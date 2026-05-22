@@ -1,0 +1,26 @@
+# ============================================================
+# .gitignore — ai-sentiment project
+# ============================================================
+
+# ❌ NEVER commit credentials
+.env
+
+# Python virtual environment
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+# OS / IDE files
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Logs / output files
+*.log
+output/
+results/
