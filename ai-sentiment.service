@@ -1,0 +1,29 @@
+[Unit]
+Description=AI Sentiment Analysis (Ollama + DeepSeek-R1)
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+# === แก้ไข path ให้ตรงกับเซิร์ฟเวอร์ ===
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ai-sentiment
+
+# โหลด .env ให้อัตโนมัติ (ถ้าใช้ systemd version >= 240)
+EnvironmentFile=/home/ubuntu/ai-sentiment/.env
+
+# รันด้วย Python ใน venv
+ExecStart=/home/ubuntu/ai-sentiment/.venv/bin/python run_forever.py
+
+# Auto-restart เมื่อ crash
+Restart=always
+RestartSec=30
+
+# Timeout (รอให้ Ollama โหลดโมเดลก่อน)
+TimeoutStartSec=120
+
+# Log ออก journald อัตโนมัติ (ดูด้วย: journalctl -u ai-sentiment -f)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

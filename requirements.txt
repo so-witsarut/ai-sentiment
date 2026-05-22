@@ -1,0 +1,5 @@
+# requirements.txt — ไลบรารีที่ต้องติดตั้ง
+requests>=2.31.0
+pymysql>=1.1.0
+pymongo>=4.6.0
+python-dotenv>=1.0.0
