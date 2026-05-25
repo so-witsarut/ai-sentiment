@@ -6,10 +6,6 @@ Flow หลักอิงจาก test_ai.py / sentiment_analysis_ai_be_srv1_0
 - ดึง content จาก MongoDB
 - ส่งให้ Ollama วิเคราะห์ sentiment
 - [TEST MODE] ไม่บันทึกลง DB
-
-Setup:
-  Copy .env.example → .env แล้วใส่ credentials จริง
-  pip install python-dotenv  (ถ้าต้องการโหลด .env อัตโนมัติ)
 """
 
 import os
@@ -22,18 +18,11 @@ import pymysql
 from pymongo import MongoClient
 from datetime import datetime, timedelta
 
-# โหลด .env file อัตโนมัติ (ถ้ามี python-dotenv ติดตั้งอยู่)
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # ถ้าไม่มี python-dotenv ก็ข้ามไป — ใช้ ENV vars ที่ set ไว้แล้วได้เลย
-
 # ตั้งค่า stdout ให้รองรับการปริ้นภาษาไทยบน Windows (แก้ปัญหา UnicodeEncodeError)
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
-def get_keyword_context(text, keyword, window=300, max_fallback_length=1000):
+def get_keyword_context(text, keyword, window=150, max_fallback_length=1000):
     """
     ตัดข้อความให้เหลือแค่บริบทแวดล้อมของ Keyword
     """
@@ -66,6 +55,7 @@ def get_keyword_context(text, keyword, window=300, max_fallback_length=1000):
 # =============================================================================
 class OllamaSentimentAnalyzer:
     def __init__(self, model="deepseek-r1:8b"):
+        
         self.model = model
         self.base_url = "http://localhost:11434/api/generate"
 
@@ -81,8 +71,14 @@ class OllamaSentimentAnalyzer:
 
         results = []
 
+        # system_instruction = (
+        #     "You are a strict Thai Sentiment Analyzer. "
+        #     'Output ONLY a minified JSON object: {"ai_sentiment": <int>}. '
+        #     "Do not explain or add markdown formatting."
+        # )
         system_instruction = (
             "You are a strict Thai Sentiment Analyzer. "
+            "/no_think "                              # ✅ magic token ของ deepseek-r1
             'Output ONLY a minified JSON object: {"ai_sentiment": <int>}. '
             "Do not explain or add markdown formatting."
         )
@@ -94,13 +90,15 @@ class OllamaSentimentAnalyzer:
             # สมมติว่าดึง Keyword ที่ชนกับโพสต์นี้มาจาก Database
             matched_keyword = post.get("keyword_name", project_name)
 
+            # 1.44
             # 🎯 ส่งทั้ง Project และ Keyword เข้าไปบอก AI ให้รู้ความสัมพันธ์
             user_prompt = (
                 f"Target Corporate Entity: '{project_name}'\n"
                 f"Trigger Keyword: '{matched_keyword}'\n"
                 f"Post User: '{post_user}'\n"
                 f"Text to analyze: '{content}'\n\n"
-                "INSTRUCTIONS (Evaluate step-by-step):\n"
+                # "INSTRUCTIONS (Evaluate step-by-step):\n"
+                "INSTRUCTIONS:\n"
                 "Step 1 - OWNED MEDIA: If 'Post User' is the Target Entity's official page -> Output {\"ai_sentiment\": 0} and STOP.\n"
                 "Step 2 - NEUTRAL NEWS & PR: Is the text an advertisement, a marketing event, sports news, or general news (like local crimes, drug busts, police arrests) that does NOT explicitly report a real scandal/crisis of the Target Entity? (Note: Ignore local idioms/metaphors, e.g., 'กลายเป็นเสือเป็นสิงห์') -> Output {\"ai_sentiment\": 0} and STOP.\n"
                 "Step 3 - NEGATIVE & CRISIS: Does the text explicitly criticize, boycott (e.g., 'บอกลา', 'ไม่กิน'), mock (even with laughing emojis), or report a damaging scandal/lawsuit DIRECTLY against the Target Entity? (Note: Ignore marketing hyperbole, e.g., 'ไม่มีอะไรดีไปกว่า') -> Output {\"ai_sentiment\": -100} and STOP.\n"
@@ -109,22 +107,26 @@ class OllamaSentimentAnalyzer:
                 "Output ONLY a valid JSON object in this exact format at the very end:\n"
                 '{"ai_sentiment": <int>}'
             )
+
             payload = {
                 "model": self.model,
                 "system": system_instruction,
                 "prompt": user_prompt,
                 "stream": False,
-                "format": "json",
+                # "format": "json",
+                "think": False,
                 "options": {
                     "temperature": 0.0,    # ปิดความสร้างสรรค์ ให้ตอบเหมือนเดิมทุกรอบ
                     "top_p": 0.1,          # ลดโอกาสการสุ่มคำตอบ
-                    "seed": 42             # ล็อก Seed ยิ่งทำให้ผลลัพธ์นิ่งสนิท
+                    "seed": 42,             # ล็อก Seed ยิ่งทำให้ผลลัพธ์นิ่งสนิท
+                    # "num_predict": 50
+                    "num_predict": 100,
                 }
             }
 
             try:
                 # ตั้ง timeout ให้เยอะขึ้นนิดนึง เพราะ DeepSeek ต้องใช้เวลา "คิด" ในแท็ก <think>
-                response = requests.post(self.base_url, json=payload, timeout=180)
+                response = requests.post(self.base_url, json=payload, timeout=200)
 
                 if response.status_code == 200:
                     result_text = response.json().get("response", "{}")
@@ -332,23 +334,20 @@ class sentiment:
 # =============================================================================
 if __name__ == "__main__":
 
-    # ─── อ่านค่าจาก Environment Variables เท่านั้น ───────────────────────────
-    # ❌ อย่าใส่ password ตรงนี้โดยตรง — ให้ set ใน .env file แทน
-    # ดูตัวอย่างที่ไฟล์ .env.example
     config = {
         # MySQL
-        "mysql_host":     os.environ.get("MYSQL_HOST"),
+        "mysql_host":     os.environ.get("MYSQL_HOST",     "10.130.84.170"),
         "mysql_port":     int(os.environ.get("MYSQL_PORT", 3306)),
-        "mysql_user":     os.environ.get("MYSQL_USER"),
-        "mysql_password": os.environ.get("MYSQL_PASSWORD"),
-        "mysql_db":       os.environ.get("MYSQL_DB",  "blue_eye"),
+        "mysql_user":     os.environ.get("MYSQL_USER",     "blueeyeremote"),
+        "mysql_password": os.environ.get("MYSQL_PASSWORD", "BEremotemysql3075"),
+        "mysql_db":       os.environ.get("MYSQL_DB",       "blue_eye"),
 
         # MongoDB
-        "mongo_host":     os.environ.get("MONGO_HOST"),
+        "mongo_host":     os.environ.get("MONGO_HOST",     "10.130.72.139"),
         "mongo_port":     int(os.environ.get("MONGO_PORT", 34596)),
-        "mongo_user":     os.environ.get("MONGO_USER"),
-        "mongo_password": os.environ.get("MONGO_PASSWORD"),
-        "mongo_db":       os.environ.get("MONGO_DB",  "blue_eye"),
+        "mongo_user":     os.environ.get("MONGO_USER",     "blueeyeharvest"),
+        "mongo_password": os.environ.get("MONGO_PASSWORD", "BEharvest3075"),
+        "mongo_db":       os.environ.get("MONGO_DB",       "blue_eye"),
     }
 
     yesterday = str(datetime.now() - timedelta(days=1))[:10]
