@@ -217,7 +217,7 @@ class sentiment:
         return list_content
 
     def analysis(self, list_content, host):
-        BATCH_SIZE = 20
+        BATCH_SIZE = 5
         total = len(list_content)
         print(f"\nTotal content to analyze: {total}")
 
