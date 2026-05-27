@@ -1,6 +1,6 @@
 # coding=utf-8
 """
-Sentiment Analysis with Ollama (deepseek-r1:8b) — TEST MODE (Windows)
+Sentiment Analysis with Ollama (qwen3-8b-instruct) — TEST MODE (Windows)
 Flow หลักอิงจาก test_ai.py / sentiment_analysis_ai_be_srv1_01.py
 - ดึง msg_id ที่ sentiment_status = '0' จาก MySQL
 - ดึง content จาก MongoDB
@@ -14,6 +14,7 @@ import json
 import time
 import sys
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pymysql
 from pymongo import MongoClient
 from datetime import datetime, timedelta
@@ -53,114 +54,132 @@ def get_keyword_context(text, keyword, window=150, max_fallback_length=1000):
 # =============================================================================
 # Ollama Sentiment Analyzer (Local Ollama)
 # =============================================================================
+# 🖥️ GPU Profile: NVIDIA GTX 1660 (6GB GDDR5, 1408 CUDA cores, 120W TDP)
+#   ⚠️ GTX 1660 มี CUDA cores น้อยกว่า RTX 3050 Ti (1408 vs 2560)
+#   → Strategy: ลด workload ต่อ request ให้เบาที่สุด แต่คง parallelism ไว้
+#   → Workers 3 ตัว = จุดสมดุลระหว่าง parallelism กับ compute pressure
+#   - Model: qwen3-8b Q4_K_M (~4.5GB) → เหลือ VRAM ~1.5GB
+#   - KV cache per seq (1024 ctx) ≈ 100-200MB
+#   - 3 workers × 200MB = 600MB < 1.5GB ✅
+# =============================================================================
 class OllamaSentimentAnalyzer:
-    def __init__(self, model="deepseek-r1:8b"):
+    # ✅ GTX 1660: 3 workers = สมดุลระหว่าง parallelism กับ CUDA cores
+    # ⚠️ อย่าลดต่ำกว่า 3 → จะช้ามาก (ทดสอบ 2 workers = 168 วินาที!)
+    CONCURRENT_WORKERS = 3
+
+    def __init__(self, model="qcwind/qwen3-8b-instruct-Q4-K-M:latest"):
         
         self.model = model
         self.base_url = "http://localhost:11434/api/generate"
 
+        # === System Prompt (สร้างครั้งเดียว ใช้ซ้ำทุก request) ===
+        self.system_instruction = (
+            "Thai Brand Sentiment Classifier. "
+            "Given a post and Target Entity, reply ONLY: {\"ai_sentiment\": 0|100|-100}. "
+            "No explanation."
+        )
+
+    def _analyze_single_post(self, post, project_name):
+        """
+        วิเคราะห์ sentiment ของโพสต์เดียว (ใช้ใน ThreadPoolExecutor)
+        Returns: dict with post_id, ai_sentiment, confidence หรือ None ถ้า error
+        """
+        post_id   = post["post_id"]
+        content   = post["content"]
+        post_user = post["post_user"]
+        matched_keyword = post.get("keyword_name", project_name)
+
+        user_prompt = (
+            f"Target: '{project_name}' | Keyword: '{matched_keyword}' | User: '{post_user}'\n"
+            f"Post: '{content[:200]}'\n\n"   # ✅ ตัดเหลือ 200 ตัวอักษร ลด token ให้เบาสุด
+            f"Rules:\n"
+            f"1. Own official page → 0\n"
+            f"2. Keyword is place/surname/idiom unrelated to brand → 0\n"
+            f"3. Ad/PR/sports news (no brand scandal) → 0\n"
+            f"4. Criticize/boycott/mock/scandal → -100\n"
+            f"5. Praise/support/defend → 100\n"
+            f"6. Default → 0\n"
+            f"{{\"ai_sentiment\": ?}}"
+        )
+
+        payload = {
+            "model": self.model,
+            "system": self.system_instruction,
+            "prompt": user_prompt,
+            "stream": False,
+            "format": "json",
+            "think": False,
+            "keep_alive": -1,                    # ✅ โมเดลค้างใน GPU ไม่ต้อง reload
+            "options": {
+                "temperature": 0.0,
+                "top_p": 0.1,
+                "seed": 42,
+                "num_predict": 15,               # ✅ JSON แค่ {"ai_sentiment": -100} ไม่ต้องเผื่อ
+                "num_ctx": 1024,                 # ✅ context window เล็ก ประหยัด VRAM
+                "num_batch": 256,                # ✅ สมดุลระหว่างความเร็วกับ VRAM
+                "num_gpu": 99,                   # ✅ บังคับทุก layer ขึ้น GPU
+            }
+        }
+
+        try:
+            response = requests.post(self.base_url, json=payload, timeout=120)
+
+            if response.status_code == 200:
+                result_text = response.json().get("response", "{}")
+
+                # --- ทำความสะอาดผลลัพธ์ ---
+                clean_text = re.sub(r'<think>.*?</think>', '', result_text, flags=re.DOTALL).strip()
+                clean_text = clean_text.replace('```json', '').replace('```', '').strip()
+
+                if not clean_text.startswith('{'):
+                    json_match = re.search(r'\{[^{}]*"ai_sentiment"[^{}]*\}', clean_text)
+                    if json_match:
+                        clean_text = json_match.group(0)
+
+                try:
+                    parsed = json.loads(clean_text)
+                    ai_sentiment = parsed.get("ai_sentiment", 0)
+
+                    if isinstance(ai_sentiment, str):
+                        s = ai_sentiment.upper()
+                        if s == "POSITIVE":  ai_sentiment = 100
+                        elif s == "NEGATIVE": ai_sentiment = -100
+                        else:                ai_sentiment = 0
+
+                    return {
+                        "post_id":      post_id,
+                        "ai_sentiment": int(ai_sentiment),
+                        "confidence":   0
+                    }
+                except json.JSONDecodeError as e:
+                    print(f"  -> JSONDecodeError [{post_id}]: {e} | Raw Clean Text: {clean_text[:150]}")
+            else:
+                print(f"  -> HTTP Error {response.status_code}: {response.text}")
+        except Exception as e:
+            print(f"  -> Request Error [{post_id}]: {e}")
+
+        return None
+
     def analyze_post_sentiments(self, json_posts, project_name=""):
         """
-        ส่งทีละโพสต์เพื่อลด timeout — พร้อม sarcasm detection และรองรับ DeepSeek-R1 CoT
+        ✅ ส่งหลายโพสต์พร้อมกัน (concurrent) เพื่อใช้ Ollama continuous batching
+        GTX 1660: ใช้ 3 workers — Ollama จะ batch requests บน GPU ให้เอง
         Returns: {"data": [...], "token_usage": {...}}
         """
         posts = json.loads(json_posts)
-
-        # print(posts)
-        # exit()
-
         results = []
 
-        # system_instruction = (
-        #     "You are a strict Thai Sentiment Analyzer. "
-        #     'Output ONLY a minified JSON object: {"ai_sentiment": <int>}. '
-        #     "Do not explain or add markdown formatting."
-        # )
-        system_instruction = (
-            "You are a strict Thai Sentiment Analyzer. "
-            "/no_think "                              # ✅ magic token ของ deepseek-r1
-            'Output ONLY a minified JSON object: {"ai_sentiment": <int>}. '
-            "Do not explain or add markdown formatting."
-        )
-        for post in posts:
-            post_id   = post["post_id"]
-            content   = post["content"]
-            post_user = post["post_user"]
-
-            # สมมติว่าดึง Keyword ที่ชนกับโพสต์นี้มาจาก Database
-            matched_keyword = post.get("keyword_name", project_name)
-
-            # 1.44
-            # 🎯 ส่งทั้ง Project และ Keyword เข้าไปบอก AI ให้รู้ความสัมพันธ์
-            user_prompt = (
-                f"Target Corporate Entity: '{project_name}'\n"
-                f"Trigger Keyword: '{matched_keyword}'\n"
-                f"Post User: '{post_user}'\n"
-                f"Text to analyze: '{content}'\n\n"
-                # "INSTRUCTIONS (Evaluate step-by-step):\n"
-                "INSTRUCTIONS:\n"
-                "Step 1 - OWNED MEDIA: If 'Post User' is the Target Entity's official page -> Output {\"ai_sentiment\": 0} and STOP.\n"
-                "Step 2 - NEUTRAL NEWS & PR: Is the text an advertisement, a marketing event, sports news, or general news (like local crimes, drug busts, police arrests) that does NOT explicitly report a real scandal/crisis of the Target Entity? (Note: Ignore local idioms/metaphors, e.g., 'กลายเป็นเสือเป็นสิงห์') -> Output {\"ai_sentiment\": 0} and STOP.\n"
-                "Step 3 - NEGATIVE & CRISIS: Does the text explicitly criticize, boycott (e.g., 'บอกลา', 'ไม่กิน'), mock (even with laughing emojis), or report a damaging scandal/lawsuit DIRECTLY against the Target Entity? (Note: Ignore marketing hyperbole, e.g., 'ไม่มีอะไรดีไปกว่า') -> Output {\"ai_sentiment\": -100} and STOP.\n"
-                "Step 4 - POSITIVE: Does the text explicitly praise or support the Target Entity? -> Output {\"ai_sentiment\": 100} and STOP.\n"
-                "Step 5 - DEFAULT: Otherwise -> Output {\"ai_sentiment\": 0} and STOP.\n\n"
-                "Output ONLY a valid JSON object in this exact format at the very end:\n"
-                '{"ai_sentiment": <int>}'
-            )
-
-            payload = {
-                "model": self.model,
-                "system": system_instruction,
-                "prompt": user_prompt,
-                "stream": False,
-                # "format": "json",
-                "think": False,
-                "options": {
-                    "temperature": 0.0,    # ปิดความสร้างสรรค์ ให้ตอบเหมือนเดิมทุกรอบ
-                    "top_p": 0.1,          # ลดโอกาสการสุ่มคำตอบ
-                    "seed": 42,             # ล็อก Seed ยิ่งทำให้ผลลัพธ์นิ่งสนิท
-                    # "num_predict": 50
-                    "num_predict": 100,
-                }
+        # ✅ ส่ง requests แบบ concurrent ด้วย ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=self.CONCURRENT_WORKERS) as executor:
+            future_to_post = {
+                executor.submit(self._analyze_single_post, post, project_name): post
+                for post in posts
             }
 
-            try:
-                # ตั้ง timeout ให้เยอะขึ้นนิดนึง เพราะ DeepSeek ต้องใช้เวลา "คิด" ในแท็ก <think>
-                response = requests.post(self.base_url, json=payload, timeout=200)
-
-                if response.status_code == 200:
-                    result_text = response.json().get("response", "{}")
-
-                    # --- ทำความสะอาดผลลัพธ์ของ DeepSeek-R1 ---
-                    # ลบแท็ก <think> และข้อความข้างในออกให้หมด (รวมถึงการขึ้นบรรทัดใหม่ด้วย re.DOTALL)
-                    clean_text = re.sub(r'<think>.*?</think>', '', result_text, flags=re.DOTALL).strip()
-
-                    # ลบ tag markdown ```json และ ``` เผื่อโมเดลแถมมาให้
-                    clean_text = clean_text.replace('```json', '').replace('```', '').strip()
-                    # -------------------------------------------------------------------------
-
-                    try:
-                        parsed = json.loads(clean_text)
-                        ai_sentiment = parsed.get("ai_sentiment", 0)
-
-                        if isinstance(ai_sentiment, str):
-                            s = ai_sentiment.upper()
-                            if s == "POSITIVE":  ai_sentiment = 100
-                            elif s == "NEGATIVE": ai_sentiment = -100
-                            else:                ai_sentiment = 0
-
-                        results.append({
-                            "post_id":      post_id,
-                            "ai_sentiment": int(ai_sentiment),
-                            "confidence":   0
-                        })
-                    except json.JSONDecodeError as e:
-                        # ปริ้นท์ clean_text ออกมาดูตอน Error เพื่อจะได้รู้ว่าหลุด Format แบบไหน
-                        print(f"  -> JSONDecodeError [{post_id}]: {e} | Raw Clean Text: {clean_text[:150]}")
-                else:
-                    print(f"  -> HTTP Error {response.status_code}: {response.text}")
-            except Exception as e:
-                print(f"  -> Request Error [{post_id}]: {e}")
+            for future in as_completed(future_to_post):
+                result = future.result()
+                if result is not None:
+                    results.append(result)
 
         return {"data": results, "token_usage": {"input": 0, "output": 0, "total": 0}}
 
@@ -172,7 +191,7 @@ class sentiment:
     def __init__(self, config):
         
         self.config = config
-        self.ollama = OllamaSentimentAnalyzer(model="deepseek-r1:8b")
+        self.ollama = OllamaSentimentAnalyzer(model="qcwind/qwen3-8b-instruct-Q4-K-M:latest")
 
     def get_content(self, list_id_with_project, collection):
         list_content = []
@@ -217,7 +236,7 @@ class sentiment:
         return list_content
 
     def analysis(self, list_content, host):
-        BATCH_SIZE = 5
+        BATCH_SIZE = 20
         total = len(list_content)
         print(f"\nTotal content to analyze: {total}")
 
@@ -238,7 +257,7 @@ class sentiment:
                 if text:
                     # กรณีที่มีหลายคำคั่นด้วยลูกน้ำ (เช่น ทราย, สุนิษฐ์, พาย) อาจจะเลือกคำแรกมาใช้สแกน
                     first_keyword = kw_name.split(",")[0].strip() if kw_name else ""
-                    clean_short_content = get_keyword_context(text, first_keyword, window=300)
+                    clean_short_content = get_keyword_context(text, first_keyword, window=200)  # ✅ GTX 1660: ลดจาก 300 → 200 ลด token
                     print("clean_short_content >>>>>>> ", clean_short_content)
                     
 
@@ -256,7 +275,7 @@ class sentiment:
 
             json_str = json.dumps(posts_for_ai, ensure_ascii=False)
 
-            print(f"  -> Sending {len(posts_for_ai)} posts to Ollama (deepseek-r1:8b)...")
+            print(f"  -> Sending {len(posts_for_ai)} posts to Ollama (qwen3-8b-instruct)...")
             print(f"  -> Project: {batch_project_name}")
             
             ollama_response = self.ollama.analyze_post_sentiments(json_str, batch_project_name)
@@ -333,6 +352,7 @@ class sentiment:
 # Main
 # =============================================================================
 if __name__ == "__main__":
+    start_time = time.time()
 
     config = {
         # MySQL
@@ -385,7 +405,7 @@ if __name__ == "__main__":
     )
 
     print("=" * 65)
-    print("     Ollama (deepseek-r1:8b) SENTIMENT ANALYSIS [TEST MODE]")
+    print("     Ollama (qcwind/qwen3-8b-instruct-Q4-K-M:latest) SENTIMENT ANALYSIS [TEST MODE]")
     print(f"     Date Range: {yesterday} ~ {now}")
     print("=" * 65)
 
@@ -449,4 +469,8 @@ if __name__ == "__main__":
         sa.analysis(list_content, config["mysql_host"])
     else:
         print("\nNo content to analyze.")
+
+    end_time = time.time()
+    total_time = end_time - start_time
+    print(f"\n--- Total Execution Time: {total_time:.2f} seconds ---")
 
