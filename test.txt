@@ -1,0 +1,47 @@
+# ============================================================
+# .env — credentials จริง (ไฟล์นี้ถูก .gitignore แล้ว ไม่ขึ้น GitHub)
+# ============================================================
+
+# MySQL (Blue Eye Database)
+MYSQL_HOST=10.130.84.170
+MYSQL_PORT=3306
+MYSQL_USER=blueeyeremote
+MYSQL_PASSWORD=BEremotemysql3075
+MYSQL_DB=blue_eye
+
+# MongoDB (Blue Eye Content Store)
+MONGO_HOST=10.130.72.139
+MONGO_PORT=34596
+MONGO_USER=blueeyeharvest
+MONGO_PASSWORD=BEharvest3075
+MONGO_DB=blue_eye
+
+# ─── การตั้งค่า run_forever.py ───────────────────────────────
+# mockup = ใช้ข้อมูลจำลอง (ทดสอบ Prompt โดยไม่ต้องเชื่อม DB)
+# db     = ดึงข้อมูลจาก MySQL + MongoDB จริง
+RUN_MODE=db
+
+# รอกี่นาทีก่อนรันรอบถัดไป
+RUN_INTERVAL_MINUTES=1
+
+# ─── SSH Tunnel ──────────────────────────────────────────────
+SSH_HOST=206.189.90.205
+SSH_PORT=22
+SSH_USER=phothon
+SSH_PASSWORD=g-hkg:biNag;viN
+
+# SSH Tunnel → MySQL (server 1)
+SSH_MYSQL_HOST_1=139.59.124.43
+SSH_MYSQL_USER_1=phothon
+SSH_MYSQL_PASSWORD_1=zx@enk,`p~M8raFv3P>f
+
+# SSH Tunnel → MySQL (server 2)
+SSH_MYSQL_HOST_2=159.89.203.21
+SSH_MYSQL_USER_2=pakorn
+SSH_MYSQL_PASSWORD_2=7y*CFqn6!>5{iU"ubKS,
+
+# ─── DigitalOcean Spaces ─────────────────────────────────────
+DO_SPACES_REGION=sgp1
+DO_SPACES_ACCESS_KEY=DO8018GL9HU4L9HC4FR3
+DO_SPACES_SECRET_KEY=eEeMDCouMzbP5sbiibyzTVrQgD8ec1W5GgYO70AHB98
+DO_SPACES_BUCKET=be-post-scrape-img
