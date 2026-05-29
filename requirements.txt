@@ -1,5 +1,7 @@
 # requirements.txt — ไลบรารีที่ต้องติดตั้ง
 requests>=2.31.0
 pymysql>=1.1.0
-pymongo>=4.6.0
+pymongo<4.8
 python-dotenv>=1.0.0
+sshtunnel>=0.4.0
+boto3>=1.34.0
