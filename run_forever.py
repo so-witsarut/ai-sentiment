@@ -104,50 +104,103 @@ MOCKUP_DATA = [
 # ═══════════════════════════════════════════════════════════════
 # ดึงข้อมูลจาก DB จริง
 # ═══════════════════════════════════════════════════════════════
-def fetch_from_db(sa_obj):
+def process_targets(sa_obj):
     yesterday = str(datetime.now() - timedelta(days=1))[:10]
     now_str   = str(datetime.now())[:10]
 
-    base_sql = (
-        "SELECT omd.msg_id, "
-        "IFNULL(ck.company_keyword_name,'') as project_name, "
-        "IFNULL(omd.post_user,'') as post_user, "
-        "IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '),'') as keyword_name "
-        "FROM own_match_daily omd "
-        "LEFT JOIN company_keyword ck ON omd.company_keyword_id = ck.company_keyword_id "
-        "LEFT JOIN own_key_match okm ON okm.own_match_id = omd.own_match_id "
-        "LEFT JOIN keyword k ON okm.keyword_id = k.keyword_id "
-        f"WHERE date(omd.msg_time) BETWEEN '{yesterday}' AND '{now_str}' "
-        "AND omd.sentiment_status = '0' AND omd.match_type = '{mtype}' "
-        "GROUP BY omd.msg_id, project_name, post_user "
-        "ORDER BY omd.msg_time ASC LIMIT 20"
-    )
+    targets = [
+        {
+            "name": "OWN MATCH",
+            "table_prefix": "own_match",
+            "sql_feed": (
+                f"SELECT omd.msg_id, "
+                f"IFNULL(ck.company_keyword_name, '') as project_name, "
+                f"IFNULL(omd.post_user, '') as post_user, "
+                f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
+                f"FROM own_match_daily omd "
+                f"LEFT JOIN company_keyword ck ON omd.company_keyword_id = ck.company_keyword_id "
+                f"LEFT JOIN own_key_match okm ON okm.own_match_id = omd.own_match_id "
+                f"LEFT JOIN keyword k ON okm.keyword_id = k.keyword_id "
+                f"WHERE date(omd.msg_time) BETWEEN '{yesterday}' AND '{now_str}' "
+                f"AND omd.sentiment_status = '0' AND omd.match_type = 'Feed' "
+                f"GROUP BY omd.msg_id, project_name, post_user "
+                f"ORDER BY omd.msg_time ASC"
+            ),
+            "sql_comment": (
+                f"SELECT omd.msg_id, "
+                f"IFNULL(ck.company_keyword_name, '') as project_name, "
+                f"IFNULL(omd.post_user, '') as post_user, "
+                f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
+                f"FROM own_match_daily omd "
+                f"LEFT JOIN company_keyword ck ON omd.company_keyword_id = ck.company_keyword_id "
+                f"LEFT JOIN own_key_match okm ON okm.own_match_id = omd.own_match_id "
+                f"LEFT JOIN keyword k ON okm.keyword_id = k.keyword_id "
+                f"WHERE date(omd.msg_time) BETWEEN '{yesterday}' AND '{now_str}' "
+                f"AND omd.sentiment_status = '0' AND omd.match_type = 'Comment' "
+                f"GROUP BY omd.msg_id, project_name, post_user "
+                f"ORDER BY omd.msg_time ASC"
+            )
+        },
+        {
+            "name": "COMPETITOR MATCH",
+            "table_prefix": "competitor_match",
+            "sql_feed": (
+                f"SELECT cmd.msg_id, "
+                f"IFNULL(ck.company_keyword_name, '') as project_name, "
+                f"IFNULL(cmd.post_user, '') as post_user, "
+                f"'' as keyword_name "
+                f"FROM competitor_match_daily cmd "
+                f"LEFT JOIN company_keyword ck ON cmd.company_keyword_id = ck.company_keyword_id "
+                f"WHERE date(cmd.msg_time) BETWEEN '{yesterday}' AND '{now_str}' "
+                f"AND cmd.sentiment_status = '0' AND cmd.match_type = 'Feed' "
+                f"GROUP BY cmd.msg_id, project_name, post_user "
+                f"ORDER BY cmd.msg_time ASC"
+            ),
+            "sql_comment": (
+                f"SELECT cmd.msg_id, "
+                f"IFNULL(ck.company_keyword_name, '') as project_name, "
+                f"IFNULL(cmd.post_user, '') as post_user, "
+                f"'' as keyword_name "
+                f"FROM competitor_match_daily cmd "
+                f"LEFT JOIN company_keyword ck ON cmd.company_keyword_id = ck.company_keyword_id "
+                f"WHERE date(cmd.msg_time) BETWEEN '{yesterday}' AND '{now_str}' "
+                f"AND cmd.sentiment_status = '0' AND cmd.match_type = 'Comment' "
+                f"GROUP BY cmd.msg_id, project_name, post_user "
+                f"ORDER BY cmd.msg_time ASC"
+            )
+        }
+    ]
 
-    conn = pymysql.connect(
-        host=DB_CONFIG["mysql_host"],
-        port=DB_CONFIG["mysql_port"],
-        user=DB_CONFIG["mysql_user"],
-        password=DB_CONFIG["mysql_password"],
-        database=DB_CONFIG["mysql_db"],
-        connect_timeout=10,
-        charset="utf8mb4",
-    )
-    feeds, comments = [], []
-    try:
-        with conn.cursor() as cur:
-            cur.execute(base_sql.format(mtype="Feed"))
-            feeds = cur.fetchall()
-            cur.execute(base_sql.format(mtype="Comment"))
-            comments = cur.fetchall()
-    finally:
-        conn.close()
+    for target in targets:
+        conn = pymysql.connect(
+            host=DB_CONFIG["mysql_host"],
+            port=DB_CONFIG["mysql_port"],
+            user=DB_CONFIG["mysql_user"],
+            password=DB_CONFIG["mysql_password"],
+            database=DB_CONFIG["mysql_db"],
+            connect_timeout=10,
+            charset="utf8mb4",
+        )
+        feeds, comments = [], []
+        try:
+            with conn.cursor() as cur:
+                cur.execute(target["sql_feed"])
+                feeds = cur.fetchall()
+                cur.execute(target["sql_comment"])
+                comments = cur.fetchall()
+        finally:
+            conn.close()
 
-    log.info(f"DB → Feed: {len(feeds)} | Comment: {len(comments)} รายการ")
+        log.info(f"DB [{target['name']}] → Feed: {len(feeds)} | Comment: {len(comments)} รายการ")
 
-    content = []
-    if feeds:    content += sa_obj.get_content(list(feeds), "Feed")
-    if comments: content += sa_obj.get_content(list(comments), "Comment")
-    return content
+        content = []
+        if feeds:    content += sa_obj.get_content(list(feeds), "Feed")
+        if comments: content += sa_obj.get_content(list(comments), "Comment")
+        
+        if content:
+            sa_obj.analysis(content, DB_CONFIG.get("mysql_host") or "localhost", target["table_prefix"])
+        else:
+            log.info(f"ไม่มีข้อมูลที่ต้องวิเคราะห์สำหรับ {target['name']}")
 
 # ═══════════════════════════════════════════════════════════════
 # รัน 1 รอบ
@@ -162,14 +215,11 @@ def run_once(round_num):
     if RUN_MODE == "mockup":
         list_content = MOCKUP_DATA
         log.info(f"[MOCKUP] ใช้ข้อมูลจำลอง {len(list_content)} รายการ")
+        if list_content:
+            sa.analysis(list_content, DB_CONFIG.get("mysql_host") or "localhost", "own_match")
     else:
-        list_content = fetch_from_db(sa)
+        process_targets(sa)
 
-    if not list_content:
-        log.info("ไม่มีข้อมูลที่ต้องวิเคราะห์รอบนี้")
-        return
-
-    sa.analysis(list_content, DB_CONFIG.get("mysql_host") or "localhost")
     log.info(f"รอบที่ {round_num} เสร็จสิ้น ✓")
 
 # ═══════════════════════════════════════════════════════════════
