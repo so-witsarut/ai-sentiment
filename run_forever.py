@@ -65,7 +65,8 @@ INTERVAL  = int(os.environ.get("RUN_INTERVAL_MINUTES", 10))   # นาที
 RUN_MODE  = os.environ.get("RUN_MODE", "mockup").lower()       # mockup | db
 
 DB_CONFIG = {
-    "mysql_host":     os.environ.get("MYSQL_HOST"),
+    "mysql_host_1":   os.environ.get("MYSQL_HOST_1", "10.130.84.170"),
+    "mysql_host_2":   os.environ.get("MYSQL_HOST_2", "10.130.69.57"),
     "mysql_port":     int(os.environ.get("MYSQL_PORT", 3306)),
     "mysql_user":     os.environ.get("MYSQL_USER"),
     "mysql_password": os.environ.get("MYSQL_PASSWORD"),
@@ -175,38 +176,45 @@ def process_targets(sa_obj):
         }
     ]
 
-    for target in targets:
-        import sys
-        if r"ai-sentiment" not in sys.path:
-            sys.path.append(r"ai-sentiment")
-        import connection
-        CONN = connection.DatabaseConnection()
-
-        feeds = CONN.getfromdb(
-            query=target["sql_feed"], 
-            DB='mysqldb', 
-            database=DB_CONFIG["mysql_db"], 
-            server=1, 
-            host=DB_CONFIG["mysql_host"]
-        )
-        comments = CONN.getfromdb(
-            query=target["sql_comment"], 
-            DB='mysqldb', 
-            database=DB_CONFIG["mysql_db"], 
-            server=1, 
-            host=DB_CONFIG["mysql_host"]
-        )
-
-        log.info(f"DB [{target['name']}] → Feed: {len(feeds)} | Comment: {len(comments)} รายการ")
-
-        content = []
-        if feeds:    content += sa_obj.get_content(list(feeds), "Feed")
-        if comments: content += sa_obj.get_content(list(comments), "Comment")
+    for server_id in [1, 2]:
+        current_host = DB_CONFIG.get(f"mysql_host_{server_id}")
         
-        if content:
-            sa_obj.analysis(content, DB_CONFIG.get("mysql_host") or "localhost", target["table_prefix"])
-        else:
-            log.info(f"ไม่มีข้อมูลที่ต้องวิเคราะห์สำหรับ {target['name']}")
+        log.info(f"\n{'=' * 40}")
+        log.info(f"   PROCESSING MYSQL SERVER {server_id} ({current_host})")
+        log.info(f"{'=' * 40}")
+
+        for target in targets:
+            import sys
+            if r"ai-sentiment" not in sys.path:
+                sys.path.append(r"ai-sentiment")
+            import connection
+            CONN = connection.DatabaseConnection()
+
+            feeds = CONN.getfromdb(
+                query=target["sql_feed"], 
+                DB='mysqldb', 
+                database=DB_CONFIG["mysql_db"], 
+                server=server_id, 
+                host=current_host
+            )
+            comments = CONN.getfromdb(
+                query=target["sql_comment"], 
+                DB='mysqldb', 
+                database=DB_CONFIG["mysql_db"], 
+                server=server_id, 
+                host=current_host
+            )
+
+            log.info(f"DB [{target['name']}] (Server {server_id}) → Feed: {len(feeds)} | Comment: {len(comments)} รายการ")
+
+            content = []
+            if feeds:    content += sa_obj.get_content(list(feeds), "Feed")
+            if comments: content += sa_obj.get_content(list(comments), "Comment")
+            
+            if content:
+                sa_obj.analysis(content, current_host, server=server_id, table_prefix=target["table_prefix"])
+            else:
+                log.info(f"ไม่มีข้อมูลที่ต้องวิเคราะห์สำหรับ {target['name']} บน Server {server_id}")
 
 # ═══════════════════════════════════════════════════════════════
 # รัน 1 รอบ

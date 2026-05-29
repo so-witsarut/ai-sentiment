@@ -259,16 +259,17 @@ class sentiment:
     #         if item[0] not in self.list_of_keywords:
     #             self.list_of_keywords.append((item[0], item[1], item[2]))
 
-    def analysis(self, list_content, host, table_prefix="own_match"):
+    def analysis(self, list_content, host, server=1, table_prefix="own_match"):
         """
         วิเคราะห์ sentiment แล้วอัพเดทลง MySQL
 
         Args:
             list_content (list): [(msg_id, content, project_name, post_user, kw_name), ...]
             host (str): MySQL host
+            server (int): MySQL Server ID (1 or 2)
             table_prefix (str): 'own_match' หรือ 'competitor_match'
         """
-        tunnel, DB_CONNECTION = CONN.get_mysql_connection(server=self.config.get("server", 1), host=host, database=self.config["mysql_db"])
+        tunnel, DB_CONNECTION = CONN.get_mysql_connection(server=server, host=host, database=self.config["mysql_db"])
 
         BATCH_SIZE = 20
         total = len(list_content)
@@ -393,7 +394,8 @@ if __name__ == "__main__":
 
     config = {
         # MySQL 
-        "mysql_host":     os.environ.get("MYSQL_HOST",     "10.130.84.170"),
+        "mysql_host_1":   os.environ.get("MYSQL_HOST_1",   "10.130.84.170"),
+        "mysql_host_2":   os.environ.get("MYSQL_HOST_2",   "10.130.69.57"),
         "mysql_port":     int(os.environ.get("MYSQL_PORT", 3306)),
         "mysql_user":     os.environ.get("MYSQL_USER",     "blueeyeremote"),
         "mysql_password": os.environ.get("MYSQL_PASSWORD", "BEremotemysql3075"),
@@ -487,54 +489,61 @@ if __name__ == "__main__":
 
     sa = sentiment(config)
 
-    for target in targets:
+    for server_id in [1, 2]:
+        current_host = config[f"mysql_host_{server_id}"]
+        
         print(f"\n{'=' * 65}")
-        print(f"     PROCESSING: {target['name']}")
+        print(f"     STARTING MYSQL SERVER {server_id} ({current_host})")
         print(f"{'=' * 65}")
 
-        # --- ดึง Feed msg_ids + project_name ---
-        _item = CONN.getfromdb(
-            query=target["sql_feed"], 
-            DB='mysqldb', 
-            database=config["mysql_db"], 
-            server=config.get("server", 1), 
-            host=config.get("mysql_host", "10.130.84.170")
-        )
+        for target in targets:
+            print(f"\n{'=' * 65}")
+            print(f"     PROCESSING: {target['name']} (Server {server_id})")
+            print(f"{'=' * 65}")
 
-        list_id_with_project = [(x[0], x[1], x[2], x[3]) for x in _item]
-        print(f"\nFeed posts to analyze: {len(list_id_with_project)}")
+            # --- ดึง Feed msg_ids + project_name ---
+            _item = CONN.getfromdb(
+                query=target["sql_feed"], 
+                DB='mysqldb', 
+                database=config["mysql_db"], 
+                server=server_id, 
+                host=current_host
+            )
 
-        print(f"\n--- SQL_FEED Query ({target['name']}) ---")
-        print(f"SQL: {target['sql_feed']}")
-        print(f"\n{'No.':<5} {'msg_id':<45} {'project_name'}")
-        print(f"{'-'*80}")
-        for i, (msg_id, proj, post_user, kw_name) in enumerate(list_id_with_project, 1):
-            print(f"{i:<5} {str(msg_id)[:43]:<45} {proj}")
-        print(f"{'-'*80}")
+            list_id_with_project = [(x[0], x[1], x[2], x[3]) for x in _item]
+            print(f"\nFeed posts to analyze: {len(list_id_with_project)}")
 
-        list_content = sa.get_content(list_id_with_project, "Feed")
+            print(f"\n--- SQL_FEED Query ({target['name']}) ---")
+            print(f"SQL: {target['sql_feed']}")
+            print(f"\n{'No.':<5} {'msg_id':<45} {'project_name'}")
+            print(f"{'-'*80}")
+            for i, (msg_id, proj, post_user, kw_name) in enumerate(list_id_with_project, 1):
+                print(f"{i:<5} {str(msg_id)[:43]:<45} {proj}")
+            print(f"{'-'*80}")
 
-        # --- ดึง Comment msg_ids + project_name ---
-        _item = CONN.getfromdb(
-            query=target["sql_comment"], 
-            DB='mysqldb', 
-            database=config["mysql_db"], 
-            server=config.get("server", 1), 
-            host=config.get("mysql_host", "10.130.84.170")
-        )
+            list_content = sa.get_content(list_id_with_project, "Feed")
 
-        list_id_with_project = [(x[0], x[1], x[2], x[3]) for x in _item]
-        print(f"Comment posts to analyze: {len(list_id_with_project)}")
+            # --- ดึง Comment msg_ids + project_name ---
+            _item = CONN.getfromdb(
+                query=target["sql_comment"], 
+                DB='mysqldb', 
+                database=config["mysql_db"], 
+                server=server_id, 
+                host=current_host
+            )
 
-        list_content += sa.get_content(list_id_with_project, "Comment")
+            list_id_with_project = [(x[0], x[1], x[2], x[3]) for x in _item]
+            print(f"Comment posts to analyze: {len(list_id_with_project)}")
 
-        print(f"Total content to process for {target['name']}: {len(list_content)}")
+            list_content += sa.get_content(list_id_with_project, "Comment")
 
-        # --- วิเคราะห์ด้วย Ollama แล้วบันทึกลง DB ---
-        if list_content:
-            sa.analysis(list_content, config["mysql_host"], target["table_prefix"])
-        else:
-            print(f"\nNo content to analyze for {target['name']}.")
+            print(f"Total content to process for {target['name']} (Server {server_id}): {len(list_content)}")
+
+            # --- วิเคราะห์ด้วย Ollama แล้วบันทึกลง DB ---
+            if list_content:
+                sa.analysis(list_content, current_host, server=server_id, table_prefix=target["table_prefix"])
+            else:
+                print(f"\nNo content to analyze for {target['name']} on Server {server_id}.")
 
     end_time = time.time()
     total_time = end_time - start_time
