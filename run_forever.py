@@ -75,6 +75,10 @@ DB_CONFIG = {
     "mongo_user":     os.environ.get("MONGO_USER"),
     "mongo_password": os.environ.get("MONGO_PASSWORD"),
     "mongo_db":       os.environ.get("MONGO_DB", "blue_eye"),
+    "ssh_host":       os.environ.get("SSH_HOST"),
+    "ssh_port":       int(os.environ.get("SSH_PORT", 22)),
+    "ssh_user":       os.environ.get("SSH_USER"),
+    "ssh_password":   os.environ.get("SSH_PASSWORD"),
 }
 
 # ─── ข้อมูลจำลอง (ใช้เมื่อ RUN_MODE=mockup) ─────────────────
@@ -172,24 +176,26 @@ def process_targets(sa_obj):
     ]
 
     for target in targets:
-        conn = pymysql.connect(
-            host=DB_CONFIG["mysql_host"],
-            port=DB_CONFIG["mysql_port"],
-            user=DB_CONFIG["mysql_user"],
-            password=DB_CONFIG["mysql_password"],
-            database=DB_CONFIG["mysql_db"],
-            connect_timeout=10,
-            charset="utf8mb4",
+        import sys
+        if r"ai-sentiment" not in sys.path:
+            sys.path.append(r"ai-sentiment")
+        import connection
+        CONN = connection.DatabaseConnection()
+
+        feeds = CONN.getfromdb(
+            query=target["sql_feed"], 
+            DB='mysqldb', 
+            database=DB_CONFIG["mysql_db"], 
+            server=1, 
+            host=DB_CONFIG["mysql_host"]
         )
-        feeds, comments = [], []
-        try:
-            with conn.cursor() as cur:
-                cur.execute(target["sql_feed"])
-                feeds = cur.fetchall()
-                cur.execute(target["sql_comment"])
-                comments = cur.fetchall()
-        finally:
-            conn.close()
+        comments = CONN.getfromdb(
+            query=target["sql_comment"], 
+            DB='mysqldb', 
+            database=DB_CONFIG["mysql_db"], 
+            server=1, 
+            host=DB_CONFIG["mysql_host"]
+        )
 
         log.info(f"DB [{target['name']}] → Feed: {len(feeds)} | Comment: {len(comments)} รายการ")
 

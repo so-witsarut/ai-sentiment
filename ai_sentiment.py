@@ -14,10 +14,20 @@ import json
 import time
 import sys
 import requests
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pymysql
 from pymongo import MongoClient
 from datetime import datetime, timedelta
+
+# pyrefly: ignore [missing-import]
+from sshtunnel import SSHTunnelForwarder
+
+sys.path.append(r"ai-sentiment")
+# pyrefly: ignore [missing-import]
+import connection
+
+CONN=connection.DatabaseConnection()
 
 # ตั้งค่า stdout ให้รองรับการปริ้นภาษาไทยบน Windows (แก้ปัญหา UnicodeEncodeError)
 if sys.stdout.encoding != 'utf-8':
@@ -204,12 +214,7 @@ class sentiment:
         if not list_id:
             return list_content
 
-        DB_CONNECTION = MongoClient(
-            self.config["mongo_host"],
-            self.config.get("mongo_port", 34596),
-            username=self.config.get("mongo_user"),
-            password=self.config.get("mongo_password")
-        )
+        DB_CONNECTION = CONN.get_mongo_client()
         DB = DB_CONNECTION[self.config.get("mongo_db", "blue_eye")]
         DB_COLLECTION = DB[collection]
 
@@ -231,9 +236,28 @@ class sentiment:
                 post_user = str(msg_id).split("_")[0]
             list_content.append((msg_id, feedcontent, proj_name, post_user, kw_name))
 
-        DB_CONNECTION.close()
+        # ไม่ปิด connection — เป็น shared connection ที่ CONN จัดการให้
 
         return list_content
+
+    # def get_keyword(self):
+    #     sql = """
+    #         SELECT keyword_name, client_id, status
+    #         FROM keyword
+    #         WHERE client_id = 67 AND status = 'active'
+    #         ORDER BY created_date DESC
+    #         LIMIT 1 
+    #     """
+    #     keywords_item = CONN.getfromdb(query=sql,
+    #                                 DB='mysqldb',
+    #                                 database='blue_eye',
+    #                                 server=1,
+    #                                 host='10.130.84.170'
+    #     )
+
+    #     for item in keywords_item:
+    #         if item[0] not in self.list_of_keywords:
+    #             self.list_of_keywords.append((item[0], item[1], item[2]))
 
     def analysis(self, list_content, host, table_prefix="own_match"):
         """
@@ -244,14 +268,7 @@ class sentiment:
             host (str): MySQL host
             table_prefix (str): 'own_match' หรือ 'competitor_match'
         """
-        DB_CONNECTION = pymysql.connect(
-            host=host,
-            port=self.config.get("mysql_port", 3306),
-            user=self.config["mysql_user"],
-            passwd=self.config["mysql_password"],
-            charset="utf8",
-            db=self.config["mysql_db"]
-        )
+        tunnel, DB_CONNECTION = CONN.get_mysql_connection(server=self.config.get("server", 1), host=host, database=self.config["mysql_db"])
 
         BATCH_SIZE = 20
         total = len(list_content)
@@ -363,6 +380,8 @@ class sentiment:
             # ไม่ต้องมีการดีเลย์ระหว่าง batch สำหรับ Local Ollama
 
         DB_CONNECTION.close()
+        if 'tunnel' in locals() and tunnel:
+            tunnel.stop()
         print("\n--- Process Complete (บันทึกลง DB แล้ว) ---")
 
 # =============================================================================
@@ -371,13 +390,21 @@ class sentiment:
 if __name__ == "__main__":
     start_time = time.time()
 
+
     config = {
-        # MySQL
+        # MySQL 
         "mysql_host":     os.environ.get("MYSQL_HOST",     "10.130.84.170"),
         "mysql_port":     int(os.environ.get("MYSQL_PORT", 3306)),
         "mysql_user":     os.environ.get("MYSQL_USER",     "blueeyeremote"),
         "mysql_password": os.environ.get("MYSQL_PASSWORD", "BEremotemysql3075"),
         "mysql_db":       os.environ.get("MYSQL_DB",       "blue_eye"),
+        "server":       os.environ.get("server",       1),
+
+        # SSH Tunnel
+        "ssh_host":       os.environ.get("SSH_HOST"),
+        "ssh_port":       int(os.environ.get("SSH_PORT", 22)),
+        "ssh_user":       os.environ.get("SSH_USER"),
+        "ssh_password":   os.environ.get("SSH_PASSWORD"),
 
         # MongoDB
         "mongo_host":     os.environ.get("MONGO_HOST",     "10.130.72.139"),
@@ -466,18 +493,13 @@ if __name__ == "__main__":
         print(f"{'=' * 65}")
 
         # --- ดึง Feed msg_ids + project_name ---
-        DB_CONNECTION = pymysql.connect(
-            host=config["mysql_host"],
-            port=config.get("mysql_port", 3306),
-            user=config["mysql_user"],
-            passwd=config["mysql_password"],
-            charset="utf8",
-            db=config["mysql_db"]
+        _item = CONN.getfromdb(
+            query=target["sql_feed"], 
+            DB='mysqldb', 
+            database=config["mysql_db"], 
+            server=config.get("server", 1), 
+            host=config.get("mysql_host", "10.130.84.170")
         )
-        cursor = DB_CONNECTION.cursor()
-        cursor.execute(target["sql_feed"])
-        _item = list(cursor.fetchall())
-        DB_CONNECTION.close()
 
         list_id_with_project = [(x[0], x[1], x[2], x[3]) for x in _item]
         print(f"\nFeed posts to analyze: {len(list_id_with_project)}")
@@ -493,18 +515,13 @@ if __name__ == "__main__":
         list_content = sa.get_content(list_id_with_project, "Feed")
 
         # --- ดึง Comment msg_ids + project_name ---
-        DB_CONNECTION = pymysql.connect(
-            host=config["mysql_host"],
-            port=config.get("mysql_port", 3306),
-            user=config["mysql_user"],
-            passwd=config["mysql_password"],
-            charset="utf8",
-            db=config["mysql_db"]
+        _item = CONN.getfromdb(
+            query=target["sql_comment"], 
+            DB='mysqldb', 
+            database=config["mysql_db"], 
+            server=config.get("server", 1), 
+            host=config.get("mysql_host", "10.130.84.170")
         )
-        cursor = DB_CONNECTION.cursor()
-        cursor.execute(target["sql_comment"])
-        _item = list(cursor.fetchall())
-        DB_CONNECTION.close()
 
         list_id_with_project = [(x[0], x[1], x[2], x[3]) for x in _item]
         print(f"Comment posts to analyze: {len(list_id_with_project)}")
