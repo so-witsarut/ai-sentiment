@@ -108,13 +108,14 @@ class OllamaSentimentAnalyzer:
             f"Target: '{actual_target}' | Keyword: '{matched_keyword}' | User: '{post_user}'\n"
             f"Post: '{content}'\n\n"
             f"Rules:\n"
-            f"1. Own official page → 0\n"
-            f"2. Keyword is place/surname/idiom unrelated to brand → 0\n"
-            f"3. Ad/PR/sports news (no brand scandal) → 0\n"
-            f"4. Criticize/boycott/mock/scandal → -100\n"
-            f"5. Praise/support/defend → 100\n"
-            f"6. Default → 0\n"
-            f"{{\"reason\": \"short reason\", \"ai_sentiment\": ?}}"
+            f"1. Target is NOT mentioned or post is about OTHER companies → 0\n"
+            f"2. Own official page → 0\n"
+            f"3. Keyword is place/surname/idiom unrelated to Target → 0\n"
+            f"4. Ad/PR/sports/stock news (no Target scandal) → 0\n"
+            f"5. Criticize/boycott/mock/scandal specifically about Target → -100\n"
+            f"6. Praise/support/defend specifically about Target → 100\n"
+            f"7. Default → 0\n"
+            f"{{\"reason\": \"เหตุผลสั้นๆ ภาษาไทย\", \"ai_sentiment\": ?}}"
         )
 
 
@@ -347,17 +348,22 @@ class sentiment:
                     ai_reason = ""
                     icon = "⚠️ N/A     "
 
-                # หา actual_target ที่ตรงกับโพสต์นี้
+                # หา actual_target และ content ที่ถูกตัดแล้ว (ส่งให้ AI) ที่ตรงกับโพสต์นี้
                 actual_target = next((p["actual_target"] for p in posts_for_ai if p["post_id"] == str_id), project_name)
+                ai_content = next((p["content"] for p in posts_for_ai if p["post_id"] == str_id), str(content))
 
-                display_content = str(content)[:120].replace("\n", " ")
-                if len(str(content)) > 120:
-                    display_content += "..."
-                    
+                # เตรียมข้อความสำหรับแสดงผล
+                original_preview = str(content).replace("\n", " ")
+                if len(original_preview) > 150:
+                    original_preview = original_preview[:150] + "..."
+                
+                ai_sliced = ai_content.replace("\n", " ")
+
                 print(f"  [{idx:02d}] 🆔 {str_id[:15]:<15} | {icon:<11} | User: {str(post_user)[:12]:<12} | Proj: {project_name[:10]:<10} | Target: {actual_target[:15]:<15} | KW: {kw_name}")
                 if ai_reason:
                     print(f"       💡 Reason: {ai_reason}")
-                print(f"       📝 {display_content}")
+                print(f"       📄 Full (Preview): {original_preview}")
+                print(f"       ✂️ Sliced (to AI): {ai_sliced}")
                 print(f"  {'-'*100}")
 
             # # ===== อัพเดท DB =====
