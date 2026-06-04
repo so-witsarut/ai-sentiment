@@ -99,9 +99,14 @@ class OllamaSentimentAnalyzer:
         post_user = post["post_user"]
         matched_keyword = post.get("keyword_name", project_name)
 
+        # ใช้ actual_target ที่คำนวณไว้แล้วจาก analysis()
+        # ถ้าเป็น COMPETITOR → actual_target = keyword_name (ชื่อแบรนด์จริง)
+        # ถ้าเป็น OWN → actual_target = project_name
+        actual_target = post.get("actual_target", project_name)
+
         user_prompt = (
-            f"Target: '{project_name}' | Keyword: '{matched_keyword}' | User: '{post_user}'\n"
-            f"Post: '{content[:200]}'\n\n"   # ✅ ตัดเหลือ 200 ตัวอักษร ลด token ให้เบาสุด
+            f"Target: '{actual_target}' | Keyword: '{matched_keyword}' | User: '{post_user}'\n"
+            f"Post: '{content}'\n\n"
             f"Rules:\n"
             f"1. Own official page → 0\n"
             f"2. Keyword is place/surname/idiom unrelated to brand → 0\n"
@@ -109,8 +114,9 @@ class OllamaSentimentAnalyzer:
             f"4. Criticize/boycott/mock/scandal → -100\n"
             f"5. Praise/support/defend → 100\n"
             f"6. Default → 0\n"
-            f"{{\"ai_sentiment\": ?}}"
+            f"{{\"reason\": \"short reason\", \"ai_sentiment\": ?}}"
         )
+
 
         payload = {
             "model": self.model,
@@ -124,7 +130,7 @@ class OllamaSentimentAnalyzer:
                 "temperature": 0.0,
                 "top_p": 0.1,
                 "seed": 42,
-                "num_predict": 15,               # ✅ JSON แค่ {"ai_sentiment": -100} ไม่ต้องเผื่อ
+                "num_predict": 128,              # ✅ ให้พื้นที่ AI พิมพ์เหตุผลสั้นๆ ได้จบประโยค
                 "num_ctx": 1024,                 # ✅ context window เล็ก ประหยัด VRAM
                 "num_batch": 256,                # ✅ สมดุลระหว่างความเร็วกับ VRAM
                 "num_gpu": 99,                   # ✅ บังคับทุก layer ขึ้น GPU
@@ -159,7 +165,8 @@ class OllamaSentimentAnalyzer:
                     return {
                         "post_id":      post_id,
                         "ai_sentiment": int(ai_sentiment),
-                        "confidence":   0
+                        "confidence":   0,
+                        "reason":       parsed.get("reason", "")
                     }
                 except json.JSONDecodeError as e:
                     print(f"  -> JSONDecodeError [{post_id}]: {e} | Raw Clean Text: {clean_text[:150]}")
@@ -240,25 +247,6 @@ class sentiment:
 
         return list_content
 
-    # def get_keyword(self):
-    #     sql = """
-    #         SELECT keyword_name, client_id, status
-    #         FROM keyword
-    #         WHERE client_id = 67 AND status = 'active'
-    #         ORDER BY created_date DESC
-    #         LIMIT 1 
-    #     """
-    #     keywords_item = CONN.getfromdb(query=sql,
-    #                                 DB='mysqldb',
-    #                                 database='blue_eye',
-    #                                 server=1,
-    #                                 host='10.130.84.170'
-    #     )
-
-    #     for item in keywords_item:
-    #         if item[0] not in self.list_of_keywords:
-    #             self.list_of_keywords.append((item[0], item[1], item[2]))
-
     def analysis(self, list_content, host, server=1, table_prefix="own_match"):
         """
         วิเคราะห์ sentiment แล้วอัพเดทลง MySQL
@@ -273,13 +261,14 @@ class sentiment:
 
         BATCH_SIZE = 20
         total = len(list_content)
-        print(f"\nTotal content to analyze: {total}")
+        print(f"\n📦 พบข้อความที่ต้องวิเคราะห์ทั้งหมด: {total} โพสต์")
 
         for batch_start in range(0, total, BATCH_SIZE):
             batch = list_content[batch_start:batch_start + BATCH_SIZE]
             batch_end = min(batch_start + BATCH_SIZE, total)
-            print(f"\n--- Batch {batch_start + 1}-{batch_end} / {total} ---")
+            print(f"\n🔄 กำลังประมวลผล Batch {batch_start + 1}-{batch_end} จากทั้งหมด {total} โพสต์...")
 
+            is_competitor = (table_prefix == "competitor_match")
             posts_for_ai = []
             batch_project_name = ""
             for (_id, content, project_name, post_user, kw_name) in batch:
@@ -292,14 +281,22 @@ class sentiment:
                 if text:
                     # กรณีที่มีหลายคำคั่นด้วยลูกน้ำ (เช่น ทราย, สุนิษฐ์, พาย) อาจจะเลือกคำแรกมาใช้สแกน
                     first_keyword = kw_name.split(",")[0].strip() if kw_name else ""
-                    clean_short_content = get_keyword_context(text, first_keyword, window=200)  # ✅ GTX 1660: ลดจาก 300 → 200 ลด token
-                    print("clean_short_content >>>>>>> ", clean_short_content)
+                    clean_short_content = get_keyword_context(text, first_keyword, window=200)
+
+                    # กำหนด actual_target ตามประเภท:
+                    # - COMPETITOR: ใช้ keyword เป็น Target (เพราะ project_name = 'Rivals' ซึ่งไม่ใช่ชื่อแบรนด์)
+                    # - OWN: ใช้ project_name เป็น Target (ชื่อแบรนด์จริง)
+                    if is_competitor:
+                        actual_target = first_keyword if first_keyword else project_name
+                    else:
+                        actual_target = project_name
 
                     posts_for_ai.append({
                         "post_id": str(_id),
                         "post_user": post_user,
                         "project_name": project_name,
                         "keyword_name": kw_name,
+                        "actual_target": actual_target,
                         "content": clean_short_content
                     })
 
@@ -309,19 +306,16 @@ class sentiment:
 
             json_str = json.dumps(posts_for_ai, ensure_ascii=False)
 
-            print(f"  -> Sending {len(posts_for_ai)} posts to Ollama (qwen3-8b-instruct)...")
-            print(f"  -> Project: {batch_project_name}")
+            target_label = f"{'COMPETITOR' if is_competitor else 'OWN'} | Project: {batch_project_name}"
+            print(f"  🚀 ส่ง {len(posts_for_ai)} โพสต์ไปยัง Ollama ({target_label})")
 
             ollama_response = self.ollama.analyze_post_sentiments(json_str, batch_project_name)
 
             if "error" in ollama_response:
-                print(f"  -> Ollama Error: {ollama_response.get('message', ollama_response['error'])}")
+                print(f"  ❌ ข้อผิดพลาดจาก Ollama: {ollama_response.get('message', ollama_response['error'])}")
 
             ollama_results = ollama_response.get("data", [])
             ollama_token_usage = ollama_response.get("token_usage", {})
-            print(f"  -> Ollama Tokens: input={ollama_token_usage.get('input', 0)}, "
-                  f"output={ollama_token_usage.get('output', 0)}, "
-                  f"total={ollama_token_usage.get('total', 0)}")
 
             ollama_map = {}
             if isinstance(ollama_results, list):
@@ -329,39 +323,42 @@ class sentiment:
                     if "post_id" in res and "ai_sentiment" in res:
                         ollama_map[res["post_id"]] = {
                             "ai_sentiment": res["ai_sentiment"],
-                            "confidence": res.get("confidence", 0)
+                            "confidence": res.get("confidence", 0),
+                            "reason": res.get("reason", "")
                         }
 
-            print(f"\n  {'No.':<5} {'Post ID':<32} {'Ollama':<12} {'Conf.':<7} {'Project':<20} Keyword")
-            print(f"  {'='*120}")
+            print(f"\n  📊 สรุปผลลัพธ์จาก Ollama (สำเร็จ {len(ollama_map)}/{len(batch)} โพสต์)")
+            print(f"  {'-'*100}")
 
             for idx, (_id, content, project_name, post_user, kw_name) in enumerate(batch, 1):
                 str_id = str(_id)
 
-                ollama_conf_str = "N/A"
                 if str_id in ollama_map:
                     ollama_val = float(ollama_map[str_id]["ai_sentiment"])
-                    ollama_conf = ollama_map[str_id]["confidence"]
-                    ollama_conf_str = f"{ollama_conf}%" if ollama_conf is not None else "N/A"
+                    ai_reason = ollama_map[str_id].get("reason", "")
                     if ollama_val > 0:
-                        ollama_label = "Positive"
+                        icon = "🟢 Positive"
                     elif ollama_val < 0:
-                        ollama_label = "Negative"
+                        icon = "🔴 Negative"
                     else:
-                        ollama_label = "Neutral"
+                        icon = "⚪ Neutral "
                 else:
                     ollama_val = None
-                    ollama_label = "N/A"
+                    ai_reason = ""
+                    icon = "⚠️ N/A     "
 
-                display_content = str(content)[:300].replace("\n", " ")
-                print(f"  {idx:<5} {str_id[:30]:<32} {ollama_label:<12} {ollama_conf_str:<7} {project_name:<20} {kw_name}")
-                print(f"        Content: {display_content}")
-                if ollama_val is not None:
-                    print(f"        Ollama={ollama_val} (Conf: {ollama_conf_str})")
-                print()
+                # หา actual_target ที่ตรงกับโพสต์นี้
+                actual_target = next((p["actual_target"] for p in posts_for_ai if p["post_id"] == str_id), project_name)
 
-            print(f"  {'='*120}")
-            print(f"  Batch: {len(batch)} posts | Ollama results: {len(ollama_map)}")
+                display_content = str(content)[:120].replace("\n", " ")
+                if len(str(content)) > 120:
+                    display_content += "..."
+                    
+                print(f"  [{idx:02d}] 🆔 {str_id[:15]:<15} | {icon:<11} | User: {str(post_user)[:12]:<12} | Proj: {project_name[:10]:<10} | Target: {actual_target[:15]:<15} | KW: {kw_name}")
+                if ai_reason:
+                    print(f"       💡 Reason: {ai_reason}")
+                print(f"       📝 {display_content}")
+                print(f"  {'-'*100}")
 
             # # ===== อัพเดท DB =====
             # for (_id, content, project_name, post_user, kw_name) in batch:
@@ -383,7 +380,7 @@ class sentiment:
         DB_CONNECTION.close()
         if 'tunnel' in locals() and tunnel:
             tunnel.stop()
-        print("\n--- Process Complete (บันทึกลง DB แล้ว) ---")
+        print("\n✅ วิเคราะห์ข้อมูลทั้งหมดเสร็จสิ้นแล้ว (รอเปิดคอมเมนต์ส่วนอัพเดท DB)")
 
 # =============================================================================
 # Main
@@ -459,9 +456,11 @@ if __name__ == "__main__":
                 f"SELECT cmd.msg_id, "
                 f"IFNULL(ck.company_keyword_name, '') as project_name, "
                 f"IFNULL(cmd.post_user, '') as post_user, "
-                f"'' as keyword_name "
+                f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
                 f"FROM competitor_match_daily cmd "
                 f"LEFT JOIN company_keyword ck ON cmd.company_keyword_id = ck.company_keyword_id "
+                f"LEFT JOIN competitor_key_match ckm ON ckm.competitor_match_id = cmd.competitor_match_id "
+                f"LEFT JOIN keyword k ON ckm.keyword_id = k.keyword_id "
                 f"WHERE date(cmd.msg_time) BETWEEN '{yesterday}' AND '{now}' "
                 f"AND cmd.sentiment_status = '0' AND cmd.match_type = 'Feed' "
                 f"GROUP BY cmd.msg_id, project_name, post_user "
@@ -471,9 +470,11 @@ if __name__ == "__main__":
                 f"SELECT cmd.msg_id, "
                 f"IFNULL(ck.company_keyword_name, '') as project_name, "
                 f"IFNULL(cmd.post_user, '') as post_user, "
-                f"'' as keyword_name "
+                f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
                 f"FROM competitor_match_daily cmd "
                 f"LEFT JOIN company_keyword ck ON cmd.company_keyword_id = ck.company_keyword_id "
+                f"LEFT JOIN competitor_key_match ckm ON ckm.competitor_match_id = cmd.competitor_match_id "
+                f"LEFT JOIN keyword k ON ckm.keyword_id = k.keyword_id "
                 f"WHERE date(cmd.msg_time) BETWEEN '{yesterday}' AND '{now}' "
                 f"AND cmd.sentiment_status = '0' AND cmd.match_type = 'Comment' "
                 f"GROUP BY cmd.msg_id, project_name, post_user "
@@ -482,25 +483,23 @@ if __name__ == "__main__":
         }
     ]
 
-    print("=" * 65)
-    print("     Ollama (qcwind/qwen3-8b-instruct-Q4-K-M:latest) SENTIMENT ANALYSIS")
-    print(f"     Date Range: {yesterday} ~ {now}")
-    print("=" * 65)
+    print("\n" + "=" * 70)
+    print(" 🤖 Ollama (qwen3-8b-instruct) SENTIMENT ANALYSIS SYSTEM")
+    print(f" 📅 ช่วงเวลา: {yesterday} ถึง {now}")
+    print("=" * 70)
 
     sa = sentiment(config)
 
     for server_id in [1, 2]:
         current_host = config[f"mysql_host_{server_id}"]
         
-        print(f"\n{'=' * 65}")
-        print(f"     STARTING MYSQL SERVER {server_id} ({current_host})")
-        print(f"{'=' * 65}")
+        print(f"\n{'=' * 70}")
+        print(f" 🖥️  เริ่มทำงานกับ MYSQL SERVER {server_id} ({current_host})")
+        print(f"{'=' * 70}")
 
         for target in targets:
-            print(f"\n{'=' * 65}")
-            print(f"     PROCESSING: {target['name']} (Server {server_id})")
-            print(f"{'=' * 65}")
-
+            print(f"\n🎯 กำลังดึงข้อมูล: {target['name']} ...")
+            print(target["sql_feed"])
             # --- ดึง Feed msg_ids + project_name ---
             _item = CONN.getfromdb(
                 query=target["sql_feed"], 
@@ -511,15 +510,7 @@ if __name__ == "__main__":
             )
 
             list_id_with_project = [(x[0], x[1], x[2], x[3]) for x in _item]
-            print(f"\nFeed posts to analyze: {len(list_id_with_project)}")
-
-            print(f"\n--- SQL_FEED Query ({target['name']}) ---")
-            print(f"SQL: {target['sql_feed']}")
-            print(f"\n{'No.':<5} {'msg_id':<45} {'project_name'}")
-            print(f"{'-'*80}")
-            for i, (msg_id, proj, post_user, kw_name) in enumerate(list_id_with_project, 1):
-                print(f"{i:<5} {str(msg_id)[:43]:<45} {proj}")
-            print(f"{'-'*80}")
+            print(f"  👉 พบข้อมูลจาก Feed: {len(list_id_with_project)} โพสต์")
 
             list_content = sa.get_content(list_id_with_project, "Feed")
 
@@ -533,19 +524,19 @@ if __name__ == "__main__":
             )
 
             list_id_with_project = [(x[0], x[1], x[2], x[3]) for x in _item]
-            print(f"Comment posts to analyze: {len(list_id_with_project)}")
+            print(f"  👉 พบข้อมูลจาก Comment: {len(list_id_with_project)} โพสต์")
 
             list_content += sa.get_content(list_id_with_project, "Comment")
 
-            print(f"Total content to process for {target['name']} (Server {server_id}): {len(list_content)}")
+            print(f"  📌 รวมทั้งหมดที่ต้องประมวลผล: {len(list_content)} โพสต์")
 
             # --- วิเคราะห์ด้วย Ollama แล้วบันทึกลง DB ---
             if list_content:
                 sa.analysis(list_content, current_host, server=server_id, table_prefix=target["table_prefix"])
             else:
-                print(f"\nNo content to analyze for {target['name']} on Server {server_id}.")
+                print(f"  ⏩ ไม่มีข้อมูลใหม่สำหรับ {target['name']} ข้ามไปทำส่วนถัดไป...")
 
     end_time = time.time()
     total_time = end_time - start_time
-    print(f"\n--- Total Execution Time: {total_time:.2f} seconds ---")
+    print(f"\n🎉 สิ้นสุดการทำงานทั้งหมด! ใช้เวลาไปทั้งสิ้น: {total_time:.2f} วินาที")
 

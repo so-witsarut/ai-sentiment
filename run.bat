@@ -10,21 +10,21 @@ echo.
 echo  กด Ctrl+C เพื่อหยุดการทำงาน
 echo.
 
-:: ตรวจสอบว่ามี .venv อยู่ไหม
+rem ตรวจสอบว่ามี .venv อยู่ไหม
 if not exist ".venv\Scripts\python.exe" (
     echo  [ERROR] ไม่พบ .venv — กรุณารัน setup.bat ก่อน
     pause
     exit /b 1
 )
 
-:: ตรวจสอบว่ามี .env อยู่ไหม
+rem ตรวจสอบว่ามี .env อยู่ไหม
 if not exist ".env" (
     echo  [WARNING] ไม่พบไฟล์ .env — คัดลอก .env.example เป็น .env แล้วใส่ credentials
     echo  ใช้โหมด mockup แทน...
     echo.
 )
 
-:: รันสคริปต์
+rem รันสคริปต์
 .venv\Scripts\python.exe run_forever.py
 
 echo.
