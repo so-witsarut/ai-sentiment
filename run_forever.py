@@ -153,9 +153,11 @@ def process_targets(sa_obj):
                 f"SELECT cmd.msg_id, "
                 f"IFNULL(ck.company_keyword_name, '') as project_name, "
                 f"IFNULL(cmd.post_user, '') as post_user, "
-                f"'' as keyword_name "
+                f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
                 f"FROM competitor_match_daily cmd "
                 f"LEFT JOIN company_keyword ck ON cmd.company_keyword_id = ck.company_keyword_id "
+                f"LEFT JOIN competitor_key_match ckm ON ckm.competitor_match_id = cmd.competitor_match_id "
+                f"LEFT JOIN keyword k ON ckm.keyword_id = k.keyword_id "
                 f"WHERE date(cmd.msg_time) BETWEEN '{yesterday}' AND '{now_str}' "
                 f"AND cmd.sentiment_status = '0' AND cmd.match_type = 'Feed' "
                 f"GROUP BY cmd.msg_id, project_name, post_user "
@@ -165,9 +167,11 @@ def process_targets(sa_obj):
                 f"SELECT cmd.msg_id, "
                 f"IFNULL(ck.company_keyword_name, '') as project_name, "
                 f"IFNULL(cmd.post_user, '') as post_user, "
-                f"'' as keyword_name "
+                f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
                 f"FROM competitor_match_daily cmd "
                 f"LEFT JOIN company_keyword ck ON cmd.company_keyword_id = ck.company_keyword_id "
+                f"LEFT JOIN competitor_key_match ckm ON ckm.competitor_match_id = cmd.competitor_match_id "
+                f"LEFT JOIN keyword k ON ckm.keyword_id = k.keyword_id "
                 f"WHERE date(cmd.msg_time) BETWEEN '{yesterday}' AND '{now_str}' "
                 f"AND cmd.sentiment_status = '0' AND cmd.match_type = 'Comment' "
                 f"GROUP BY cmd.msg_id, project_name, post_user "
@@ -184,6 +188,7 @@ def process_targets(sa_obj):
         log.info(f"{'=' * 40}")
 
         for target in targets:
+            # log.info(target["sql_feed"])
             import sys
             if r"ai-sentiment" not in sys.path:
                 sys.path.append(r"ai-sentiment")

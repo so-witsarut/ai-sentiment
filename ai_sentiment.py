@@ -84,9 +84,10 @@ class OllamaSentimentAnalyzer:
 
         # === System Prompt (สร้างครั้งเดียว ใช้ซ้ำทุก request) ===
         self.system_instruction = (
-            "Thai Brand Sentiment Classifier. "
-            "Given a post and Target Entity, reply ONLY: {\"ai_sentiment\": 0|100|-100}. "
-            "No explanation."
+            "You are a strict Thai Sentiment Analyzer. "
+            "/no_think "                              # ✅ magic token ของ qwen3 (ปิด thinking mode)
+            'Output ONLY a minified JSON object: {"reason": "<เหตุผลสั้นๆ ภาษาไทย>", "ai_sentiment": <int>}. '
+            "Do not explain or add markdown formatting."
         )
 
     def _analyze_single_post(self, post, project_name):
@@ -105,17 +106,17 @@ class OllamaSentimentAnalyzer:
         actual_target = post.get("actual_target", project_name)
 
         user_prompt = (
-            f"Target: '{actual_target}' | Keyword: '{matched_keyword}' | User: '{post_user}'\n"
-            f"Post: '{content}'\n\n"
-            f"Rules:\n"
-            f"1. Target is NOT mentioned or post is about OTHER companies → 0\n"
-            f"2. Own official page → 0\n"
-            f"3. Keyword is place/surname/idiom unrelated to Target → 0\n"
-            f"4. Ad/PR/sports/stock news (no Target scandal) → 0\n"
-            f"5. Criticize/boycott/mock/scandal specifically about Target → -100\n"
-            f"6. Praise/support/defend specifically about Target → 100\n"
-            f"7. Default → 0\n"
-            f"{{\"reason\": \"เหตุผลสั้นๆ ภาษาไทย\", \"ai_sentiment\": ?}}"
+            f"Target Corporate Entity: '{actual_target}'\n"
+            f"Trigger Keyword: '{matched_keyword}'\n"
+            f"Post User: '{post_user}'\n"
+            f"Text to analyze: '{content}'\n\n"
+            "INSTRUCTIONS:\n"
+            "Step 1 - OWNED MEDIA: If 'Post User' is the Target Entity's official page -> Output and STOP.\n"
+            "Step 2 - NEUTRAL NEWS & PR: Is the text an advertisement, a marketing event, sports news, or general news (like local crimes, drug busts, police arrests) that does NOT explicitly report a real scandal/crisis of the Target Entity? (Note: Ignore local idioms/metaphors, e.g., 'กลายเป็นเสือเป็นสิงห์') -> Output and STOP.\n"
+            "Step 3 - NEGATIVE & CRISIS: Does the text explicitly criticize, boycott (e.g., 'บอกลา', 'ไม่กิน'), mock (even with laughing emojis), or report a damaging scandal/lawsuit DIRECTLY against the Target Entity? (Note: Ignore marketing hyperbole, e.g., 'ไม่มีอะไรดีไปกว่า') -> Output and STOP.\n"
+            "Step 4 - POSITIVE & PRAISE: Does the text explicitly praise, compliment, support, or defend the Target Entity in a clearly positive way? -> Output and STOP.\n"
+            "Output ONLY a valid JSON object in this exact format at the very end:\n"
+            '{"reason": "เหตุผลสั้นๆ ภาษาไทย", "ai_sentiment": <int>}'
         )
 
 
@@ -131,7 +132,7 @@ class OllamaSentimentAnalyzer:
                 "temperature": 0.0,
                 "top_p": 0.1,
                 "seed": 42,
-                "num_predict": 128,              # ✅ ให้พื้นที่ AI พิมพ์เหตุผลสั้นๆ ได้จบประโยค
+                "num_predict": 128,              # ✅ ให้พื้นที่พิมพ์ reason ภาษาไทยได้จบประโยค
                 "num_ctx": 1024,                 # ✅ context window เล็ก ประหยัด VRAM
                 "num_batch": 256,                # ✅ สมดุลระหว่างความเร็วกับ VRAM
                 "num_gpu": 99,                   # ✅ บังคับทุก layer ขึ้น GPU
