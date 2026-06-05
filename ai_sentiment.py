@@ -261,7 +261,7 @@ class sentiment:
         """
         tunnel, DB_CONNECTION = CONN.get_mysql_connection(server=server, host=host, database=self.config["mysql_db"])
 
-        BATCH_SIZE = 20
+        BATCH_SIZE = 5
         total = len(list_content)
         print(f"\n📦 พบข้อความที่ต้องวิเคราะห์ทั้งหมด: {total} โพสต์")
 
