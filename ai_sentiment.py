@@ -367,27 +367,33 @@ class sentiment:
                 print(f"       ✂️ Sliced (to AI): {ai_sliced}")
                 print(f"  {'-'*100}")
 
-            # # ===== อัพเดท DB =====
-            # for (_id, content, project_name, post_user, kw_name) in batch:
-            #     str_id = str(_id)
-            #     if str_id not in ollama_map:
-            #         continue
-            #     sentiment_val = float(ollama_map[str_id]["ai_sentiment"])
-            #     cursor = DB_CONNECTION.cursor()
-            #     SQL = f'UPDATE {table_prefix} SET {table_prefix}_sentiment = {{0}}, sentiment_status = {{1}} WHERE msg_id = "{{2}}"'.format(sentiment_val, "1", str(_id))
-            #     cursor.execute(SQL)
-            #     SQL = f'UPDATE {table_prefix}_daily SET {table_prefix}_sentiment = {{0}}, sentiment_status = {{1}} WHERE msg_id = "{{2}}"'.format(sentiment_val, "1", str(_id))
-            #     cursor.execute(SQL)
-            #     SQL = f'UPDATE {table_prefix}_3months SET {table_prefix}_sentiment = {{0}}, sentiment_status = {{1}} WHERE msg_id = "{{2}}"'.format(sentiment_val, "1", str(_id))
-            #     cursor.execute(SQL)
-            # DB_CONNECTION.commit()
+            # ===== อัพเดท DB =====
+            cursor = DB_CONNECTION.cursor()
+
+
+            for (_id, content, project_name, post_user, kw_name) in batch:
+                str_id = str(_id)
+                if str_id not in ollama_map:
+                    continue
+                sentiment_val = float(ollama_map[str_id]["ai_sentiment"])
+                ai_reason_val = ollama_map[str_id].get("reason", "") or ""
+
+                for tbl in [table_prefix, f"{table_prefix}_daily", f"{table_prefix}_3months"]:
+                    cursor.execute(
+                        f'UPDATE `{tbl}` SET `{table_prefix}_sentiment` = %s, `sentiment_status` = %s, `ai_reason` = %s WHERE msg_id = %s',
+                        (sentiment_val, "1", ai_reason_val, str(_id))
+                    )
+
+            DB_CONNECTION.commit()
+            cursor.close()
+            print(f"  💾 บันทึกลง DB เรียบร้อย ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
 
             # ไม่ต้องมีการดีเลย์ระหว่าง batch สำหรับ Local Ollama
 
         DB_CONNECTION.close()
         if 'tunnel' in locals() and tunnel:
             tunnel.stop()
-        print("\n✅ วิเคราะห์ข้อมูลทั้งหมดเสร็จสิ้นแล้ว (รอเปิดคอมเมนต์ส่วนอัพเดท DB)")
+        print("\n✅ วิเคราะห์และบันทึกข้อมูลทั้งหมดเสร็จสิ้นแล้ว")
 
 # =============================================================================
 # Main
@@ -497,7 +503,7 @@ if __name__ == "__main__":
 
     sa = sentiment(config)
 
-    for server_id in [1, 2]:
+    for server_id in [1]: #, 2]: ทดสอบเฉพาะ server 1 ก่อน
         current_host = config[f"mysql_host_{server_id}"]
         
         print(f"\n{'=' * 70}")
