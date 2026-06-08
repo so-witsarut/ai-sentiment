@@ -61,49 +61,88 @@ except ImportError as e:
 # ═══════════════════════════════════════════════════════════════
 # ตั้งค่า
 # ═══════════════════════════════════════════════════════════════
-INTERVAL  = int(os.environ.get("RUN_INTERVAL_MINUTES", 10))   # นาที
-RUN_MODE  = os.environ.get("RUN_MODE", "mockup").lower()       # mockup | db
+INTERVAL  = 10
+RUN_MODE  = "mockup"
+DB_CONFIG = {}
 
-DB_CONFIG = {
-    "mysql_host_1":   os.environ.get("MYSQL_HOST_1", "10.130.84.170"),
-    "mysql_host_2":   os.environ.get("MYSQL_HOST_2", "10.130.69.57"),
-    "mysql_port":     int(os.environ.get("MYSQL_PORT", 3306)),
-    "mysql_user":     os.environ.get("MYSQL_USER"),
-    "mysql_password": os.environ.get("MYSQL_PASSWORD"),
-    "mysql_db":       os.environ.get("MYSQL_DB", "blue_eye"),
-    "mongo_host":     os.environ.get("MONGO_HOST"),
-    "mongo_port":     int(os.environ.get("MONGO_PORT", 34596)),
-    "mongo_user":     os.environ.get("MONGO_USER"),
-    "mongo_password": os.environ.get("MONGO_PASSWORD"),
-    "mongo_db":       os.environ.get("MONGO_DB", "blue_eye"),
-    "ssh_host":       os.environ.get("SSH_HOST"),
-    "ssh_port":       int(os.environ.get("SSH_PORT", 22)),
-    "ssh_user":       os.environ.get("SSH_USER"),
-    "ssh_password":   os.environ.get("SSH_PASSWORD"),
-}
+def load_config():
+    global INTERVAL, RUN_MODE, DB_CONFIG
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(override=True)
+    except ImportError:
+        pass
+
+    # Reload connection เพื่ออัพเดท module-level globals จาก environment variables ใน .env
+    try:
+        import importlib
+        import connection
+        importlib.reload(connection)
+    except Exception as e:
+        log.warning(f"ไม่สามารถ reload connection module ได้: {e}")
+
+    INTERVAL  = int(os.environ.get("RUN_INTERVAL_MINUTES", 10))   # นาที
+    RUN_MODE  = os.environ.get("RUN_MODE", "mockup").lower()       # mockup | db
+
+    DB_CONFIG = {
+        "mysql_host_1":   os.environ.get("MYSQL_HOST_1", "10.130.84.170"),
+        "mysql_host_2":   os.environ.get("MYSQL_HOST_2", "10.130.69.57"),
+        "mysql_port":     int(os.environ.get("MYSQL_PORT", 3306)),
+        "mysql_user":     os.environ.get("MYSQL_USER"),
+        "mysql_password": os.environ.get("MYSQL_PASSWORD"),
+        "mysql_db":       os.environ.get("MYSQL_DB", "blue_eye"),
+        "mongo_host":     os.environ.get("MONGO_HOST"),
+        "mongo_port":     int(os.environ.get("MONGO_PORT", 34596)),
+        "mongo_user":     os.environ.get("MONGO_USER"),
+        "mongo_password": os.environ.get("MONGO_PASSWORD"),
+        "mongo_db":       os.environ.get("MONGO_DB", "blue_eye"),
+        "ssh_host":       os.environ.get("SSH_HOST"),
+        "ssh_port":       int(os.environ.get("SSH_PORT", 22)),
+        "ssh_user":       os.environ.get("SSH_USER"),
+        "ssh_password":   os.environ.get("SSH_PASSWORD"),
+    }
+
+# โหลดการตั้งค่าครั้งแรก
+load_config()
 
 # ─── ข้อมูลจำลอง (ใช้เมื่อ RUN_MODE=mockup) ─────────────────
-# รูปแบบ: (msg_id, content, project_name, post_user, keyword_name)
+# รูปแบบ: (msg_id, content, company_name, project_name, post_user, keyword_name)
 MOCKUP_DATA = [
     ('DYjCAykTYVB',
-     'SK-II ชวนสัมผัสประสบการณ์ดูแลผิว รับส่วนลด 10% เฉพาะ 22-24 พ.ค. นี้',
-     'Central', 'central_beautyclub', 'เซ็นทรัลลาดพร้าว'),
+     'อนาคต ทางเชื่อมใต้ดินห้าง Central Park กับ สถานีรถไฟใต้ดิน MRT สถานีสีลม…อีก 3 เดือน skywalk จะเปิดมาครบ 1 ปีแล้ว ทางใต้ดินนี้ยังก่อสร้างอยู่ งานใต้ดินใช้เวลานานกว่าบนดินมาก แต่คืบหน้าเป็นรูปเป็นร่างไปมากเช่นกัน หวังว่าภายในปีนี้น่าจะสร้างเสร็จ อยากให้อลังการแบบทางเชื่อมตามสถานีใต้ดินที่โตเกียวจัง😄',
+     'Central', 'Central', 'ฟุตบาทไทยสไตล์', 'Central Park'),
 
     ('100080317547658_1024757183544857',
      'บอกลาเบียร์สิงห์ 🤣 ปลอม คุณหลอกดาว คุณไม่รักครอบครัว กุจะหันไปกินช้าง',
-     'Boonrawd', 'Siri Preyachy', 'สิงห์'),
+     'Boonrawd', 'Boonrawd', 'Siri Preyachy', 'สิงห์'),
 
     ('28143837526',
      '"สิงห์" เสี่ยงเสียความผูกพันต่อผู้บริโภค จากมหากาพย์ดราม่าครอบครัว',
-     'Boonrawd', 'Positioningmag', 'สิงห์'),
+     'Boonrawd', 'Boonrawd', 'Positioningmag', 'สิงห์'),
 
     ('100064782188264_1454988ddddddddd',
      '"บุญรอดบริวเวอรี่" สั่งปลดพายสก๊อตพ้นทุกตำแหน่งแล้ว หลังดราม่าครอบครัว #ทรายสก๊อต',
-     'Boonrawd', 'Dailynews', 'บุญรอดบริวเวอรี่'),
+     'Boonrawd', 'Boonrawd', 'Dailynews', 'บุญรอดบริวเวอรี่'),
 
     ('DYjYKgfFEH5',
      'งานแถลง HISENSE Football Youth Cup 2026 สนามสิงห์เชียงราย สเตเดียม',
-     'Boonrawd', 'chiangrai_united', 'สิงห์'),
+     'Boonrawd', 'Boonrawd', 'chiangrai_united', 'สิงห์'),
+
+    ('DYjgfFeeEH4',
+     'สวยแบบจักรวาลร้องว๊าววววควรค่าแก่การเป็นสะใภ้รังษีสิงห์พิพัฒน์หุ่นคือไม่อ้วน ไม่ผอม ดูรวย ดูแพงลักษณะคนมีวาสนาของแท่',
+     'Boonrawd', 'Boonrawd', 'ก็ชอบแบบนี้ ก็ชอบแบบนี้', 'สิงห์'),
+
+    ('DYjgfFeeEH3',
+     '#บันเทิง #ดราม่า #ทรายสก็อต #มายด์',
+     'Boonrawd', 'Boonrawd', 'Sparktrends', 'ทราย'),
+
+    ('DYjgfFeeEH8',
+     'ไม่ใช่ทายาท ไม่ใช่ลูก เป็นแค่ลูกค้าของ สก๊อต และ สิงห์เท่านั้น เราชอบ เรื่องอื่นเราไม่ยุ่ง มุ่งแต่เรื่องของเราก็ปวดหัวพอแล้วจ้ะ',
+     'Boonrawd', 'Boonrawd', 'ยิ่งรัก ยิ่งลุ่มหลง', 'สิงห์'),
+
+     ('DYjgfFeeEH8',
+     'ชอบฟังเพลงชาร์คเต้ฮะสมัย ม.ปลาย เปิดวนอ่ะ เพลงเบอร์สอง',
+     'Boonrawd', 'Boonrawd', 'Min Thitapus', 'ชาร์คเต้'),
 ]
 
 # ═══════════════════════════════════════════════════════════════
@@ -119,30 +158,34 @@ def process_targets(sa_obj):
             "table_prefix": "own_match",
             "sql_feed": (
                 f"SELECT omd.msg_id, "
+                f"IFNULL(c.company_name, '') as company_name, "
                 f"IFNULL(ck.company_keyword_name, '') as project_name, "
                 f"IFNULL(omd.post_user, '') as post_user, "
                 f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
                 f"FROM own_match_daily omd "
                 f"LEFT JOIN company_keyword ck ON omd.company_keyword_id = ck.company_keyword_id "
+                f"LEFT JOIN client c ON omd.client_id = c.client_id "
                 f"LEFT JOIN own_key_match okm ON okm.own_match_id = omd.own_match_id "
                 f"LEFT JOIN keyword k ON okm.keyword_id = k.keyword_id "
                 f"WHERE date(omd.msg_time) BETWEEN '{yesterday}' AND '{now_str}' "
                 f"AND omd.sentiment_status = '0' AND omd.match_type = 'Feed' "
-                f"GROUP BY omd.msg_id, project_name, post_user "
+                f"GROUP BY omd.msg_id, company_name, project_name, post_user "
                 f"ORDER BY omd.msg_time ASC"
             ),
             "sql_comment": (
                 f"SELECT omd.msg_id, "
+                f"IFNULL(c.company_name, '') as company_name, "
                 f"IFNULL(ck.company_keyword_name, '') as project_name, "
                 f"IFNULL(omd.post_user, '') as post_user, "
                 f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
                 f"FROM own_match_daily omd "
                 f"LEFT JOIN company_keyword ck ON omd.company_keyword_id = ck.company_keyword_id "
+                f"LEFT JOIN client c ON omd.client_id = c.client_id "
                 f"LEFT JOIN own_key_match okm ON okm.own_match_id = omd.own_match_id "
                 f"LEFT JOIN keyword k ON okm.keyword_id = k.keyword_id "
                 f"WHERE date(omd.msg_time) BETWEEN '{yesterday}' AND '{now_str}' "
                 f"AND omd.sentiment_status = '0' AND omd.match_type = 'Comment' "
-                f"GROUP BY omd.msg_id, project_name, post_user "
+                f"GROUP BY omd.msg_id, company_name, project_name, post_user "
                 f"ORDER BY omd.msg_time ASC"
             )
         },
@@ -151,36 +194,40 @@ def process_targets(sa_obj):
             "table_prefix": "competitor_match",
             "sql_feed": (
                 f"SELECT cmd.msg_id, "
+                f"IFNULL(c.company_name, '') as company_name, "
                 f"IFNULL(ck.company_keyword_name, '') as project_name, "
                 f"IFNULL(cmd.post_user, '') as post_user, "
                 f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
                 f"FROM competitor_match_daily cmd "
                 f"LEFT JOIN company_keyword ck ON cmd.company_keyword_id = ck.company_keyword_id "
+                f"LEFT JOIN client c ON cmd.client_id = c.client_id "
                 f"LEFT JOIN competitor_key_match ckm ON ckm.competitor_match_id = cmd.competitor_match_id "
                 f"LEFT JOIN keyword k ON ckm.keyword_id = k.keyword_id "
                 f"WHERE date(cmd.msg_time) BETWEEN '{yesterday}' AND '{now_str}' "
                 f"AND cmd.sentiment_status = '0' AND cmd.match_type = 'Feed' "
-                f"GROUP BY cmd.msg_id, project_name, post_user "
+                f"GROUP BY cmd.msg_id, company_name, project_name, post_user "
                 f"ORDER BY cmd.msg_time ASC"
             ),
             "sql_comment": (
                 f"SELECT cmd.msg_id, "
+                f"IFNULL(c.company_name, '') as company_name, "
                 f"IFNULL(ck.company_keyword_name, '') as project_name, "
                 f"IFNULL(cmd.post_user, '') as post_user, "
                 f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
                 f"FROM competitor_match_daily cmd "
                 f"LEFT JOIN company_keyword ck ON cmd.company_keyword_id = ck.company_keyword_id "
+                f"LEFT JOIN client c ON cmd.client_id = c.client_id "
                 f"LEFT JOIN competitor_key_match ckm ON ckm.competitor_match_id = cmd.competitor_match_id "
                 f"LEFT JOIN keyword k ON ckm.keyword_id = k.keyword_id "
                 f"WHERE date(cmd.msg_time) BETWEEN '{yesterday}' AND '{now_str}' "
                 f"AND cmd.sentiment_status = '0' AND cmd.match_type = 'Comment' "
-                f"GROUP BY cmd.msg_id, project_name, post_user "
+                f"GROUP BY cmd.msg_id, company_name, project_name, post_user "
                 f"ORDER BY cmd.msg_time ASC"
             )
         }
     ]
 
-    for server_id in [1, 2]:
+    for server_id in [1]:
         current_host = DB_CONFIG.get(f"mysql_host_{server_id}")
         
         log.info(f"\n{'=' * 40}")
@@ -225,6 +272,9 @@ def process_targets(sa_obj):
 # รัน 1 รอบ
 # ═══════════════════════════════════════════════════════════════
 def run_once(round_num):
+    # โหลด config ใหม่ในแต่ละรอบ เพื่อให้สามารถเปลี่ยนสลับ RUN_MODE จาก .env ได้แบบ dynamic
+    load_config()
+
     log.info(f"{'─'*60}")
     log.info(f"  รอบที่ {round_num}  [{RUN_MODE.upper()}]  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log.info(f"{'─'*60}")
@@ -235,7 +285,7 @@ def run_once(round_num):
         list_content = MOCKUP_DATA
         log.info(f"[MOCKUP] ใช้ข้อมูลจำลอง {len(list_content)} รายการ")
         if list_content:
-            sa.analysis(list_content, DB_CONFIG.get("mysql_host") or "localhost", "own_match")
+            sa.analysis(list_content, DB_CONFIG.get("mysql_host_1") or "localhost", table_prefix="own_match")
     else:
         process_targets(sa)
 

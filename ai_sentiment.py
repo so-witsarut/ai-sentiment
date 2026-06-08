@@ -83,14 +83,17 @@ class OllamaSentimentAnalyzer:
         self.base_url = "http://localhost:11434/api/generate"
 
         # === System Prompt (สร้างครั้งเดียว ใช้ซ้ำทุก request) ===
+        # self.system_instruction = (
+        #     "You are a strict Thai Sentiment Analyzer. "
+        #     # "/no_think "                              # ✅ magic token ของ qwen3 (ปิด thinking mode)
+        #     'Output ONLY a minified JSON object: {"reason": "<เหตุผลสั้นๆ ภาษาไทย>", "ai_sentiment": <int>}. '
+        #     "Do not explain or add markdown formatting."
+        # )
         self.system_instruction = (
-            "You are a strict Thai Sentiment Analyzer. "
-            "/no_think "                              # ✅ magic token ของ qwen3 (ปิด thinking mode)
-            'Output ONLY a minified JSON object: {"reason": "<เหตุผลสั้นๆ ภาษาไทย>", "ai_sentiment": <int>}. '
-            "Do not explain or add markdown formatting."
+            'Return only JSON: {"reason":"<thai>","ai_sentiment":<int>}'
         )
 
-    def _analyze_single_post(self, post, project_name):
+    def _analyze_single_post(self, post, company_name):
         """
         วิเคราะห์ sentiment ของโพสต์เดียว (ใช้ใน ThreadPoolExecutor)
         Returns: dict with post_id, ai_sentiment, confidence หรือ None ถ้า error
@@ -98,26 +101,72 @@ class OllamaSentimentAnalyzer:
         post_id   = post["post_id"]
         content   = post["content"]
         post_user = post["post_user"]
-        matched_keyword = post.get("keyword_name", project_name)
+        matched_keyword = post.get("keyword_name", company_name)
 
         # ใช้ actual_target ที่คำนวณไว้แล้วจาก analysis()
         # ถ้าเป็น COMPETITOR → actual_target = keyword_name (ชื่อแบรนด์จริง)
-        # ถ้าเป็น OWN → actual_target = project_name
-        actual_target = post.get("actual_target", project_name)
+        # ถ้าเป็น OWN → actual_target = company_name
+        actual_target = post.get("actual_target", company_name)
 
+        # user_prompt = (
+        #     f"Target Corporate Entity: '{actual_target}'\n"
+        #     f"Trigger Keyword: '{matched_keyword}'\n"
+        #     f"Post User: '{post_user}'\n"
+        #     f"Text to analyze: '{content}'\n\n"
+        #     "INSTRUCTIONS:\n"
+        #     f"Rule 0 - BRAND MENTION CHECK: If the text does NOT explicitly mention or refer to '{actual_target}' (case-insensitive, including its common abbreviations, acronyms, parent companies, translations, or transliterated forms in Thai/English), you MUST output ai_sentiment: 0 and STOP.\n\n"
+        #     f"Step 1 - OWNED MEDIA: If 'Post User' is the official page/account/employee of '{actual_target}' -> Output ai_sentiment: 0 and STOP.\n"
+        #     f"Step 2 - NEUTRAL NEWS & PR: Is the text an advertisement, marketing promotion, sports, or general news that does NOT report a negative scandal or positive feedback directly involving '{actual_target}'? -> Output ai_sentiment: 0 and STOP.\n"
+        #     f"Step 3 - NEGATIVE & CRISIS: Does the text explicitly criticize, express anger, report a scandal, or show dissatisfaction DIRECTLY targeting '{actual_target}'? -> Output ai_sentiment: -100 and STOP.\n"
+        #     f"Step 4 - POSITIVE & PRAISE: Does the text praise, support, defend, or express satisfaction DIRECTLY with '{actual_target}'? -> Output ai_sentiment: 100 and STOP.\n"
+        #     "Output ONLY a valid JSON object in this exact format:\n"
+        #     '{"reason": "เหตุผลสั้นๆ ภาษาไทย", "ai_sentiment": <int>}'
+        # )
+        # user_prompt = (
+        #     f"Target Corporate Entity: '{actual_target}'\n"
+        #     f"Trigger Keyword (Alias/Product): '{matched_keyword}'\n"
+        #     f"Post User: '{post_user}'\n"
+        #     f"Text to analyze: '{content}'\n\n"
+        #     "INSTRUCTIONS:\n"
+        #     f"Note: The Trigger Keyword '{matched_keyword}' represents '{actual_target}'. Treat them as the same entity.\n\n"
+        #     "Rule 0 - STRICT ENTITY MATCHING:\n"
+        #     f"- If the text does NOT explicitly mention '{actual_target}' or '{matched_keyword}', output 0 and STOP.\n"
+        #     f"- FALSE POSITIVE CHECK: If '{matched_keyword}' appears ONLY as part of a person's name/surname (e.g., รังษีสิงห์พิพัฒน์), a location/stadium (e.g., สิงห์เชียงราย), or an unrelated compound word, it is NOT a valid brand mention -> Output 0 and STOP.\n\n"
+        #     f"Step 1 - OWNED MEDIA: If 'Post User' is the official page of '{actual_target}' -> Output 0 and STOP.\n"
+        #     f"Step 2 - NEUTRAL/GENERAL: Is it just an advertisement, sports result, or general news without any reputation damage to the brand? -> Output 0 and STOP.\n"
+        #     f"Step 3 - NEGATIVE & CRISIS: Does the text express anger, boycott, OR report a corporate scandal, drama, or reputation risk (e.g., เสี่ยงเสียความผูกพัน, ดราม่าครอบครัว) directly involving '{actual_target}' or '{matched_keyword}'? -> Output -100 and STOP.\n"
+        #     f"Step 4 - POSITIVE & PRAISE: Does the text explicitly express praise, support (e.g., เราชอบ, สนับสนุน), or satisfaction directly with the brand/product? -> Output 100 and STOP.\n\n"
+        #     "CRITICAL: The 'reason' MUST be based EXACTLY on the 'Text to analyze'. Do NOT invent or hallucinate products not mentioned in the text.\n"
+        #     "Output ONLY a valid JSON object in this exact format:\n"
+        #     '{"reason": "สรุปเหตุผลภาษาไทยสั้นๆ ตามเนื้อหาจริง", "ai_sentiment": <int>}'
+        # )
         user_prompt = (
-            f"Target Corporate Entity: '{actual_target}'\n"
-            f"Trigger Keyword: '{matched_keyword}'\n"
-            f"Post User: '{post_user}'\n"
-            f"Text to analyze: '{content}'\n\n"
-            "INSTRUCTIONS:\n"
-            "Step 1 - OWNED MEDIA: If 'Post User' is the Target Entity's official page -> Output and STOP.\n"
-            "Step 2 - NEUTRAL NEWS & PR: Is the text an advertisement, a marketing event, sports news, or general news (like local crimes, drug busts, police arrests) that does NOT explicitly report a real scandal/crisis of the Target Entity? (Note: Ignore local idioms/metaphors, e.g., 'กลายเป็นเสือเป็นสิงห์') -> Output and STOP.\n"
-            "Step 3 - NEGATIVE & CRISIS: Does the text explicitly criticize, boycott (e.g., 'บอกลา', 'ไม่กิน'), mock (even with laughing emojis), or report a damaging scandal/lawsuit DIRECTLY against the Target Entity? (Note: Ignore marketing hyperbole, e.g., 'ไม่มีอะไรดีไปกว่า') -> Output and STOP.\n"
-            "Step 4 - POSITIVE & PRAISE: Does the text explicitly praise, compliment, support, or defend the Target Entity in a clearly positive way? -> Output and STOP.\n"
-            "Output ONLY a valid JSON object in this exact format at the very end:\n"
-            '{"reason": "เหตุผลสั้นๆ ภาษาไทย", "ai_sentiment": <int>}'
+            f"Target={actual_target}\n"
+            f"Keyword={matched_keyword}\n"
+            f"User={post_user}\n"
+            f"Text={content}\n\n"
+
+            f"Keyword represents Target.\n"
+            f"If Target/Keyword not truly mentioned, or keyword is person/place/team name -> 0.\n"
+            f"If official page, ad, promotion, sports score, neutral news -> 0.\n"
+            f"If complaint, anger, boycott, scandal, reputation risk to Target -> -100.\n"
+            f"If praise, support, satisfaction toward Target -> 100.\n\n"
+
+            'JSON only: {"reason":"ไทยสั้นๆ","ai_sentiment":-100|0|100}'
         )
+        # user_prompt = (
+        #     f"Target: '{actual_target}' | Keyword: '{matched_keyword}' | User: '{post_user}'\n"
+        #     f"Text: '{content}'\n\n"
+        #     "RULES (Evaluate in order):\n"
+        #     "0. MATCH: If Text lacks explicit mention of Target or Keyword -> output 0, STOP.\n"
+        #     "1. FALSE POSITIVE: If Keyword is merely part of a person's name (e.g. รังษีสิงห์พิพัฒน์) or location -> output 0, STOP.\n"
+        #     "2. GENERIC/3RD-PARTY: If Keyword is a generic term (e.g. พลังงาน) AND Text praises/criticizes a different entity (e.g. MEA) -> output 0, STOP.\n"
+        #     "3. NEUTRAL/OWNED: If User is Target's official account, or Text is general news/ads without brand reputation impact -> output 0, STOP.\n"
+        #     "4. NEGATIVE: Expresses anger, boycott, drama, or reputation risk DIRECTLY targeting Target/Keyword -> output -100, STOP.\n"
+        #     "5. POSITIVE: Expresses explicit praise or support DIRECTLY for Target/Keyword -> output 100, STOP.\n\n"
+        #     "Output ONLY valid minified JSON based EXACTLY on Text:\n"
+        #     '{"reason":"สรุปเหตุผลภาษาไทยสั้นๆ 1 ประโยค","ai_sentiment":<int>}'
+        # )
 
 
         payload = {
@@ -187,7 +236,7 @@ class OllamaSentimentAnalyzer:
 
         return None
 
-    def analyze_post_sentiments(self, json_posts, project_name=""):
+    def analyze_post_sentiments(self, json_posts, company_name=""):
         """
         ✅ ส่งหลายโพสต์พร้อมกัน (concurrent) เพื่อใช้ Ollama continuous batching
         GTX 1660: ใช้ 3 workers — Ollama จะ batch requests บน GPU ให้เอง
@@ -199,7 +248,7 @@ class OllamaSentimentAnalyzer:
         # ✅ ส่ง requests แบบ concurrent ด้วย ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=self.CONCURRENT_WORKERS) as executor:
             future_to_post = {
-                executor.submit(self._analyze_single_post, post, project_name): post
+                executor.submit(self._analyze_single_post, post, company_name): post
                 for post in posts
             }
 
@@ -220,13 +269,14 @@ class sentiment:
         self.config = config
         self.ollama = OllamaSentimentAnalyzer(model="qcwind/qwen3-8b-instruct-Q4-K-M:latest")
 
-    def get_content(self, list_id_with_project, collection):
+    def get_content(self, list_id_with_info, collection):
         list_content = []
 
-        project_map   = {msg_id: proj         for (msg_id, proj, post_user, kw_name) in list_id_with_project}
-        post_user_map = {msg_id: post_user    for (msg_id, proj, post_user, kw_name) in list_id_with_project}
-        keyword_map   = {msg_id: kw_name      for (msg_id, proj, post_user, kw_name) in list_id_with_project}
-        list_id = [msg_id for (msg_id, proj, post_user, kw_name) in list_id_with_project]
+        company_map   = {msg_id: comp         for (msg_id, comp, proj, post_user, kw_name) in list_id_with_info}
+        project_map   = {msg_id: proj         for (msg_id, comp, proj, post_user, kw_name) in list_id_with_info}
+        post_user_map = {msg_id: post_user    for (msg_id, comp, proj, post_user, kw_name) in list_id_with_info}
+        keyword_map   = {msg_id: kw_name      for (msg_id, comp, proj, post_user, kw_name) in list_id_with_info}
+        list_id = [msg_id for (msg_id, comp, proj, post_user, kw_name) in list_id_with_info]
 
         if not list_id:
             return list_content
@@ -245,13 +295,14 @@ class sentiment:
         for e in result:
             feedcontent = e.get(columnName, "")
             msg_id = e["_id"]
+            comp_name = company_map.get(msg_id, "")
             proj_name = project_map.get(msg_id, "")
             post_user = post_user_map.get(msg_id, "")
             kw_name   = keyword_map.get(msg_id, "")
             # fallback: ถ้า post_user ว่าง ให้ใช้ prefix ก่อน '_' จาก msg_id
             if not post_user:
                 post_user = str(msg_id).split("_")[0]
-            list_content.append((msg_id, feedcontent, proj_name, post_user, kw_name))
+            list_content.append((msg_id, feedcontent, comp_name, proj_name, post_user, kw_name))
 
         # ไม่ปิด connection — เป็น shared connection ที่ CONN จัดการให้
 
@@ -262,7 +313,7 @@ class sentiment:
         วิเคราะห์ sentiment แล้วอัพเดทลง MySQL
 
         Args:
-            list_content (list): [(msg_id, content, project_name, post_user, kw_name), ...]
+            list_content (list): [(msg_id, content, company_name, project_name, post_user, kw_name), ...]
             host (str): MySQL host
             server (int): MySQL Server ID (1 or 2)
             table_prefix (str): 'own_match' หรือ 'competitor_match'
@@ -280,11 +331,14 @@ class sentiment:
 
             is_competitor = (table_prefix == "competitor_match")
             posts_for_ai = []
+            batch_company_name = ""
             batch_project_name = ""
-            for (_id, content, project_name, post_user, kw_name) in batch:
+            for (_id, content, company_name, project_name, post_user, kw_name) in batch:
                 text = re.sub(r"<[^>]+>", "", str(content))
                 text = re.sub(r"\s+", " ", text).strip()
 
+                if not batch_company_name and company_name:
+                    batch_company_name = company_name
                 if not batch_project_name and project_name:
                     batch_project_name = project_name
 
@@ -294,17 +348,17 @@ class sentiment:
                     clean_short_content = get_keyword_context(text, first_keyword, window=200)
 
                     # กำหนด actual_target ตามประเภท:
-                    # - COMPETITOR: ใช้ keyword เป็น Target (เพราะ project_name = 'Rivals' ซึ่งไม่ใช่ชื่อแบรนด์)
-                    # - OWN: ใช้ project_name เป็น Target (ชื่อแบรนด์จริง)
+                    # - COMPETITOR: ใช้ keyword เป็น Target
+                    # - OWN: ใช้ company_name เป็น Target (ชื่อแบรนด์จริง)
                     if is_competitor:
                         actual_target = first_keyword if first_keyword else project_name
                     else:
-                        actual_target = project_name
+                        actual_target = company_name
 
                     posts_for_ai.append({
                         "post_id": str(_id),
                         "post_user": post_user,
-                        "project_name": project_name,
+                        "company_name": company_name,
                         "keyword_name": kw_name,
                         "actual_target": actual_target,
                         "content": clean_short_content
@@ -316,10 +370,10 @@ class sentiment:
 
             json_str = json.dumps(posts_for_ai, ensure_ascii=False)
 
-            target_label = f"{'COMPETITOR' if is_competitor else 'OWN'} | Project: {batch_project_name}"
+            target_label = f"{'COMPETITOR' if is_competitor else 'OWN'} | Company: {batch_company_name} | Proj: {batch_project_name}"
             print(f"  🚀 ส่ง {len(posts_for_ai)} โพสต์ไปยัง Ollama ({target_label})")
 
-            ollama_response = self.ollama.analyze_post_sentiments(json_str, batch_project_name)
+            ollama_response = self.ollama.analyze_post_sentiments(json_str, batch_company_name)
 
             if "error" in ollama_response:
                 print(f"  ❌ ข้อผิดพลาดจาก Ollama: {ollama_response.get('message', ollama_response['error'])}")
@@ -340,7 +394,7 @@ class sentiment:
             print(f"\n  📊 สรุปผลลัพธ์จาก Ollama (สำเร็จ {len(ollama_map)}/{len(batch)} โพสต์)")
             print(f"  {'-'*100}")
 
-            for idx, (_id, content, project_name, post_user, kw_name) in enumerate(batch, 1):
+            for idx, (_id, content, company_name, project_name, post_user, kw_name) in enumerate(batch, 1):
                 str_id = str(_id)
 
                 if str_id in ollama_map:
@@ -358,7 +412,7 @@ class sentiment:
                     icon = "⚠️ N/A     "
 
                 # หา actual_target และ content ที่ถูกตัดแล้ว (ส่งให้ AI) ที่ตรงกับโพสต์นี้
-                actual_target = next((p["actual_target"] for p in posts_for_ai if p["post_id"] == str_id), project_name)
+                actual_target = next((p["actual_target"] for p in posts_for_ai if p["post_id"] == str_id), company_name)
                 ai_content = next((p["content"] for p in posts_for_ai if p["post_id"] == str_id), str(content))
 
                 # เตรียมข้อความสำหรับแสดงผล
@@ -368,7 +422,7 @@ class sentiment:
                 
                 ai_sliced = ai_content.replace("\n", " ")
 
-                print(f"  [{idx:02d}] 🆔 {str_id[:15]:<15} | {icon:<11} | User: {str(post_user)[:12]:<12} | Proj: {project_name[:10]:<10} | Target: {actual_target[:15]:<15} | KW: {kw_name}")
+                print(f"  [{idx:02d}] 🆔 {str_id[:15]:<15} | {icon:<11} | User: {str(post_user)[:12]:<12} | Client: {company_name[:10]:<10} | Proj: {project_name[:10]:<10} | Target: {actual_target[:15]:<15} | KW: {kw_name}")
                 if ai_reason:
                     print(f"       💡 Reason: {ai_reason}")
                 print(f"       📄 Full (Preview): {original_preview}")
@@ -378,7 +432,7 @@ class sentiment:
             # ===== อัพเดท DB (คอมเมนต์ไว้ทดสอบ Prompt) =====
             cursor = DB_CONNECTION.cursor()
             
-            for (_id, content, project_name, post_user, kw_name) in batch:
+            for (_id, content, company_name, project_name, post_user, kw_name) in batch:
                 str_id = str(_id)
                 if str_id not in ollama_map:
                     continue
@@ -529,12 +583,12 @@ if __name__ == "__main__":
                 host=current_host
             )
 
-            list_id_with_project = [(x[0], x[1], x[2], x[3]) for x in _item]
-            print(f"  👉 พบข้อมูลจาก Feed: {len(list_id_with_project)} โพสต์")
+            list_id_with_info = [(x[0], x[1], x[2], x[3], x[4]) for x in _item]
+            print(f"  👉 พบข้อมูลจาก Feed: {len(list_id_with_info)} โพสต์")
 
-            list_content = sa.get_content(list_id_with_project, "Feed")
+            list_content = sa.get_content(list_id_with_info, "Feed")
 
-            # --- ดึง Comment msg_ids + project_name ---
+            # --- ดึง Comment msg_ids + company_name ---
             _item = CONN.getfromdb(
                 query=target["sql_comment"], 
                 DB='mysqldb', 
@@ -543,10 +597,10 @@ if __name__ == "__main__":
                 host=current_host
             )
 
-            list_id_with_project = [(x[0], x[1], x[2], x[3]) for x in _item]
-            print(f"  👉 พบข้อมูลจาก Comment: {len(list_id_with_project)} โพสต์")
+            list_id_with_info = [(x[0], x[1], x[2], x[3], x[4]) for x in _item]
+            print(f"  👉 พบข้อมูลจาก Comment: {len(list_id_with_info)} โพสต์")
 
-            list_content += sa.get_content(list_id_with_project, "Comment")
+            list_content += sa.get_content(list_id_with_info, "Comment")
 
             print(f"  📌 รวมทั้งหมดที่ต้องประมวลผล: {len(list_content)} โพสต์")
 
