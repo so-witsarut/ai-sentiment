@@ -308,7 +308,7 @@ class sentiment:
 
         return list_content
 
-    def analysis(self, list_content, host, server=1, table_prefix="own_match"):
+    def analysis(self, list_content, host, server=1, table_prefix="own_match", save_db=True):
         """
         วิเคราะห์ sentiment แล้วอัพเดทลง MySQL
 
@@ -317,6 +317,7 @@ class sentiment:
             host (str): MySQL host
             server (int): MySQL Server ID (1 or 2)
             table_prefix (str): 'own_match' หรือ 'competitor_match'
+            save_db (bool): บันทึกลงฐานข้อมูลหรือไม่ (ถ้า False จะแค่จำลองการทำงาน)
         """
         tunnel, DB_CONNECTION = CONN.get_mysql_connection(server=server, host=host, database=self.config["mysql_db"])
 
@@ -429,25 +430,28 @@ class sentiment:
                 print(f"       ✂️ Sliced (to AI): {ai_sliced}")
                 print(f"  {'-'*100}")
 
-            # ===== อัพเดท DB (คอมเมนต์ไว้ทดสอบ Prompt) =====
-            cursor = DB_CONNECTION.cursor()
-            
-            for (_id, content, company_name, project_name, post_user, kw_name) in batch:
-                str_id = str(_id)
-                if str_id not in ollama_map:
-                    continue
-                sentiment_val = float(ollama_map[str_id]["ai_sentiment"])
-                ai_reason_val = ollama_map[str_id].get("reason", "") or ""
-            
-                for tbl in [table_prefix, f"{table_prefix}_daily", f"{table_prefix}_3months"]:
-                    cursor.execute(
-                        f'UPDATE `{tbl}` SET `{table_prefix}_sentiment` = %s, `sentiment_status` = %s, `ai_reason` = %s WHERE msg_id = %s',
-                        (sentiment_val, "1", ai_reason_val, str(_id))
-                    )
-            
-            DB_CONNECTION.commit()
-            cursor.close()
-            print(f"  💾 บันทึกลง DB เรียบร้อย ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
+            # ===== อัพเดท DB =====
+            if save_db:
+                cursor = DB_CONNECTION.cursor()
+                
+                for (_id, content, company_name, project_name, post_user, kw_name) in batch:
+                    str_id = str(_id)
+                    if str_id not in ollama_map:
+                        continue
+                    sentiment_val = float(ollama_map[str_id]["ai_sentiment"])
+                    ai_reason_val = ollama_map[str_id].get("reason", "") or ""
+                
+                    for tbl in [table_prefix, f"{table_prefix}_daily", f"{table_prefix}_3months"]:
+                        cursor.execute(
+                            f'UPDATE `{tbl}` SET `{table_prefix}_sentiment` = %s, `sentiment_status` = %s, `ai_reason` = %s WHERE msg_id = %s',
+                            (sentiment_val, "1", ai_reason_val, str(_id))
+                        )
+                
+                DB_CONNECTION.commit()
+                cursor.close()
+                print(f"  💾 บันทึกลง DB เรียบร้อย ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
+            else:
+                print(f"  🚫 [MOCKUP] ข้ามการบันทึกลง DB ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
 
             # ไม่ต้องมีการดีเลย์ระหว่าง batch สำหรับ Local Ollama
 

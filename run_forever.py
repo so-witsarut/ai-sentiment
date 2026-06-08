@@ -285,7 +285,7 @@ def run_once(round_num):
         list_content = MOCKUP_DATA
         log.info(f"[MOCKUP] ใช้ข้อมูลจำลอง {len(list_content)} รายการ")
         if list_content:
-            sa.analysis(list_content, DB_CONFIG.get("mysql_host_1") or "localhost", table_prefix="own_match")
+            sa.analysis(list_content, DB_CONFIG.get("mysql_host_1") or "localhost", table_prefix="own_match", save_db=False)
     else:
         process_targets(sa)
 
