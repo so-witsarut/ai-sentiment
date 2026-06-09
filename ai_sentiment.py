@@ -437,27 +437,27 @@ class sentiment:
                 print(f"  {'-'*100}")
 
             # ===== อัพเดท DB =====
-            # if save_db:
-            #     cursor = DB_CONNECTION.cursor()
+            if save_db:
+                cursor = DB_CONNECTION.cursor()
                 
-            #     for (_id, content, company_name, project_name, post_user, kw_name) in batch:
-            #         str_id = str(_id)
-            #         if str_id not in ollama_map:
-            #             continue
-            #         sentiment_val = float(ollama_map[str_id]["ai_sentiment"])
-            #         ai_reason_val = ollama_map[str_id].get("reason", "") or ""
+                for (_id, content, company_name, project_name, post_user, kw_name) in batch:
+                    str_id = str(_id)
+                    if str_id not in ollama_map:
+                        continue
+                    sentiment_val = float(ollama_map[str_id]["ai_sentiment"])
+                    ai_reason_val = ollama_map[str_id].get("reason", "") or ""
                 
-            #         for tbl in [table_prefix, f"{table_prefix}_daily", f"{table_prefix}_3months"]:
-            #             cursor.execute(
-            #                 f'UPDATE `{tbl}` SET `{table_prefix}_sentiment` = %s, `sentiment_status` = %s, `ai_reason` = %s WHERE msg_id = %s',
-            #                 (sentiment_val, "1", ai_reason_val, str(_id))
-            #             )
+                    for tbl in [table_prefix, f"{table_prefix}_daily", f"{table_prefix}_3months"]:
+                        cursor.execute(
+                            f'UPDATE `{tbl}` SET `{table_prefix}_sentiment` = %s, `sentiment_status` = %s, `ai_reason` = %s WHERE msg_id = %s',
+                            (sentiment_val, "1", ai_reason_val, str(_id))
+                        )
                 
-            #     DB_CONNECTION.commit()
-            #     cursor.close()
-            #     print(f"  💾 บันทึกลง DB เรียบร้อย ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
-            # else:
-            #     print(f"  🚫 [MOCKUP] ข้ามการบันทึกลง DB ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
+                DB_CONNECTION.commit()
+                cursor.close()
+                print(f"  💾 บันทึกลง DB เรียบร้อย ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
+            else:
+                print(f"  🚫 [MOCKUP] ข้ามการบันทึกลง DB ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
 
             # ไม่ต้องมีการดีเลย์ระหว่าง batch สำหรับ Local Ollama
 
