@@ -227,7 +227,7 @@ def process_targets(sa_obj):
         }
     ]
 
-    for server_id in [1]:
+    for server_id in [1,2]:
         current_host = DB_CONFIG.get(f"mysql_host_{server_id}")
         
         log.info(f"\n{'=' * 40}")

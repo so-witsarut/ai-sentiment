@@ -574,7 +574,7 @@ if __name__ == "__main__":
 
     sa = sentiment(config)
 
-    for server_id in [1]: #, 2]: ทดสอบเฉพาะ server 1 ก่อน
+    for server_id in [1 , 2]: #, 2]: ทดสอบเฉพาะ server 1 ก่อน
         current_host = config[f"mysql_host_{server_id}"]
         
         print(f"\n{'=' * 70}")
