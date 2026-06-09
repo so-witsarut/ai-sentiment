@@ -438,6 +438,11 @@ class sentiment:
 
             # ===== อัพเดท DB =====
             if save_db:
+                try:
+                    DB_CONNECTION.ping(reconnect=True)
+                except Exception as e:
+                    print(f"  ⚠️ Warning: MySQL Ping/Reconnect failed: {e}")
+                
                 cursor = DB_CONNECTION.cursor()
                 
                 for (_id, content, company_name, project_name, post_user, kw_name) in batch:

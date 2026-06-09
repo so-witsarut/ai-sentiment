@@ -141,6 +141,8 @@ class DatabaseConnection():
                         passwd=BE_MYSQL_PASSWORD,
                         db=database,
                         charset="utf8",
+                        connect_timeout=10,
+                        read_timeout=30,
                     )
                     try:
                         with conn.cursor() as cursor:
@@ -242,5 +244,6 @@ class DatabaseConnection():
             db=database,
             charset="utf8",
             connect_timeout=10,
+            read_timeout=30,
         )
         return tunnel, conn
