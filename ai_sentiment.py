@@ -33,7 +33,7 @@ CONN=connection.DatabaseConnection()
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
-def get_keyword_context(text, keyword, window=150, max_fallback_length=1000):
+def get_keyword_context(text, keyword, window=150, max_fallback_length=400):
     """
     ตัดข้อความให้เหลือแค่บริบทแวดล้อมของ Keyword
     """
@@ -89,8 +89,14 @@ class OllamaSentimentAnalyzer:
         #     'Output ONLY a minified JSON object: {"reason": "<เหตุผลสั้นๆ ภาษาไทย>", "ai_sentiment": <int>}. '
         #     "Do not explain or add markdown formatting."
         # )
+        # self.system_instruction = (
+        #     'Return only JSON: {"reason":"<thai>","ai_sentiment":<int>}'
+        # )
         self.system_instruction = (
-            'Return only JSON: {"reason":"<thai>","ai_sentiment":<int>}'
+            "You are an expert Thai Social Media Brand Reputation Analyst. "
+            "Given a social media post, determine the PUBLIC SENTIMENT toward a specific Target brand. "
+            "Score: 100=positive brand impact, -100=negative brand impact, 0=neutral/irrelevant. "
+            'Output ONLY minified JSON: {"reason":"<ภาษาไทย>","ai_sentiment":<-100|0|100>}'
         )
 
     def _analyze_single_post(self, post, company_name):
@@ -108,133 +114,133 @@ class OllamaSentimentAnalyzer:
         # ถ้าเป็น OWN → actual_target = company_name
         actual_target = post.get("actual_target", company_name)
 
-        # user_prompt = (
-        #     f"Target Corporate Entity: '{actual_target}'\n"
-        #     f"Trigger Keyword: '{matched_keyword}'\n"
-        #     f"Post User: '{post_user}'\n"
-        #     f"Text to analyze: '{content}'\n\n"
-        #     "INSTRUCTIONS:\n"
-        #     f"Rule 0 - BRAND MENTION CHECK: If the text does NOT explicitly mention or refer to '{actual_target}' (case-insensitive, including its common abbreviations, acronyms, parent companies, translations, or transliterated forms in Thai/English), you MUST output ai_sentiment: 0 and STOP.\n\n"
-        #     f"Step 1 - OWNED MEDIA: If 'Post User' is the official page/account/employee of '{actual_target}' -> Output ai_sentiment: 0 and STOP.\n"
-        #     f"Step 2 - NEUTRAL NEWS & PR: Is the text an advertisement, marketing promotion, sports, or general news that does NOT report a negative scandal or positive feedback directly involving '{actual_target}'? -> Output ai_sentiment: 0 and STOP.\n"
-        #     f"Step 3 - NEGATIVE & CRISIS: Does the text explicitly criticize, express anger, report a scandal, or show dissatisfaction DIRECTLY targeting '{actual_target}'? -> Output ai_sentiment: -100 and STOP.\n"
-        #     f"Step 4 - POSITIVE & PRAISE: Does the text praise, support, defend, or express satisfaction DIRECTLY with '{actual_target}'? -> Output ai_sentiment: 100 and STOP.\n"
-        #     "Output ONLY a valid JSON object in this exact format:\n"
-        #     '{"reason": "เหตุผลสั้นๆ ภาษาไทย", "ai_sentiment": <int>}'
-        # )
-        # user_prompt = (
-        #     f"Target Corporate Entity: '{actual_target}'\n"
-        #     f"Trigger Keyword (Alias/Product): '{matched_keyword}'\n"
-        #     f"Post User: '{post_user}'\n"
-        #     f"Text to analyze: '{content}'\n\n"
-        #     "INSTRUCTIONS:\n"
-        #     f"Note: The Trigger Keyword '{matched_keyword}' represents '{actual_target}'. Treat them as the same entity.\n\n"
-        #     "Rule 0 - STRICT ENTITY MATCHING:\n"
-        #     f"- If the text does NOT explicitly mention '{actual_target}' or '{matched_keyword}', output 0 and STOP.\n"
-        #     f"- FALSE POSITIVE CHECK: If '{matched_keyword}' appears ONLY as part of a person's name/surname (e.g., รังษีสิงห์พิพัฒน์), a location/stadium (e.g., สิงห์เชียงราย), or an unrelated compound word, it is NOT a valid brand mention -> Output 0 and STOP.\n\n"
-        #     f"Step 1 - OWNED MEDIA: If 'Post User' is the official page of '{actual_target}' -> Output 0 and STOP.\n"
-        #     f"Step 2 - NEUTRAL/GENERAL: Is it just an advertisement, sports result, or general news without any reputation damage to the brand? -> Output 0 and STOP.\n"
-        #     f"Step 3 - NEGATIVE & CRISIS: Does the text express anger, boycott, OR report a corporate scandal, drama, or reputation risk (e.g., เสี่ยงเสียความผูกพัน, ดราม่าครอบครัว) directly involving '{actual_target}' or '{matched_keyword}'? -> Output -100 and STOP.\n"
-        #     f"Step 4 - POSITIVE & PRAISE: Does the text explicitly express praise, support (e.g., เราชอบ, สนับสนุน), or satisfaction directly with the brand/product? -> Output 100 and STOP.\n\n"
-        #     "CRITICAL: The 'reason' MUST be based EXACTLY on the 'Text to analyze'. Do NOT invent or hallucinate products not mentioned in the text.\n"
-        #     "Output ONLY a valid JSON object in this exact format:\n"
-        #     '{"reason": "สรุปเหตุผลภาษาไทยสั้นๆ ตามเนื้อหาจริง", "ai_sentiment": <int>}'
-        # )
         user_prompt = (
-            f"Target={actual_target}\n"
+            f"Target Entity={actual_target}\n"
             f"Keyword={matched_keyword}\n"
             f"User={post_user}\n"
             f"Text={content}\n\n"
 
-            f"Keyword represents Target.\n"
-            f"If Target/Keyword not truly mentioned, or keyword is person/place/team name -> 0.\n"
-            f"If official page, ad, promotion, sports score, neutral news -> 0.\n"
-            f"If complaint, anger, boycott, scandal, reputation risk to Target -> -100.\n"
-            f"If praise, support, satisfaction toward Target -> 100.\n\n"
+            "INSTRUCTIONS (stop at first match):\n"
+            "1. OWNED MEDIA: 'User' is Target's official page -> 0.\n"
+            "2. NEUTRAL: Ads, promotions, sports results, or general news "
+            "with no direct brand reputation impact -> 0.\n"
+            "3. UNRELATED: Text is about a different entity, "
+            "or Keyword is a location/idiom/generic word -> 0.\n"
+            "4. NEGATIVE: Explicitly criticizes, boycotts, "
+            "or reports scandal DIRECTLY against Target -> -100.\n"
+            "5. POSITIVE: Explicitly praises or recommends Target DIRECTLY -> 100.\n"
+            "6. DEFAULT: Otherwise -> 0.\n\n"
 
-            'JSON only: {"reason":"ไทยสั้นๆ","ai_sentiment":-100|0|100}'
+            'JSON ONLY: {"reason":"ไทย 1 ประโยค","ai_sentiment":<int>,"is_ambiguous":<bool>}'
         )
+
         # user_prompt = (
-        #     f"Target: '{actual_target}' | Keyword: '{matched_keyword}' | User: '{post_user}'\n"
-        #     f"Text: '{content}'\n\n"
-        #     "RULES (Evaluate in order):\n"
-        #     "0. MATCH: If Text lacks explicit mention of Target or Keyword -> output 0, STOP.\n"
-        #     "1. FALSE POSITIVE: If Keyword is merely part of a person's name (e.g. รังษีสิงห์พิพัฒน์) or location -> output 0, STOP.\n"
-        #     "2. GENERIC/3RD-PARTY: If Keyword is a generic term (e.g. พลังงาน) AND Text praises/criticizes a different entity (e.g. MEA) -> output 0, STOP.\n"
-        #     "3. NEUTRAL/OWNED: If User is Target's official account, or Text is general news/ads without brand reputation impact -> output 0, STOP.\n"
-        #     "4. NEGATIVE: Expresses anger, boycott, drama, or reputation risk DIRECTLY targeting Target/Keyword -> output -100, STOP.\n"
-        #     "5. POSITIVE: Expresses explicit praise or support DIRECTLY for Target/Keyword -> output 100, STOP.\n\n"
-        #     "Output ONLY valid minified JSON based EXACTLY on Text:\n"
-        #     '{"reason":"สรุปเหตุผลภาษาไทยสั้นๆ 1 ประโยค","ai_sentiment":<int>}'
+        #     f"Target={actual_target}\n"
+        #     f"Keyword={matched_keyword}\n"
+        #     f"User={post_user}\n"
+        #     f"Text={content}\n\n"
+
+        #     "INSTRUCTIONS:\n"
+        #     "1. OWNED MEDIA: If 'User' is Target's official page -> 0.\n"
+        #     "2. FALSE POSITIVE: If Keyword refers to UNRELATED location (e.g. จังหวัดสิงห์บุรี) or idiom (e.g. เสือเป็นสิงห์) -> 0. (Note: 'สิงห์ปาร์ค', 'สิงห์ เชียงราย' ARE valid Target entities).\n"
+        #     "3. NEUTRAL NEWS: Ads, sports, or general news (like crimes/drug busts) NOT explicitly damaging the Target -> 0.\n"
+        #     "4. NEGATIVE: Explicitly criticizes, boycotts (e.g. 'บอกลา'), or reports a real scandal DIRECTLY against Target -> -100.\n"
+        #     "5. POSITIVE: Explicitly praises or supports Target -> 100.\n"
+        #     "6. DEFAULT: Otherwise -> 0.\n\n"
+
+        #     'JSON ONLY:\n{"reason":"เหตุผล 1 ประโยคภาษาไทย","ai_sentiment":<int>}'
         # )
 
 
-        payload = {
-            "model": self.model,
-            "system": self.system_instruction,
-            "prompt": user_prompt,
-            "stream": False,
-            "format": "json",
-            "think": False,
-            "keep_alive": -1,                    # ✅ โมเดลค้างใน GPU ไม่ต้อง reload
-            "options": {
-                "temperature": 0.0,
-                "top_p": 0.1,
-                "seed": 42,
-                "num_predict": 128,              # ✅ ให้พื้นที่พิมพ์ reason ภาษาไทยได้จบประโยค
-                "num_ctx": 1024,                 # ✅ context window เล็ก ประหยัด VRAM
-                "num_batch": 256,                # ✅ สมดุลระหว่างความเร็วกับ VRAM
-                "num_gpu": 99,                   # ✅ บังคับทุก layer ขึ้น GPU
+        def _call_ollama(is_deep_think=False):
+            current_payload = {
+                "model": self.model,
+                "system": self.system_instruction,
+                "prompt": user_prompt,
+                "stream": False,
+                "format": "json",
+                "think": is_deep_think,
+                "keep_alive": -1,                    # ✅ โมเดลค้างใน GPU ไม่ต้อง reload
+                "options": {
+                    "temperature": 0.0,
+                    "top_p":       0.1,
+                    "seed":        42,
+                    "num_predict": 384 if is_deep_think else 128,
+                    "num_ctx":     768 if is_deep_think else 512,   # ลดจาก 1536/1024
+                    "num_batch":   256,
+                    "num_gpu":     99,
+                }
             }
-        }
 
-        try:
-            response = requests.post(self.base_url, json=payload, timeout=120)
+            try:
+                # ให้เวลารอนานขึ้นถ้ารอบ deep think เพราะ GTX 1660 ประมวลผล concurrent นาน
+                response = requests.post(self.base_url, json=current_payload, timeout=300 if is_deep_think else 120)
 
-            if response.status_code == 200:
-                result_text = response.json().get("response", "{}")
+                if response.status_code == 200:
+                    result_text = response.json().get("response", "{}")
 
-                # --- ทำความสะอาดผลลัพธ์ ---
-                clean_text = re.sub(r'<think>.*?</think>', '', result_text, flags=re.DOTALL).strip()
-                clean_text = clean_text.replace('```json', '').replace('```', '').strip()
+                    # --- ทำความสะอาดผลลัพธ์ ---
+                    clean_text = re.sub(r'<think>.*?</think>', '', result_text, flags=re.DOTALL).strip()
+                    clean_text = clean_text.replace('```json', '').replace('```', '').strip()
 
-                if not clean_text.startswith('{'):
-                    json_match = re.search(r'\{[^{}]*"ai_sentiment"[^{}]*\}', clean_text)
-                    if json_match:
-                        clean_text = json_match.group(0)
+                    if not clean_text.startswith('{'):
+                        json_match = re.search(r'\{[^{}]*"ai_sentiment"[^{}]*\}', clean_text)
+                        if json_match:
+                            clean_text = json_match.group(0)
 
-                try:
-                    parsed = json.loads(clean_text)
-                    ai_sentiment = parsed.get("ai_sentiment", 0)
+                    try:
+                        parsed = json.loads(clean_text)
+                        ai_sentiment = parsed.get("ai_sentiment", 0)
 
-                    if isinstance(ai_sentiment, str):
-                        s = ai_sentiment.upper()
-                        if s == "POSITIVE":  ai_sentiment = 100
-                        elif s == "NEGATIVE": ai_sentiment = -100
-                        else:                ai_sentiment = 0
-                    else:
-                        # Normalize: บวก→100, ลบ→-100, ศูนย์→0
-                        if ai_sentiment > 0:
-                            ai_sentiment = 100
-                        elif ai_sentiment < 0:
-                            ai_sentiment = -100
+                        if isinstance(ai_sentiment, str):
+                            s = ai_sentiment.upper()
+                            if s == "POSITIVE":  ai_sentiment = 100
+                            elif s == "NEGATIVE": ai_sentiment = -100
+                            else:                ai_sentiment = 0
                         else:
-                            ai_sentiment = 0
+                            # Normalize: บวก→100, ลบ→-100, ศูนย์→0
+                            if ai_sentiment > 0:
+                                ai_sentiment = 100
+                            elif ai_sentiment < 0:
+                                ai_sentiment = -100
+                            else:
+                                ai_sentiment = 0
 
-                    return {
-                        "post_id":      post_id,
-                        "ai_sentiment": int(ai_sentiment),
-                        "confidence":   0,
-                        "reason":       parsed.get("reason", "")
-                    }
-                except json.JSONDecodeError as e:
-                    print(f"  -> JSONDecodeError [{post_id}]: {e} | Raw Clean Text: {clean_text[:150]}")
-            else:
-                print(f"  -> HTTP Error {response.status_code}: {response.text}")
-        except Exception as e:
-            print(f"  -> Request Error [{post_id}]: {e}")
+                        return {
+                            "post_id":      post_id,
+                            "ai_sentiment": int(ai_sentiment),
+                            "confidence":   0,
+                            "reason":       parsed.get("reason", "")
+                        }
+                    except json.JSONDecodeError as e:
+                        print(f"  -> JSONDecodeError [{post_id}]: {e} | Raw Clean Text: {clean_text[:150]}")
+                else:
+                    print(f"  -> HTTP Error {response.status_code}: {response.text}")
+            except Exception as e:
+                print(f"  -> Request Error [{post_id}]: {e}")
 
-        return None
+            return None
+
+        # ==========================================
+        # 🚀 TWO-PASS FILTERING (Cascade Architecture)
+        # ==========================================
+        # Pass 1: วิเคราะห์แบบเร็ว (Fast Pass)
+        first_pass_result = _call_ollama(is_deep_think=False)
+
+        # ถ้าผลลัพธ์รอบแรกออกมาเป็น Positive (100) หรือ Negative (-100)
+        # ให้ส่งทำ Pass 2 เพื่อยืนยันความถูกต้องด้วย Deep Reasoning
+        if first_pass_result and first_pass_result["ai_sentiment"] != 0:
+            print(f"\n  🔍 [Pass 2 Triggered] Post {post_id} ได้ค่า {first_pass_result['ai_sentiment']} -> กำลังวิเคราะห์เชิงลึก (Think=True)...")
+            
+            second_pass_result = _call_ollama(is_deep_think=True)
+            
+            if second_pass_result:
+                # เติม tag ไว้ใน reason ให้รู้ว่าผ่านการ Deep Checked แล้ว
+                second_pass_result["reason"] = "[Deep Checked] " + second_pass_result["reason"]
+                return second_pass_result
+
+        # ถ้าเป็น Neutral (0) หรือ Error ให้ส่งกลับเลย
+        return first_pass_result
 
     def analyze_post_sentiments(self, json_posts, company_name=""):
         """
@@ -346,7 +352,7 @@ class sentiment:
                 if text:
                     # กรณีที่มีหลายคำคั่นด้วยลูกน้ำ (เช่น ทราย, สุนิษฐ์, พาย) อาจจะเลือกคำแรกมาใช้สแกน
                     first_keyword = kw_name.split(",")[0].strip() if kw_name else ""
-                    clean_short_content = get_keyword_context(text, first_keyword, window=200)
+                    clean_short_content = get_keyword_context(text, first_keyword, window=150)
 
                     # กำหนด actual_target ตามประเภท:
                     # - COMPETITOR: ใช้ keyword เป็น Target
@@ -431,27 +437,27 @@ class sentiment:
                 print(f"  {'-'*100}")
 
             # ===== อัพเดท DB =====
-            if save_db:
-                cursor = DB_CONNECTION.cursor()
+            # if save_db:
+            #     cursor = DB_CONNECTION.cursor()
                 
-                for (_id, content, company_name, project_name, post_user, kw_name) in batch:
-                    str_id = str(_id)
-                    if str_id not in ollama_map:
-                        continue
-                    sentiment_val = float(ollama_map[str_id]["ai_sentiment"])
-                    ai_reason_val = ollama_map[str_id].get("reason", "") or ""
+            #     for (_id, content, company_name, project_name, post_user, kw_name) in batch:
+            #         str_id = str(_id)
+            #         if str_id not in ollama_map:
+            #             continue
+            #         sentiment_val = float(ollama_map[str_id]["ai_sentiment"])
+            #         ai_reason_val = ollama_map[str_id].get("reason", "") or ""
                 
-                    for tbl in [table_prefix, f"{table_prefix}_daily", f"{table_prefix}_3months"]:
-                        cursor.execute(
-                            f'UPDATE `{tbl}` SET `{table_prefix}_sentiment` = %s, `sentiment_status` = %s, `ai_reason` = %s WHERE msg_id = %s',
-                            (sentiment_val, "1", ai_reason_val, str(_id))
-                        )
+            #         for tbl in [table_prefix, f"{table_prefix}_daily", f"{table_prefix}_3months"]:
+            #             cursor.execute(
+            #                 f'UPDATE `{tbl}` SET `{table_prefix}_sentiment` = %s, `sentiment_status` = %s, `ai_reason` = %s WHERE msg_id = %s',
+            #                 (sentiment_val, "1", ai_reason_val, str(_id))
+            #             )
                 
-                DB_CONNECTION.commit()
-                cursor.close()
-                print(f"  💾 บันทึกลง DB เรียบร้อย ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
-            else:
-                print(f"  🚫 [MOCKUP] ข้ามการบันทึกลง DB ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
+            #     DB_CONNECTION.commit()
+            #     cursor.close()
+            #     print(f"  💾 บันทึกลง DB เรียบร้อย ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
+            # else:
+            #     print(f"  🚫 [MOCKUP] ข้ามการบันทึกลง DB ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
 
             # ไม่ต้องมีการดีเลย์ระหว่าง batch สำหรับ Local Ollama
 
