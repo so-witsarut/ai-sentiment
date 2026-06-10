@@ -168,7 +168,8 @@ class OllamaSentimentAnalyzer:
                     "num_predict": 384 if is_deep_think else 128,
                     "num_ctx":     768 if is_deep_think else 512,   # ลดจาก 1536/1024
                     "num_batch":   256,
-                    "num_gpu":     99,
+                    "flash_attn":  True,  # ⚡ เปิดใช้ Flash Attention เพื่อประหยัด VRAM ของ 1660
+                    "num_gpu":     99,  # ⚠️ คอมเมนต์ออก เพื่อป้องกันปัญหา memory layout (OOM) 
                 }
             }
 
