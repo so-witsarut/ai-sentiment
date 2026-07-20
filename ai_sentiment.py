@@ -27,6 +27,14 @@ sys.path.append(r"ai-sentiment")
 # pyrefly: ignore [missing-import]
 import connection
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyBzFYeBNrOnDqhSTwVDzW73sX_q_ki2-Rw")
+
 CONN=connection.DatabaseConnection()
 
 # ตั้งค่า stdout ให้รองรับการปริ้นภาษาไทยบน Windows (แก้ปัญหา UnicodeEncodeError)
@@ -98,6 +106,103 @@ class OllamaSentimentAnalyzer:
             "Score: 100=positive brand impact, -100=negative brand impact, 0=neutral/irrelevant. "
             'Output ONLY minified JSON: {"reason":"<ภาษาไทย>","ai_sentiment":<-100|0|100>}'
         )
+
+    def _call_gemini_api(self, model_name, system_instruction, user_prompt, max_retries=3):
+        if not GEMINI_API_KEY:
+            return None
+        
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "system_instruction": {"parts": [{"text": system_instruction}]},
+            "contents": [{"parts": [{"text": user_prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.0}
+        }
+        
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(url, json=payload, timeout=60)
+                if response.status_code == 200:
+                    res_data = response.json()
+                    result_text = res_data["candidates"][0]["content"]["parts"][0]["text"]
+                    return self._parse_json_result(result_text)
+                else:
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+            except Exception:
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+        return None
+
+    def _call_ollama_generic(self, model_name, system_instruction, user_prompt):
+        payload_generate = {
+            "model": model_name,
+            "system": system_instruction,
+            "prompt": user_prompt,
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.0, "seed": 42}
+        }
+        try:
+            response = requests.post("http://localhost:11434/api/generate", json=payload_generate, timeout=120)
+            if response.status_code == 200:
+                result_text = response.json().get("response", "{}")
+                return self._parse_json_result(result_text)
+        except Exception:
+            pass
+            
+        # Fallback chat
+        payload_chat = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_instruction},
+                {"role": "user",   "content": user_prompt}
+            ],
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.0, "seed": 42}
+        }
+        try:
+            response = requests.post("http://localhost:11434/api/chat", json=payload_chat, timeout=120)
+            if response.status_code == 200:
+                result_text = response.json().get("message", {}).get("content", "{}")
+                return self._parse_json_result(result_text)
+        except Exception:
+            pass
+        return None
+
+    def _parse_json_result(self, result_text):
+        clean_text = re.sub(r'<think>.*?</think>', '', result_text, flags=re.DOTALL).strip()
+        clean_text = clean_text.replace('```json', '').replace('```', '').strip()
+        
+        if not clean_text.startswith('{'):
+            json_match = re.search(r'\{[^{}]*"ai_sentiment"[^{}]*\}', clean_text)
+            if json_match:
+                clean_text = json_match.group(0)
+        
+        try:
+            parsed = json.loads(clean_text)
+            ai_sentiment = parsed.get("ai_sentiment", 0)
+            try:
+                ai_sentiment = int(ai_sentiment)
+            except:
+                ai_sentiment = 0
+            if ai_sentiment > 0: ai_sentiment = 100
+            elif ai_sentiment < 0: ai_sentiment = -100
+            parsed["ai_sentiment"] = ai_sentiment
+            return parsed
+        except json.JSONDecodeError:
+            sentiment_match = re.search(r'["\']?ai_sentiment["\']?\s*[:=]\s*(-?100|0)', clean_text, re.IGNORECASE)
+            reason_match = re.search(r'["\']?reason["\']?\s*[:=]\s*["\']?(.*?)["\']?(?:,|\n|\})', clean_text, re.IGNORECASE)
+            entity_match = re.search(r'["\']?entity_found["\']?\s*[:=]\s*(true|false)', clean_text, re.IGNORECASE)
+            
+            if sentiment_match:
+                ai_sentiment = int(sentiment_match.group(1))
+                reason = reason_match.group(1).strip() if reason_match else clean_text[:100].replace('\n', ' ')
+                entity_found = True
+                if entity_match:
+                    entity_found = entity_match.group(1).lower() == 'true'
+                return {"ai_sentiment": ai_sentiment, "reason": reason, "entity_found": entity_found}
+        return None
 
     def _analyze_single_post(self, post, company_name):
         """
@@ -228,16 +333,66 @@ class OllamaSentimentAnalyzer:
         # Pass 1: วิเคราะห์แบบเร็ว (Fast Pass)
         first_pass_result = _call_ollama(is_deep_think=False)
 
-        # ถ้าผลลัพธ์รอบแรกออกมาเป็น Positive (100) หรือ Negative (-100)
-        # ให้ส่งทำ Pass 2 เพื่อยืนยันความถูกต้องด้วย Deep Reasoning
         if first_pass_result and first_pass_result["ai_sentiment"] != 0:
-            print(f"\n  🔍 [Pass 2 Triggered] Post {post_id} ได้ค่า {first_pass_result['ai_sentiment']} -> กำลังวิเคราะห์เชิงลึก (Think=True)...")
+            first_sentiment = first_pass_result["ai_sentiment"]
+            first_reason = first_pass_result.get("reason", "")
+            print(f"\n  🔍 [Pass 2 Triggered] Post {post_id} ได้ค่า {first_sentiment} -> กำลังยืนยันความถูกต้องด้วยโมเดลวิเคราะห์ (Validation)...")
             
-            second_pass_result = _call_ollama(is_deep_think=True)
+            validation_system_instruction = (
+                "You are a strict Brand Mention Validator. "
+                "Your #1 priority is to check if the Target Entity is EXPLICITLY mentioned in the text. "
+                "If the Target Entity is NOT mentioned, you MUST return ai_sentiment=0 regardless of the text's tone. "
+                "Do NOT assume or infer that the text is about the Target Entity."
+            )
+
+            validation_user_prompt = (
+                f"Target Entity={actual_target}\n"
+                f"Keyword={matched_keyword}\n"
+                f"User={post_user}\n"
+                f"Text={content}\n\n"
+                f"First-Pass Sentiment={first_sentiment}\n"
+                f"First-Pass Reason={first_reason}\n\n"
+                "TASK (Follow these steps IN ORDER):\n"
+                "Step 1: ENTITY CHECK - Scan the Text and determine if the Target Entity or any of its known brands/products are explicitly mentioned. Set entity_found=true or entity_found=false.\n"
+                "Step 2: IF entity_found=false -> STOP. Set ai_sentiment=0. The text is UNRELATED. Do NOT proceed further.\n"
+                "Step 3: IF entity_found=true -> Check these rules:\n"
+                "   - OWNED MEDIA: Official page posts, PR, or promotional content by the Target Entity -> 0\n"
+                "   - NEUTRAL: General ads, job hirings, sports news without direct positive/negative impact -> 0\n"
+                "   - UNRELATED REFERENCE: Name used as location, idiom, person name, or animal breed -> 0\n"
+                "   - NEGATIVE: Explicitly criticizes/boycotts/complains DIRECTLY against the Target Entity -> -100\n"
+                "   - POSITIVE: Explicitly praises/recommends the Target Entity DIRECTLY -> 100\n\n"
+                'JSON ONLY: {"entity_found":true/false,"reason":"[\u0e22\u0e37\u0e19\u0e22\u0e31\u0e19/\u0e41\u0e01\u0e49\u0e44\u0e02] \u0e2a\u0e23\u0e38\u0e1b\u0e2a\u0e31\u0e49\u0e19\u0e46 \u0e20\u0e32\u0e29\u0e32\u0e44\u0e17\u0e22","ai_sentiment":<-100|0|100>}'
+            )
+
+            validation_models = ["api:gemma-4-31b-it", "gemma4:31b-cloud"]
+            second_pass_result = None
+
+            for val_model in validation_models:
+                print(f"      🔄 [Pass 2] ลองใช้โมเดล: {val_model} สำหรับ Post {post_id}...")
+                
+                if val_model.startswith("api:"):
+                    actual_api_model = val_model.replace("api:", "", 1)
+                    res = self._call_gemini_api(actual_api_model, validation_system_instruction, validation_user_prompt)
+                else:
+                    res = self._call_ollama_generic(val_model, validation_system_instruction, validation_user_prompt)
+
+                if res and "ai_sentiment" in res:
+                    second_pass_result = res
+                    used_model = val_model
+                    break
+                else:
+                    print(f"      ⚠️ {val_model} สำหรับ Post {post_id} ล้มเหลว กำลังสลับไปใช้โมเดลถัดไป...")
             
             if second_pass_result:
-                # เติม tag ไว้ใน reason ให้รู้ว่าผ่านการ Deep Checked แล้ว
-                second_pass_result["reason"] = "[Deep Checked] " + second_pass_result["reason"]
+                entity_found = second_pass_result.get("entity_found", True)
+                if isinstance(entity_found, str):
+                    entity_found = entity_found.lower() == "true"
+                    
+                if not entity_found:
+                    second_pass_result["ai_sentiment"] = 0
+                
+                second_pass_result["post_id"] = post_id
+                second_pass_result["reason"] = f"[Deep Checked: {used_model}] {second_pass_result.get('reason', '')} (รอบแรก: {first_reason})"
                 return second_pass_result
 
         # ถ้าเป็น Neutral (0) หรือ Error ให้ส่งกลับเลย
@@ -512,30 +667,34 @@ if __name__ == "__main__":
             "table_prefix": "own_match",
             "sql_feed": (
                 f"SELECT omd.msg_id, "
+                f"IFNULL(c.company_name, '') as company_name, "
                 f"IFNULL(ck.company_keyword_name, '') as project_name, "
                 f"IFNULL(omd.post_user, '') as post_user, "
                 f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
                 f"FROM own_match_daily omd "
                 f"LEFT JOIN company_keyword ck ON omd.company_keyword_id = ck.company_keyword_id "
+                f"LEFT JOIN client c ON omd.client_id = c.client_id "
                 f"LEFT JOIN own_key_match okm ON okm.own_match_id = omd.own_match_id "
                 f"LEFT JOIN keyword k ON okm.keyword_id = k.keyword_id "
                 f"WHERE date(omd.msg_time) BETWEEN '{yesterday}' AND '{now}' "
                 f"AND omd.sentiment_status = '0' AND omd.match_type = 'Feed' "
-                f"GROUP BY omd.msg_id, project_name, post_user "
+                f"GROUP BY omd.msg_id, company_name, project_name, post_user "
                 f"ORDER BY omd.msg_time ASC "
             ),
             "sql_comment": (
                 f"SELECT omd.msg_id, "
+                f"IFNULL(c.company_name, '') as company_name, "
                 f"IFNULL(ck.company_keyword_name, '') as project_name, "
                 f"IFNULL(omd.post_user, '') as post_user, "
                 f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
                 f"FROM own_match_daily omd "
                 f"LEFT JOIN company_keyword ck ON omd.company_keyword_id = ck.company_keyword_id "
+                f"LEFT JOIN client c ON omd.client_id = c.client_id "
                 f"LEFT JOIN own_key_match okm ON okm.own_match_id = omd.own_match_id "
                 f"LEFT JOIN keyword k ON okm.keyword_id = k.keyword_id "
                 f"WHERE date(omd.msg_time) BETWEEN '{yesterday}' AND '{now}' "
                 f"AND omd.sentiment_status = '0' AND omd.match_type = 'Comment' "
-                f"GROUP BY omd.msg_id, project_name, post_user "
+                f"GROUP BY omd.msg_id, company_name, project_name, post_user "
                 f"ORDER BY omd.msg_time ASC "
             )
         },
@@ -544,30 +703,34 @@ if __name__ == "__main__":
             "table_prefix": "competitor_match",
             "sql_feed": (
                 f"SELECT cmd.msg_id, "
+                f"IFNULL(c.company_name, '') as company_name, "
                 f"IFNULL(ck.company_keyword_name, '') as project_name, "
                 f"IFNULL(cmd.post_user, '') as post_user, "
                 f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
                 f"FROM competitor_match_daily cmd "
                 f"LEFT JOIN company_keyword ck ON cmd.company_keyword_id = ck.company_keyword_id "
+                f"LEFT JOIN client c ON cmd.client_id = c.client_id "
                 f"LEFT JOIN competitor_key_match ckm ON ckm.competitor_match_id = cmd.competitor_match_id "
                 f"LEFT JOIN keyword k ON ckm.keyword_id = k.keyword_id "
                 f"WHERE date(cmd.msg_time) BETWEEN '{yesterday}' AND '{now}' "
                 f"AND cmd.sentiment_status = '0' AND cmd.match_type = 'Feed' "
-                f"GROUP BY cmd.msg_id, project_name, post_user "
+                f"GROUP BY cmd.msg_id, company_name, project_name, post_user "
                 f"ORDER BY cmd.msg_time ASC "
             ),
             "sql_comment": (
                 f"SELECT cmd.msg_id, "
+                f"IFNULL(c.company_name, '') as company_name, "
                 f"IFNULL(ck.company_keyword_name, '') as project_name, "
                 f"IFNULL(cmd.post_user, '') as post_user, "
                 f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
                 f"FROM competitor_match_daily cmd "
                 f"LEFT JOIN company_keyword ck ON cmd.company_keyword_id = ck.company_keyword_id "
+                f"LEFT JOIN client c ON cmd.client_id = c.client_id "
                 f"LEFT JOIN competitor_key_match ckm ON ckm.competitor_match_id = cmd.competitor_match_id "
                 f"LEFT JOIN keyword k ON ckm.keyword_id = k.keyword_id "
                 f"WHERE date(cmd.msg_time) BETWEEN '{yesterday}' AND '{now}' "
                 f"AND cmd.sentiment_status = '0' AND cmd.match_type = 'Comment' "
-                f"GROUP BY cmd.msg_id, project_name, post_user "
+                f"GROUP BY cmd.msg_id, company_name, project_name, post_user "
                 f"ORDER BY cmd.msg_time ASC "
             )
         }
