@@ -536,20 +536,38 @@ class SentimentAPI:
 # Main
 # =============================================================================
 if __name__ == "__main__":
-    start_time = time.time()
-    
-    # ใช้วันที่ปัจจุบันเป็น default 
-    yesterday = str(datetime.now() - timedelta(days=1))[:10]
-    now       = str(datetime.now())[:10]
-
     print("\n" + "=" * 70)
-    print(" 🤖 Ollama SENTIMENT ANALYSIS SYSTEM (API MODE)")
-    print(f" 📅 ช่วงเวลา: {yesterday} ถึง {now}")
+    print(" 🤖 Ollama SENTIMENT ANALYSIS SYSTEM (API MODE - RUN FOREVER)")
     print("=" * 70)
 
     app = SentimentAPI()
-    app.run(yesterday, now, save_db=True)
+    
+    # อ่านค่าจาก .env หรือตั้งค่าเริ่มต้นที่ 10 นาที
+    SLEEP_MINUTES = int(os.environ.get("RUN_INTERVAL_MINUTES", 10))
 
-    end_time = time.time()
-    total_time = end_time - start_time
-    print(f"\n🎉 สิ้นสุดการทำงานทั้งหมด! ใช้เวลาไปทั้งสิ้น: {total_time:.2f} วินาที")
+    while True:
+        start_time = time.time()
+        
+        # อัปเดตวันที่ให้เป็นปัจจุบันเสมอในแต่ละรอบ
+        yesterday = str(datetime.now() - timedelta(days=1))[:10]
+        now       = str(datetime.now())[:10]
+
+        print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🚀 เริ่มการดึงข้อมูลรอบใหม่...")
+        print(f"📅 ช่วงเวลา: {yesterday} ถึง {now}")
+        print("-" * 70)
+
+        try:
+            app.run(yesterday, now, save_db=True)
+        except Exception as e:
+            print(f"❌ เกิดข้อผิดพลาดระหว่างรัน: {e}")
+
+        end_time = time.time()
+        total_time = end_time - start_time
+        print(f"\n🎉 สิ้นสุดการทำงานรอบนี้! ใช้เวลาไปทั้งสิ้น: {total_time:.2f} วินาที")
+        
+        print(f"⏳ รอ {SLEEP_MINUTES} นาทีก่อนเริ่มรอบถัดไป... (กด Ctrl+C เพื่อหยุดโปรแกรม)")
+        try:
+            time.sleep(SLEEP_MINUTES * 60)
+        except KeyboardInterrupt:
+            print("\n🛑 หยุดการทำงานตามคำสั่งผู้ใช้ (Ctrl+C)")
+            sys.exit(0)
