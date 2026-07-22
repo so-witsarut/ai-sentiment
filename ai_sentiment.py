@@ -1,11 +1,7 @@
 # coding=utf-8
 """
 Sentiment Analysis with Ollama (qwen3-8b-instruct)
-Flow หลักอิงจาก sentiment_analysis_ai_be_srv1_01.py
-- ดึง msg_id ที่ sentiment_status = '0' จาก MySQL
-- ดึง content จาก MongoDB
-- ส่งให้ Ollama วิเคราะห์ sentiment
-- อัพเดทผลลัพธ์กลับลง MySQL (own_match, own_match_daily, own_match_3months)
+Using Blueeye REST API
 """
 
 import os
@@ -14,18 +10,8 @@ import json
 import time
 import sys
 import requests
-import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import pymysql
-from pymongo import MongoClient
 from datetime import datetime, timedelta
-
-# pyrefly: ignore [missing-import]
-from sshtunnel import SSHTunnelForwarder
-
-sys.path.append(r"ai-sentiment")
-# pyrefly: ignore [missing-import]
-import connection
 
 try:
     from dotenv import load_dotenv
@@ -33,9 +19,9 @@ try:
 except ImportError:
     pass
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyBzFYeBNrOnDqhSTwVDzW73sX_q_ki2-Rw")
-
-CONN=connection.DatabaseConnection()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+BE_API_TOKEN = os.environ.get("BE_API_TOKEN", "10b6150ab6b7a8ef90904a32ef875f2b62789753109733d0194165d9ed3e854c")
+BE_API_BASE_URL = os.environ.get("BE_API_BASE_URL", "https://api.blueeye.io/api/v1")
 
 # ตั้งค่า stdout ให้รองรับการปริ้นภาษาไทยบน Windows (แก้ปัญหา UnicodeEncodeError)
 if sys.stdout.encoding != 'utf-8':
@@ -48,18 +34,13 @@ def get_keyword_context(text, keyword, window=150, max_fallback_length=400):
     if not text:
         return ""
         
-    # ถ้าไม่มี Keyword ให้ตัดตามความยาวสูงสุดเลย
     if not keyword or keyword not in text:
         return text[:max_fallback_length] + ("..." if len(text) > max_fallback_length else "")
 
-    # หาตำแหน่งของ Keyword ในข้อความ
     start_idx = text.find(keyword)
-    
-    # คำนวณจุดตัดหน้า-หลัง
     left_bound = max(0, start_idx - window)
     right_bound = min(len(text), start_idx + len(keyword) + window)
     
-    # หั่นข้อความและเติม ... ให้รู้ว่าถูกตัดมา
     sliced_text = text[left_bound:right_bound]
     
     if left_bound > 0:
@@ -72,34 +53,13 @@ def get_keyword_context(text, keyword, window=150, max_fallback_length=400):
 # =============================================================================
 # Ollama Sentiment Analyzer (Local Ollama)
 # =============================================================================
-# 🖥️ GPU Profile: NVIDIA GTX 1660 (6GB GDDR5, 1408 CUDA cores, 120W TDP)
-#   ⚠️ GTX 1660 มี CUDA cores น้อยกว่า RTX 3050 Ti (1408 vs 2560)
-#   → Strategy: ลด workload ต่อ request ให้เบาที่สุด แต่คง parallelism ไว้
-#   → Workers 3 ตัว = จุดสมดุลระหว่าง parallelism กับ compute pressure
-#   - Model: qwen3-8b Q4_K_M (~4.5GB) → เหลือ VRAM ~1.5GB
-#   - KV cache per seq (1024 ctx) ≈ 100-200MB
-#   - 3 workers × 200MB = 600MB < 1.5GB ✅
-# =============================================================================
 class OllamaSentimentAnalyzer:
-    # ✅ GTX 1660: 3 workers = สมดุลระหว่าง parallelism กับ CUDA cores
-    # ⚠️ อย่าลดต่ำกว่า 3 → จะช้ามาก (ทดสอบ 2 workers = 168 วินาที!)
     CONCURRENT_WORKERS = 3
 
     def __init__(self, model="qcwind/qwen3-8b-instruct-Q4-K-M:latest"):
-        
         self.model = model
         self.base_url = "http://localhost:11434/api/generate"
 
-        # === System Prompt (สร้างครั้งเดียว ใช้ซ้ำทุก request) ===
-        # self.system_instruction = (
-        #     "You are a strict Thai Sentiment Analyzer. "
-        #     # "/no_think "                              # ✅ magic token ของ qwen3 (ปิด thinking mode)
-        #     'Output ONLY a minified JSON object: {"reason": "<เหตุผลสั้นๆ ภาษาไทย>", "ai_sentiment": <int>}. '
-        #     "Do not explain or add markdown formatting."
-        # )
-        # self.system_instruction = (
-        #     'Return only JSON: {"reason":"<thai>","ai_sentiment":<int>}'
-        # )
         self.system_instruction = (
             "You are an expert Thai Social Media Brand Reputation Analyst. "
             "Given a social media post, determine the PUBLIC SENTIMENT toward a specific Target brand. "
@@ -120,15 +80,20 @@ class OllamaSentimentAnalyzer:
         
         for attempt in range(max_retries):
             try:
-                response = requests.post(url, json=payload, timeout=60)
+                response = requests.post(url, json=payload, timeout=45)
                 if response.status_code == 200:
                     res_data = response.json()
                     result_text = res_data["candidates"][0]["content"]["parts"][0]["text"]
-                    return self._parse_json_result(result_text)
+                    parsed_res = self._parse_json_result(result_text)
+                    if parsed_res is None:
+                        print(f"  -> Gemini API Parsing Error [{model_name}]: {result_text}")
+                    return parsed_res
                 else:
+                    print(f"  -> Gemini API Error [{model_name}]: {response.status_code} - {response.text}")
                     if attempt < max_retries - 1:
                         time.sleep(2)
-            except Exception:
+            except Exception as e:
+                print(f"  -> Gemini API Exception [{model_name}]: {e}")
                 if attempt < max_retries - 1:
                     time.sleep(2)
         return None
@@ -150,7 +115,6 @@ class OllamaSentimentAnalyzer:
         except Exception:
             pass
             
-        # Fallback chat
         payload_chat = {
             "model": model_name,
             "messages": [
@@ -191,9 +155,9 @@ class OllamaSentimentAnalyzer:
             parsed["ai_sentiment"] = ai_sentiment
             return parsed
         except json.JSONDecodeError:
-            sentiment_match = re.search(r'["\']?ai_sentiment["\']?\s*[:=]\s*(-?100|0)', clean_text, re.IGNORECASE)
-            reason_match = re.search(r'["\']?reason["\']?\s*[:=]\s*["\']?(.*?)["\']?(?:,|\n|\})', clean_text, re.IGNORECASE)
-            entity_match = re.search(r'["\']?entity_found["\']?\s*[:=]\s*(true|false)', clean_text, re.IGNORECASE)
+            sentiment_match = re.search(r'[`"\']?ai_sentiment[`"\']?\s*[:=]\s*(-?100|0|100)', clean_text, re.IGNORECASE)
+            reason_match = re.search(r'[`"\']?reason[`"\']?\s*[:=]\s*[`"\']?(.*?)[`"\']?(?:,|\n|\}|$)', clean_text, re.IGNORECASE)
+            entity_match = re.search(r'[`"\']?entity_found[`"\']?\s*[:=]\s*(true|false)', clean_text, re.IGNORECASE)
             
             if sentiment_match:
                 ai_sentiment = int(sentiment_match.group(1))
@@ -204,58 +168,52 @@ class OllamaSentimentAnalyzer:
                 return {"ai_sentiment": ai_sentiment, "reason": reason, "entity_found": entity_found}
         return None
 
-    def _analyze_single_post(self, post, company_name):
-        """
-        วิเคราะห์ sentiment ของโพสต์เดียว (ใช้ใน ThreadPoolExecutor)
-        Returns: dict with post_id, ai_sentiment, confidence หรือ None ถ้า error
-        """
-        post_id   = post["post_id"]
-        content   = post["content"]
-        post_user = post["post_user"]
-        matched_keyword = post.get("keyword_name", company_name)
+    def _analyze_single_post(self, post):
+        post_id = str(post.get("match_post_id", ""))
+        keywords = post.get("keywords", [])
+        target_entity = ", ".join(keywords) if keywords else "the Target Entity"
+        feed_link = post.get("feed_link", "")
 
-        # ใช้ actual_target ที่คำนวณไว้แล้วจาก analysis()
-        # ถ้าเป็น COMPETITOR → actual_target = keyword_name (ชื่อแบรนด์จริง)
-        # ถ้าเป็น OWN → actual_target = company_name
-        actual_target = post.get("actual_target", company_name)
-
-        user_prompt = (
-            f"Target Entity={actual_target}\n"
-            f"Keyword={matched_keyword}\n"
-            f"User={post_user}\n"
-            f"Text={content}\n\n"
-
-            "INSTRUCTIONS (stop at first match):\n"
-            "1. OWNED MEDIA: 'User' is Target's official page -> 0.\n"
-            "2. NEUTRAL: Ads, promotions, sports results, or general news "
-            "with no direct brand reputation impact -> 0.\n"
-            "3. UNRELATED: Text is about a different entity, "
-            "or Keyword is a location/idiom/generic word -> 0.\n"
-            "4. NEGATIVE: Explicitly criticizes, boycotts, "
-            "or reports scandal DIRECTLY against Target -> -100.\n"
-            "5. POSITIVE: Explicitly praises or recommends Target DIRECTLY -> 100.\n"
-            "6. DEFAULT: Otherwise -> 0.\n\n"
-
-            'JSON ONLY: {"reason":"ไทย 1 ประโยค","ai_sentiment":<int>,"is_ambiguous":<bool>}'
-        )
+        # Pass 2: ขยาย Context Window เป็น 300 สำหรับ Gemini
+        if "full_text" in post and keywords:
+            content = get_keyword_context(post["full_text"], str(keywords[0]), window=300)
+        else:
+            content = post.get("content", "")
 
         # user_prompt = (
-        #     f"Target={actual_target}\n"
+        #     f"Target Entity={actual_target}\n"
         #     f"Keyword={matched_keyword}\n"
         #     f"User={post_user}\n"
         #     f"Text={content}\n\n"
-
-        #     "INSTRUCTIONS:\n"
-        #     "1. OWNED MEDIA: If 'User' is Target's official page -> 0.\n"
-        #     "2. FALSE POSITIVE: If Keyword refers to UNRELATED location (e.g. จังหวัดสิงห์บุรี) or idiom (e.g. เสือเป็นสิงห์) -> 0. (Note: 'สิงห์ปาร์ค', 'สิงห์ เชียงราย' ARE valid Target entities).\n"
-        #     "3. NEUTRAL NEWS: Ads, sports, or general news (like crimes/drug busts) NOT explicitly damaging the Target -> 0.\n"
-        #     "4. NEGATIVE: Explicitly criticizes, boycotts (e.g. 'บอกลา'), or reports a real scandal DIRECTLY against Target -> -100.\n"
-        #     "5. POSITIVE: Explicitly praises or supports Target -> 100.\n"
+        #
+        #     "INSTRUCTIONS (stop at first match):\n"
+        #     "1. OWNED MEDIA: 'User' is Target's official page -> 0.\n"
+        #     "2. NEUTRAL: Ads, promotions, sports results, or general news "
+        #     "with no direct brand reputation impact -> 0.\n"
+        #     "3. UNRELATED: Text is about a different entity, "
+        #     "or Keyword is a location/idiom/generic word -> 0.\n"
+        #     "4. NEGATIVE: Explicitly criticizes, boycotts, "
+        #     "or reports scandal DIRECTLY against Target -> -100.\n"
+        #     "5. POSITIVE: Explicitly praises or recommends Target DIRECTLY -> 100.\n"
         #     "6. DEFAULT: Otherwise -> 0.\n\n"
-
-        #     'JSON ONLY:\n{"reason":"เหตุผล 1 ประโยคภาษาไทย","ai_sentiment":<int>}'
+        #
+        #     'JSON ONLY: {"reason":"ไทย 1 ประโยค","ai_sentiment":<int>,"is_ambiguous":<bool>}'
         # )
 
+        user_prompt = (
+            f"Target Entity={target_entity}\n"
+            f"Source Link={feed_link}\n"
+            f"Text={content}\n\n"
+            "INSTRUCTIONS:\n"
+            f"Analyze the sentiment of the text specifically towards the Target Entity ({target_entity}).\n"
+            "1. UNRELATED REFERENCE: If the Target Entity name is used as a generic location, idiom, animal breed, or is completely unrelated to the intended subject -> 0.\n"
+            "2. OWNED MEDIA: If Source Link or Text indicates it's posted by the Target Entity's official page or PR, return 0.\n"
+            "3. NEGATIVE: Explicitly criticizes, complains, expresses anger, or reports a bad experience against the Target Entity -> -100.\n"
+            "4. POSITIVE: Explicitly praises, recommends, expresses happiness, or shows support for the Target Entity -> 100.\n"
+            "5. NEUTRAL: General news, ads, promotions, sports results, statements of facts, or ambiguous tone -> 0.\n\n"
+            "CRITICAL: For the 'reason' field, you MUST explain WHICH rule you applied and WHY (e.g., 'เนื้อหาเป็นการรายงานผลกีฬา', 'เป็นโพสต์จาก Official Page'). Do NOT include phrases like 'จึงจัดเป็น 0' or 'จึงได้คะแนน 100'.\n"
+            'JSON ONLY: {"reason":"เหตุผลที่อ้างอิงกฎข้างต้น (ภาษาไทยสั้นๆ)","ai_sentiment":<int>,"is_ambiguous":<bool>}'
+        )
 
         def _call_ollama(is_deep_think=False):
             current_payload = {
@@ -265,27 +223,24 @@ class OllamaSentimentAnalyzer:
                 "stream": False,
                 "format": "json",
                 "think": is_deep_think,
-                "keep_alive": -1,                    # ✅ โมเดลค้างใน GPU ไม่ต้อง reload
+                "keep_alive": -1,
                 "options": {
                     "temperature": 0.0,
                     "top_p":       0.1,
                     "seed":        42,
                     "num_predict": 384 if is_deep_think else 128,
-                    "num_ctx":     768 if is_deep_think else 512,   # ลดจาก 1536/1024
+                    "num_ctx":     768 if is_deep_think else 512,
                     "num_batch":   256,
-                    "flash_attn":  True,  # ⚡ เปิดใช้ Flash Attention เพื่อประหยัด VRAM ของ 1660
-                    "num_gpu":     99,  # ⚠️ คอมเมนต์ออก เพื่อป้องกันปัญหา memory layout (OOM) 
+                    "flash_attn":  True,
                 }
             }
 
             try:
-                # ให้เวลารอนานขึ้นถ้ารอบ deep think เพราะ GTX 1660 ประมวลผล concurrent นาน
                 response = requests.post(self.base_url, json=current_payload, timeout=300 if is_deep_think else 120)
 
                 if response.status_code == 200:
                     result_text = response.json().get("response", "{}")
 
-                    # --- ทำความสะอาดผลลัพธ์ ---
                     clean_text = re.sub(r'<think>.*?</think>', '', result_text, flags=re.DOTALL).strip()
                     clean_text = clean_text.replace('```json', '').replace('```', '').strip()
 
@@ -304,7 +259,6 @@ class OllamaSentimentAnalyzer:
                             elif s == "NEGATIVE": ai_sentiment = -100
                             else:                ai_sentiment = 0
                         else:
-                            # Normalize: บวก→100, ลบ→-100, ศูนย์→0
                             if ai_sentiment > 0:
                                 ai_sentiment = 100
                             elif ai_sentiment < 0:
@@ -327,52 +281,70 @@ class OllamaSentimentAnalyzer:
 
             return None
 
-        # ==========================================
-        # 🚀 TWO-PASS FILTERING (Cascade Architecture)
-        # ==========================================
-        # Pass 1: วิเคราะห์แบบเร็ว (Fast Pass)
         first_pass_result = _call_ollama(is_deep_think=False)
 
         if first_pass_result and first_pass_result["ai_sentiment"] != 0:
             first_sentiment = first_pass_result["ai_sentiment"]
             first_reason = first_pass_result.get("reason", "")
-            print(f"\n  🔍 [Pass 2 Triggered] Post {post_id} ได้ค่า {first_sentiment} -> กำลังยืนยันความถูกต้องด้วยโมเดลวิเคราะห์ (Validation)...")
+            print(f"\n  🔍 [Pass 2 Triggered] Post {post_id} ได้ค่า {first_sentiment} -> กำลังยืนยันความถูกต้อง...")
             
             validation_system_instruction = (
-                "You are a strict Brand Mention Validator. "
-                "Your #1 priority is to check if the Target Entity is EXPLICITLY mentioned in the text. "
-                "If the Target Entity is NOT mentioned, you MUST return ai_sentiment=0 regardless of the text's tone. "
+                f"You are a strict Brand Mention Validator for '{target_entity}'. "
+                f"Your #1 priority is to check if '{target_entity}' is EXPLICITLY mentioned in the text. "
+                "If it is NOT mentioned, you MUST return ai_sentiment=0 regardless of the text's tone. "
                 "Do NOT assume or infer that the text is about the Target Entity."
             )
 
+            # validation_user_prompt = (
+            #     f"Target Entity={actual_target}\n"
+            #     f"Keyword={matched_keyword}\n"
+            #     f"User={post_user}\n"
+            #     f"Text={content}\n\n"
+            #     f"First-Pass Sentiment={first_sentiment}\n"
+            #     f"First-Pass Reason={first_reason}\n\n"
+            #     "TASK (Follow these steps IN ORDER):\n"
+            #     "Step 1: ENTITY CHECK - Scan the Text and determine if the Target Entity or any of its known brands/products are explicitly mentioned. Set entity_found=true or entity_found=false.\n"
+            #     "Step 2: IF entity_found=false -> STOP. Set ai_sentiment=0. The text is UNRELATED. Do NOT proceed further.\n"
+            #     "Step 3: IF entity_found=true -> Check these rules:\n"
+            #     "   - OWNED MEDIA: Official page posts, PR, or promotional content by the Target Entity -> 0\n"
+            #     "   - NEUTRAL: General ads, job hirings, sports news without direct positive/negative impact -> 0\n"
+            #     "   - UNRELATED REFERENCE: Name used as location, idiom, person name, or animal breed -> 0\n"
+            #     "   - NEGATIVE: Explicitly criticizes/boycotts/complains DIRECTLY against the Target Entity -> -100\n"
+            #     "   - POSITIVE: Explicitly praises/recommends the Target Entity DIRECTLY -> 100\n\n"
+            #     'JSON ONLY: {"entity_found":true/false,"reason":"[\u0e22\u0e37\u0e19\u0e22\u0e31\u0e19/\u0e41\u0e01\u0e49\u0e44\u0e02] \u0e2a\u0e23\u0e38\u0e1b\u0e2a\u0e31\u0e49\u0e19\u0e46 \u0e20\u0e32\u0e29\u0e32\u0e44\u0e17\u0e22","ai_sentiment":<-100|0|100>}'
+            # )
+
             validation_user_prompt = (
-                f"Target Entity={actual_target}\n"
-                f"Keyword={matched_keyword}\n"
-                f"User={post_user}\n"
+                f"Target Entity={target_entity}\n"
+                f"Source Link={feed_link}\n"
                 f"Text={content}\n\n"
                 f"First-Pass Sentiment={first_sentiment}\n"
                 f"First-Pass Reason={first_reason}\n\n"
-                "TASK (Follow these steps IN ORDER):\n"
-                "Step 1: ENTITY CHECK - Scan the Text and determine if the Target Entity or any of its known brands/products are explicitly mentioned. Set entity_found=true or entity_found=false.\n"
-                "Step 2: IF entity_found=false -> STOP. Set ai_sentiment=0. The text is UNRELATED. Do NOT proceed further.\n"
-                "Step 3: IF entity_found=true -> Check these rules:\n"
-                "   - OWNED MEDIA: Official page posts, PR, or promotional content by the Target Entity -> 0\n"
-                "   - NEUTRAL: General ads, job hirings, sports news without direct positive/negative impact -> 0\n"
-                "   - UNRELATED REFERENCE: Name used as location, idiom, person name, or animal breed -> 0\n"
-                "   - NEGATIVE: Explicitly criticizes/boycotts/complains DIRECTLY against the Target Entity -> -100\n"
-                "   - POSITIVE: Explicitly praises/recommends the Target Entity DIRECTLY -> 100\n\n"
-                'JSON ONLY: {"entity_found":true/false,"reason":"[\u0e22\u0e37\u0e19\u0e22\u0e31\u0e19/\u0e41\u0e01\u0e49\u0e44\u0e02] \u0e2a\u0e23\u0e38\u0e1b\u0e2a\u0e31\u0e49\u0e19\u0e46 \u0e20\u0e32\u0e29\u0e32\u0e44\u0e17\u0e22","ai_sentiment":<-100|0|100>}'
+                "TASK:\n"
+                f"Validate the sentiment specifically towards '{target_entity}'.\n"
+                "   - UNRELATED REFERENCE: If the name is used as a generic location, idiom, or animal breed -> 0\n"
+                "   - OWNED MEDIA: If Source Link indicates the post is from the Target Entity's official page, return 0.\n"
+                "   - NEGATIVE: Explicitly criticizes, complains, expresses anger, or reports a bad experience -> -100\n"
+                "   - POSITIVE: Explicitly praises, recommends, expresses happiness, or shows support -> 100\n"
+                "   - NEUTRAL: General news, ads, promotions, sports results, statements of facts, or ambiguous tone -> 0\n\n"
+                "CRITICAL: You MUST output ONLY a valid JSON object. Do NOT include markdown formatting, bullet points, or thinking processes.\n"
+                "CRITICAL: For the 'reason' field, explain WHICH rule you applied and WHY (e.g., 'เนื้อหาเป็นการรายงานผลกีฬา'). Do NOT include phrases like 'จึงจัดเป็น 0' or 'จึงได้ 100'.\n"
+                '{"entity_found": <boolean>, "reason": "<อธิบายเหตุผลอ้างอิงตามกฎ เป็นภาษาไทยสั้นๆ>", "ai_sentiment": <-100|0|100>}'
             )
 
-            validation_models = ["api:gemma-4-31b-it", "gemma4:31b-cloud"]
+            validation_models = [
+                "api:gemma-4-31b-it", 
+                "gemma4:31b-cloud", 
+                "api:gemma-4-26b-a4b-it", 
+                "api:gemini-3.1-flash-lite", 
+                "api:gemini-3.5-flash-lite"
+            ]
             second_pass_result = None
-
+            
             for val_model in validation_models:
-                print(f"      🔄 [Pass 2] ลองใช้โมเดล: {val_model} สำหรับ Post {post_id}...")
-                
                 if val_model.startswith("api:"):
                     actual_api_model = val_model.replace("api:", "", 1)
-                    res = self._call_gemini_api(actual_api_model, validation_system_instruction, validation_user_prompt)
+                    res = self._call_gemini_api(actual_api_model, validation_system_instruction, validation_user_prompt, max_retries=1)
                 else:
                     res = self._call_ollama_generic(val_model, validation_system_instruction, validation_user_prompt)
 
@@ -380,8 +352,6 @@ class OllamaSentimentAnalyzer:
                     second_pass_result = res
                     used_model = val_model
                     break
-                else:
-                    print(f"      ⚠️ {val_model} สำหรับ Post {post_id} ล้มเหลว กำลังสลับไปใช้โมเดลถัดไป...")
             
             if second_pass_result:
                 entity_found = second_pass_result.get("entity_found", True)
@@ -395,22 +365,15 @@ class OllamaSentimentAnalyzer:
                 second_pass_result["reason"] = f"[Deep Checked: {used_model}] {second_pass_result.get('reason', '')} (รอบแรก: {first_reason})"
                 return second_pass_result
 
-        # ถ้าเป็น Neutral (0) หรือ Error ให้ส่งกลับเลย
         return first_pass_result
 
-    def analyze_post_sentiments(self, json_posts, company_name=""):
-        """
-        ✅ ส่งหลายโพสต์พร้อมกัน (concurrent) เพื่อใช้ Ollama continuous batching
-        GTX 1660: ใช้ 3 workers — Ollama จะ batch requests บน GPU ให้เอง
-        Returns: {"data": [...], "token_usage": {...}}
-        """
+    def analyze_post_sentiments(self, json_posts):
         posts = json.loads(json_posts)
         results = []
 
-        # ✅ ส่ง requests แบบ concurrent ด้วย ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=self.CONCURRENT_WORKERS) as executor:
             future_to_post = {
-                executor.submit(self._analyze_single_post, post, company_name): post
+                executor.submit(self._analyze_single_post, post): post
                 for post in posts
             }
 
@@ -423,373 +386,170 @@ class OllamaSentimentAnalyzer:
 
 
 # =============================================================================
-# Sentiment Analysis
+# Sentiment API Manager
 # =============================================================================
-class sentiment:
-    def __init__(self, config):
-        
-        self.config = config
+class SentimentAPI:
+    def __init__(self):
         self.ollama = OllamaSentimentAnalyzer(model="qcwind/qwen3-8b-instruct-Q4-K-M:latest")
+        self.headers = {
+            'X-Internal-Token': BE_API_TOKEN,
+            'Content-Type': 'application/json'
+        }
 
-    def get_content(self, list_id_with_info, collection):
-        list_content = []
+    def fetch_pending(self, date_from, date_to):
+        url = f"{BE_API_BASE_URL}/internal/sentiment/pending?date_from={date_from}&date_to={date_to}"
+        print(f"\n🎯 กำลังดึงข้อมูลผ่าน API...")
+        try:
+            response = requests.get(url, headers=self.headers, timeout=60)
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, list):
+                    return data
+                elif isinstance(data, dict) and "data" in data:
+                    return data["data"]
+                elif isinstance(data, dict) and "results" in data:
+                    return data["results"]
+                else:
+                    print("⚠️ API คืนค่ามาในรูปแบบที่ไม่คาดคิด (ไม่มีฟิลด์ list/data)")
+                    return []
+            else:
+                print(f"❌ API Fetch Error {response.status_code}: {response.text}")
+                return []
+        except Exception as e:
+            print(f"❌ Exception in fetch_pending: {e}")
+            return []
 
-        company_map   = {msg_id: comp         for (msg_id, comp, proj, post_user, kw_name) in list_id_with_info}
-        project_map   = {msg_id: proj         for (msg_id, comp, proj, post_user, kw_name) in list_id_with_info}
-        post_user_map = {msg_id: post_user    for (msg_id, comp, proj, post_user, kw_name) in list_id_with_info}
-        keyword_map   = {msg_id: kw_name      for (msg_id, comp, proj, post_user, kw_name) in list_id_with_info}
-        list_id = [msg_id for (msg_id, comp, proj, post_user, kw_name) in list_id_with_info]
+    def bulk_update(self, results):
+        if not results:
+            return
+            
+        url = f"{BE_API_BASE_URL}/internal/sentiment/results"
+        payload = {"results": results}
+        
+        try:
+            response = requests.post(url, headers=self.headers, json=payload, timeout=60)
+            if response.status_code in [200, 201]:
+                print(f"  ✅ บันทึกข้อมูลสำเร็จ ({len(results)} โพสต์)")
+            else:
+                print(f"  ❌ API Update Error {response.status_code}: {response.text}")
+        except Exception as e:
+            print(f"  ❌ Exception in bulk_update: {e}")
 
-        if not list_id:
-            return list_content
+    def run(self, date_from, date_to, save_db=False):
+        pending_posts = self.fetch_pending(date_from, date_to)
+        
+        if not pending_posts:
+            print("⏩ ไม่มีข้อมูลใหม่ให้วิเคราะห์ (0 โพสต์)")
+            return
 
-        DB_CONNECTION = CONN.get_mongo_client()
-        DB = DB_CONNECTION[self.config.get("mongo_db", "blue_eye")]
-        DB_COLLECTION = DB[collection]
-
-        result = DB_COLLECTION.find({"_id": {"$in": list_id}})
-
-        if collection == "Feed":
-            columnName = "feedcontent"
-        else:
-            columnName = "commentcontent"
-
-        for e in result:
-            feedcontent = e.get(columnName, "")
-            msg_id = e["_id"]
-            comp_name = company_map.get(msg_id, "")
-            proj_name = project_map.get(msg_id, "")
-            post_user = post_user_map.get(msg_id, "")
-            kw_name   = keyword_map.get(msg_id, "")
-            # fallback: ถ้า post_user ว่าง ให้ใช้ prefix ก่อน '_' จาก msg_id
-            if not post_user:
-                post_user = str(msg_id).split("_")[0]
-            list_content.append((msg_id, feedcontent, comp_name, proj_name, post_user, kw_name))
-
-        # ไม่ปิด connection — เป็น shared connection ที่ CONN จัดการให้
-
-        return list_content
-
-    def analysis(self, list_content, host, server=1, table_prefix="own_match", save_db=True):
-        """
-        วิเคราะห์ sentiment แล้วอัพเดทลง MySQL
-
-        Args:
-            list_content (list): [(msg_id, content, company_name, project_name, post_user, kw_name), ...]
-            host (str): MySQL host
-            server (int): MySQL Server ID (1 or 2)
-            table_prefix (str): 'own_match' หรือ 'competitor_match'
-            save_db (bool): บันทึกลงฐานข้อมูลหรือไม่ (ถ้า False จะแค่จำลองการทำงาน)
-        """
-        tunnel, DB_CONNECTION = CONN.get_mysql_connection(server=server, host=host, database=self.config["mysql_db"])
+        total = len(pending_posts)
+        print(f"📦 พบข้อความที่ต้องวิเคราะห์ทั้งหมด: {total} โพสต์")
 
         BATCH_SIZE = 5
-        total = len(list_content)
-        print(f"\n📦 พบข้อความที่ต้องวิเคราะห์ทั้งหมด: {total} โพสต์")
-
         for batch_start in range(0, total, BATCH_SIZE):
-            batch = list_content[batch_start:batch_start + BATCH_SIZE]
+            batch = pending_posts[batch_start:batch_start + BATCH_SIZE]
             batch_end = min(batch_start + BATCH_SIZE, total)
             print(f"\n🔄 กำลังประมวลผล Batch {batch_start + 1}-{batch_end} จากทั้งหมด {total} โพสต์...")
 
-            is_competitor = (table_prefix == "competitor_match")
+            # Prepare data for AI
             posts_for_ai = []
-            batch_company_name = ""
-            batch_project_name = ""
-            for (_id, content, company_name, project_name, post_user, kw_name) in batch:
+            for post in batch:
+                content = post.get("content", "")
                 text = re.sub(r"<[^>]+>", "", str(content))
                 text = re.sub(r"\s+", " ", text).strip()
-
-                if not batch_company_name and company_name:
-                    batch_company_name = company_name
-                if not batch_project_name and project_name:
-                    batch_project_name = project_name
-
-                if text:
-                    # กรณีที่มีหลายคำคั่นด้วยลูกน้ำ (เช่น ทราย, สุนิษฐ์, พาย) อาจจะเลือกคำแรกมาใช้สแกน
-                    first_keyword = kw_name.split(",")[0].strip() if kw_name else ""
-                    clean_short_content = get_keyword_context(text, first_keyword, window=150)
-
-                    # กำหนด actual_target ตามประเภท:
-                    # - COMPETITOR: ใช้ keyword เป็น Target
-                    # - OWN: ใช้ company_name เป็น Target (ชื่อแบรนด์จริง)
-                    if is_competitor:
-                        actual_target = first_keyword if first_keyword else project_name
-                    else:
-                        actual_target = company_name
-
-                    posts_for_ai.append({
-                        "post_id": str(_id),
-                        "post_user": post_user,
-                        "company_name": company_name,
-                        "keyword_name": kw_name,
-                        "actual_target": actual_target,
-                        "content": clean_short_content
-                    })
-
-            if not posts_for_ai:
-                print("  -> All content in batch is empty, skipping.")
-                continue
+                
+                keywords = post.get("keywords", [])
+                keyword = str(keywords[0]) if keywords else str(post.get("project_id", ""))
+                clean_short_content = get_keyword_context(text, keyword, window=150)
+                
+                modified_post = post.copy()
+                modified_post["content"] = clean_short_content
+                modified_post["full_text"] = text  # เก็บเต็มไว้ให้ Pass 2
+                posts_for_ai.append(modified_post)
 
             json_str = json.dumps(posts_for_ai, ensure_ascii=False)
-
-            target_label = f"{'COMPETITOR' if is_competitor else 'OWN'} | Company: {batch_company_name} | Proj: {batch_project_name}"
-            print(f"  🚀 ส่ง {len(posts_for_ai)} โพสต์ไปยัง Ollama ({target_label})")
-
-            ollama_response = self.ollama.analyze_post_sentiments(json_str, batch_company_name)
-
-            if "error" in ollama_response:
-                print(f"  ❌ ข้อผิดพลาดจาก Ollama: {ollama_response.get('message', ollama_response['error'])}")
-
+            
+            # Send to local Ollama
+            ollama_response = self.ollama.analyze_post_sentiments(json_str)
             ollama_results = ollama_response.get("data", [])
-            ollama_token_usage = ollama_response.get("token_usage", {})
-
+            
             ollama_map = {}
             if isinstance(ollama_results, list):
                 for res in ollama_results:
                     if "post_id" in res and "ai_sentiment" in res:
-                        ollama_map[res["post_id"]] = {
-                            "ai_sentiment": res["ai_sentiment"],
-                            "confidence": res.get("confidence", 0),
+                        ollama_map[str(res["post_id"])] = {
+                            "val": res["ai_sentiment"],
                             "reason": res.get("reason", "")
                         }
 
-            print(f"\n  📊 สรุปผลลัพธ์จาก Ollama (สำเร็จ {len(ollama_map)}/{len(batch)} โพสต์)")
-            print(f"  {'-'*100}")
+            # Prepare payload for POST API
+            api_results = []
+            for idx, post_for_ai in enumerate(posts_for_ai, 1):
+                match_post_id = str(post_for_ai.get("match_post_id", ""))
+                ai_content = post_for_ai.get("content", "").replace("\n", " ")
+                
+                # ตัดข้อความให้สั้นลงสำหรับการปรินต์แสดงผล (ถ้ายาวไป)
+                if len(ai_content) > 120:
+                    ai_content = ai_content[:120] + "..."
 
-            for idx, (_id, content, company_name, project_name, post_user, kw_name) in enumerate(batch, 1):
-                str_id = str(_id)
+                if match_post_id in ollama_map:
+                    raw_val = ollama_map[match_post_id]["val"]
+                    ai_reason = ollama_map[match_post_id]["reason"]
 
-                if str_id in ollama_map:
-                    ollama_val = float(ollama_map[str_id]["ai_sentiment"])
-                    ai_reason = ollama_map[str_id].get("reason", "")
-                    if ollama_val > 0:
-                        icon = "🟢 Positive"
-                    elif ollama_val < 0:
-                        icon = "🔴 Negative"
+                    # Map int to string
+                    if raw_val > 0:
+                        sentiment_str = "positive"
+                        icon = "🟢"
+                    elif raw_val < 0:
+                        sentiment_str = "negative"
+                        icon = "🔴"
                     else:
-                        icon = "⚪ Neutral "
-                else:
-                    ollama_val = None
-                    ai_reason = ""
-                    icon = "⚠️ N/A     "
+                        sentiment_str = "neutral"
+                        icon = "⚪"
+                        
+                    api_results.append({
+                        "match_post_id": match_post_id,
+                        "sentiment": sentiment_str
+                    })
+                    
+                    keywords = post_for_ai.get("keywords", [])
+                    keyword_str = ", ".join(keywords) if keywords else "None"
+                    feed_link = post_for_ai.get("feed_link", "None")
 
-                # หา actual_target และ content ที่ถูกตัดแล้ว (ส่งให้ AI) ที่ตรงกับโพสต์นี้
-                actual_target = next((p["actual_target"] for p in posts_for_ai if p["post_id"] == str_id), company_name)
-                ai_content = next((p["content"] for p in posts_for_ai if p["post_id"] == str_id), str(content))
-
-                # เตรียมข้อความสำหรับแสดงผล
-                original_preview = str(content).replace("\n", " ")
-                if len(original_preview) > 150:
-                    original_preview = original_preview[:150] + "..."
-                
-                ai_sliced = ai_content.replace("\n", " ")
-
-                print(f"  [{idx:02d}] 🆔 {str_id[:15]:<15} | {icon:<11} | User: {str(post_user)[:12]:<12} | Client: {company_name[:10]:<10} | Proj: {project_name[:10]:<10} | Target: {actual_target[:15]:<15} | KW: {kw_name}")
-                if ai_reason:
-                    print(f"       💡 Reason: {ai_reason}")
-                print(f"       📄 Full (Preview): {original_preview}")
-                print(f"       ✂️ Sliced (to AI): {ai_sliced}")
-                print(f"  {'-'*100}")
-
-            # ===== อัพเดท DB =====
+                    print(f"  [{idx:02d}] {icon} 🆔 {match_post_id[:15]:<15} | {sentiment_str.upper():<8}")
+                    print(f"       🔑 Keyword: {keyword_str}")
+                    print(f"       🔗 Source: {feed_link}")
+                    print(f"       📄 Content: {ai_content}")
+                    if ai_reason:
+                        print(f"       💡 Reason: {ai_reason}")
+                    print(f"  {'-'*90}")
+                        
+            # Update batch back to API
             if save_db:
-                try:
-                    DB_CONNECTION.ping(reconnect=True)
-                except Exception as e:
-                    print(f"  ⚠️ Warning: MySQL Ping/Reconnect failed: {e}")
-                
-                cursor = DB_CONNECTION.cursor()
-                
-                for (_id, content, company_name, project_name, post_user, kw_name) in batch:
-                    str_id = str(_id)
-                    if str_id not in ollama_map:
-                        continue
-                    sentiment_val = float(ollama_map[str_id]["ai_sentiment"])
-                    ai_reason_val = ollama_map[str_id].get("reason", "") or ""
-                
-                    for tbl in [table_prefix, f"{table_prefix}_daily", f"{table_prefix}_3months"]:
-                        cursor.execute(
-                            f'UPDATE `{tbl}` SET `{table_prefix}_sentiment` = %s, `sentiment_status` = %s, `ai_reason` = %s WHERE msg_id = %s',
-                            (sentiment_val, "1", ai_reason_val, str(_id))
-                        )
-                
-                DB_CONNECTION.commit()
-                cursor.close()
-                print(f"  💾 บันทึกลง DB เรียบร้อย ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
+                self.bulk_update(api_results)
             else:
-                print(f"  🚫 [MOCKUP] ข้ามการบันทึกลง DB ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
+                print(api_results)
+                print(f"  🚫 [MOCKUP] ข้ามการบันทึกลง API ({len(api_results)} โพสต์)")
 
-            # ไม่ต้องมีการดีเลย์ระหว่าง batch สำหรับ Local Ollama
-
-        DB_CONNECTION.close()
-        if 'tunnel' in locals() and tunnel:
-            tunnel.stop()
-        print("\n✅ วิเคราะห์และบันทึกข้อมูลทั้งหมดเสร็จสิ้นแล้ว")
 
 # =============================================================================
 # Main
 # =============================================================================
 if __name__ == "__main__":
     start_time = time.time()
-
-
-    config = {
-        # MySQL 
-        "mysql_host_1":   os.environ.get("MYSQL_HOST_1",   "10.130.84.170"),
-        "mysql_host_2":   os.environ.get("MYSQL_HOST_2",   "10.130.69.57"),
-        "mysql_port":     int(os.environ.get("MYSQL_PORT", 3306)),
-        "mysql_user":     os.environ.get("MYSQL_USER",     "blueeyeremote"),
-        "mysql_password": os.environ.get("MYSQL_PASSWORD", "BEremotemysql3075"),
-        "mysql_db":       os.environ.get("MYSQL_DB",       "blue_eye"),
-        "server":       os.environ.get("server",       1),
-
-        # SSH Tunnel
-        "ssh_host":       os.environ.get("SSH_HOST"),
-        "ssh_port":       int(os.environ.get("SSH_PORT", 22)),
-        "ssh_user":       os.environ.get("SSH_USER"),
-        "ssh_password":   os.environ.get("SSH_PASSWORD"),
-
-        # MongoDB
-        "mongo_host":     os.environ.get("MONGO_HOST",     "10.130.72.139"),
-        "mongo_port":     int(os.environ.get("MONGO_PORT", 34596)),
-        "mongo_user":     os.environ.get("MONGO_USER",     "blueeyeharvest"),
-        "mongo_password": os.environ.get("MONGO_PASSWORD", "BEharvest3075"),
-        "mongo_db":       os.environ.get("MONGO_DB",       "blue_eye"),
-    }
-
+    
+    # ใช้วันที่ปัจจุบันเป็น default 
     yesterday = str(datetime.now() - timedelta(days=1))[:10]
     now       = str(datetime.now())[:10]
 
-    targets = [
-        {
-            "name": "OWN MATCH",
-            "table_prefix": "own_match",
-            "sql_feed": (
-                f"SELECT omd.msg_id, "
-                f"IFNULL(c.company_name, '') as company_name, "
-                f"IFNULL(ck.company_keyword_name, '') as project_name, "
-                f"IFNULL(omd.post_user, '') as post_user, "
-                f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
-                f"FROM own_match_daily omd "
-                f"LEFT JOIN company_keyword ck ON omd.company_keyword_id = ck.company_keyword_id "
-                f"LEFT JOIN client c ON omd.client_id = c.client_id "
-                f"LEFT JOIN own_key_match okm ON okm.own_match_id = omd.own_match_id "
-                f"LEFT JOIN keyword k ON okm.keyword_id = k.keyword_id "
-                f"WHERE date(omd.msg_time) BETWEEN '{yesterday}' AND '{now}' "
-                f"AND omd.sentiment_status = '0' AND omd.match_type = 'Feed' "
-                f"GROUP BY omd.msg_id, company_name, project_name, post_user "
-                f"ORDER BY omd.msg_time ASC "
-            ),
-            "sql_comment": (
-                f"SELECT omd.msg_id, "
-                f"IFNULL(c.company_name, '') as company_name, "
-                f"IFNULL(ck.company_keyword_name, '') as project_name, "
-                f"IFNULL(omd.post_user, '') as post_user, "
-                f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
-                f"FROM own_match_daily omd "
-                f"LEFT JOIN company_keyword ck ON omd.company_keyword_id = ck.company_keyword_id "
-                f"LEFT JOIN client c ON omd.client_id = c.client_id "
-                f"LEFT JOIN own_key_match okm ON okm.own_match_id = omd.own_match_id "
-                f"LEFT JOIN keyword k ON okm.keyword_id = k.keyword_id "
-                f"WHERE date(omd.msg_time) BETWEEN '{yesterday}' AND '{now}' "
-                f"AND omd.sentiment_status = '0' AND omd.match_type = 'Comment' "
-                f"GROUP BY omd.msg_id, company_name, project_name, post_user "
-                f"ORDER BY omd.msg_time ASC "
-            )
-        },
-        {
-            "name": "COMPETITOR MATCH",
-            "table_prefix": "competitor_match",
-            "sql_feed": (
-                f"SELECT cmd.msg_id, "
-                f"IFNULL(c.company_name, '') as company_name, "
-                f"IFNULL(ck.company_keyword_name, '') as project_name, "
-                f"IFNULL(cmd.post_user, '') as post_user, "
-                f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
-                f"FROM competitor_match_daily cmd "
-                f"LEFT JOIN company_keyword ck ON cmd.company_keyword_id = ck.company_keyword_id "
-                f"LEFT JOIN client c ON cmd.client_id = c.client_id "
-                f"LEFT JOIN competitor_key_match ckm ON ckm.competitor_match_id = cmd.competitor_match_id "
-                f"LEFT JOIN keyword k ON ckm.keyword_id = k.keyword_id "
-                f"WHERE date(cmd.msg_time) BETWEEN '{yesterday}' AND '{now}' "
-                f"AND cmd.sentiment_status = '0' AND cmd.match_type = 'Feed' "
-                f"GROUP BY cmd.msg_id, company_name, project_name, post_user "
-                f"ORDER BY cmd.msg_time ASC "
-            ),
-            "sql_comment": (
-                f"SELECT cmd.msg_id, "
-                f"IFNULL(c.company_name, '') as company_name, "
-                f"IFNULL(ck.company_keyword_name, '') as project_name, "
-                f"IFNULL(cmd.post_user, '') as post_user, "
-                f"IFNULL(GROUP_CONCAT(DISTINCT k.keyword_name SEPARATOR ', '), '') as keyword_name "
-                f"FROM competitor_match_daily cmd "
-                f"LEFT JOIN company_keyword ck ON cmd.company_keyword_id = ck.company_keyword_id "
-                f"LEFT JOIN client c ON cmd.client_id = c.client_id "
-                f"LEFT JOIN competitor_key_match ckm ON ckm.competitor_match_id = cmd.competitor_match_id "
-                f"LEFT JOIN keyword k ON ckm.keyword_id = k.keyword_id "
-                f"WHERE date(cmd.msg_time) BETWEEN '{yesterday}' AND '{now}' "
-                f"AND cmd.sentiment_status = '0' AND cmd.match_type = 'Comment' "
-                f"GROUP BY cmd.msg_id, company_name, project_name, post_user "
-                f"ORDER BY cmd.msg_time ASC "
-            )
-        }
-    ]
-
     print("\n" + "=" * 70)
-    print(" 🤖 Ollama (qwen3-8b-instruct) SENTIMENT ANALYSIS SYSTEM")
+    print(" 🤖 Ollama SENTIMENT ANALYSIS SYSTEM (API MODE)")
     print(f" 📅 ช่วงเวลา: {yesterday} ถึง {now}")
     print("=" * 70)
 
-    sa = sentiment(config)
-
-    for server_id in [1 , 2]: #, 2]: ทดสอบเฉพาะ server 1 ก่อน
-        current_host = config[f"mysql_host_{server_id}"]
-        
-        print(f"\n{'=' * 70}")
-        print(f" 🖥️  เริ่มทำงานกับ MYSQL SERVER {server_id} ({current_host})")
-        print(f"{'=' * 70}")
-
-        for target in targets:
-            print(f"\n🎯 กำลังดึงข้อมูล: {target['name']} ...")
-            print(target["sql_feed"])
-            # --- ดึง Feed msg_ids + project_name ---
-            _item = CONN.getfromdb(
-                query=target["sql_feed"], 
-                DB='mysqldb', 
-                database=config["mysql_db"], 
-                server=server_id, 
-                host=current_host
-            )
-
-            list_id_with_info = [(x[0], x[1], x[2], x[3], x[4]) for x in _item]
-            print(f"  👉 พบข้อมูลจาก Feed: {len(list_id_with_info)} โพสต์")
-
-            list_content = sa.get_content(list_id_with_info, "Feed")
-
-            # --- ดึง Comment msg_ids + company_name ---
-            _item = CONN.getfromdb(
-                query=target["sql_comment"], 
-                DB='mysqldb', 
-                database=config["mysql_db"], 
-                server=server_id, 
-                host=current_host
-            )
-
-            list_id_with_info = [(x[0], x[1], x[2], x[3], x[4]) for x in _item]
-            print(f"  👉 พบข้อมูลจาก Comment: {len(list_id_with_info)} โพสต์")
-
-            list_content += sa.get_content(list_id_with_info, "Comment")
-
-            print(f"  📌 รวมทั้งหมดที่ต้องประมวลผล: {len(list_content)} โพสต์")
-
-            # --- วิเคราะห์ด้วย Ollama แล้วบันทึกลง DB ---
-            if list_content:
-                sa.analysis(list_content, current_host, server=server_id, table_prefix=target["table_prefix"])
-            else:
-                print(f"  ⏩ ไม่มีข้อมูลใหม่สำหรับ {target['name']} ข้ามไปทำส่วนถัดไป...")
+    app = SentimentAPI()
+    app.run(yesterday, now, save_db=True)
 
     end_time = time.time()
     total_time = end_time - start_time
     print(f"\n🎉 สิ้นสุดการทำงานทั้งหมด! ใช้เวลาไปทั้งสิ้น: {total_time:.2f} วินาที")
-
