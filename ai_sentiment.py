@@ -509,8 +509,7 @@ class SentimentAPI:
                         
                     api_results.append({
                         "match_post_id": match_post_id,
-                        "sentiment": sentiment_str,
-                        "sentiment_reason": ai_reason
+                        "sentiment": sentiment_str
                     })
                     
                     keywords = post_for_ai.get("keywords", [])
