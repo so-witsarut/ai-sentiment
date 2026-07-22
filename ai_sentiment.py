@@ -558,7 +558,7 @@ if __name__ == "__main__":
         print("-" * 70)
 
         try:
-            app.run(yesterday, now, save_db=False)
+            app.run(yesterday, now, save_db=True)
         except Exception as e:
             print(f"❌ เกิดข้อผิดพลาดระหว่างรัน: {e}")
 
