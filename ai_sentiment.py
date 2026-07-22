@@ -362,7 +362,6 @@ class OllamaSentimentAnalyzer:
                     second_pass_result["ai_sentiment"] = 0
                 
                 second_pass_result["post_id"] = post_id
-                second_pass_result["reason"] = f"[Deep Checked: {used_model}] {second_pass_result.get('reason', '')} (รอบแรก: {first_reason})"
                 return second_pass_result
 
         return first_pass_result
