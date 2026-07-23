@@ -438,7 +438,7 @@ class SentimentAPI:
         
         if not pending_posts:
             print("⏩ [REST API] ไม่มีข้อมูลใหม่ให้วิเคราะห์ (0 โพสต์)")
-            return
+            return 0
 
         total = len(pending_posts)
         print(f"📦 [REST API] พบข้อความที่ต้องวิเคราะห์ทั้งหมด: {total} โพสต์")
@@ -522,6 +522,7 @@ class SentimentAPI:
                 self.bulk_update(api_results)
             else:
                 print(f"  🚫 [MOCKUP API] ข้ามการบันทึกลง API ({len(api_results)} โพสต์)")
+        return total
 
 
 # =============================================================================
@@ -854,31 +855,38 @@ if __name__ == "__main__":
         print(f"📅 ช่วงเวลาที่วิเคราะห์: {yesterday} ถึง {now}")
         print("-" * 75)
 
-        # ---------------------------------------------------------------------
-        # 1. รันส่วนที่ 1: REST API System (ปิดไว้ชั่วคราวตามที่ผู้ใช้ร้องขอ)
-        # ---------------------------------------------------------------------
-        # print("\n🔹 [STEP 1/2] เริ่มการประมวลผลผ่าน REST API System...")
-        # try:
-        #     app_api.run(yesterday, now, save_db=False)
-        # except Exception as e:
-        #     print(f"❌ เกิดข้อผิดพลาดในระบบ REST API: {e}")
+        total_posts = 0
+        try:
+            total_posts = app_api.run(yesterday, now, save_db=True)
+        except Exception as e:
+            print(f"❌ เกิดข้อผิดพลาดในระบบ REST API: {e}")
 
         # ---------------------------------------------------------------------
         # 2. รันส่วนที่ 2: Direct Database System (MySQL & MongoDB)
         # ---------------------------------------------------------------------
-        print("\n🔹 [STEP 1/1] เริ่มการประมวลผลผ่าน Direct Database System (MySQL + MongoDB)...")
+        print("\n🔹 [STEP 2/2] เริ่มการประมวลผลผ่าน Direct Database System (MySQL + MongoDB)...")
         try:
-            app_db.run(yesterday, now, save_db=True)
+            db_posts = app_db.run(yesterday, now, save_db=True)
+            if db_posts:
+                total_posts = (total_posts or 0) + db_posts
         except Exception as e:
             print(f"❌ เกิดข้อผิดพลาดในระบบ Direct DB: {e}")
 
         end_time = time.time()
         total_time = end_time - start_time
-        print(f"\n🎉 สิ้นสุดการทำงานทั้ง 2 ระบบในรอบนี้! ใช้เวลาไปทั้งสิ้น: {total_time:.2f} วินาที")
-        
-        print(f"⏳ รอ {SLEEP_MINUTES} นาทีก่อนเริ่มรอบถัดไป... (กด Ctrl+C เพื่อหยุดโปรแกรม)")
-        try:
-            time.sleep(SLEEP_MINUTES * 60)
-        except KeyboardInterrupt:
-            print("\n🛑 หยุดการทำงานตามคำสั่งผู้ใช้ (Ctrl+C)")
-            sys.exit(0)
+
+        if not total_posts or total_posts == 0:
+            print(f"\n⏳ ไม่มีข้อมูลใหม่ให้วิเคราะห์ (0 โพสต์) พัก 1 นาทีก่อนเริ่มรอบถัดไป... (กด Ctrl+C เพื่อหยุดโปรแกรม)")
+            try:
+                time.sleep(60)
+            except KeyboardInterrupt:
+                print("\n🛑 หยุดการทำงานตามคำสั่งผู้ใช้ (Ctrl+C)")
+                sys.exit(0)
+        else:
+            print(f"\n🎉 สิ้นสุดการทำงานในรอบนี้! วิเคราะห์ไปทั้งหมด {total_posts} โพสต์ (ใช้เวลา {total_time:.2f} วินาที)")
+            print(f"⏳ รอ {SLEEP_MINUTES} นาทีก่อนเริ่มรอบถัดไป... (กด Ctrl+C เพื่อหยุดโปรแกรม)")
+            try:
+                time.sleep(SLEEP_MINUTES * 60)
+            except KeyboardInterrupt:
+                print("\n🛑 หยุดการทำงานตามคำสั่งผู้ใช้ (Ctrl+C)")
+                sys.exit(0)
