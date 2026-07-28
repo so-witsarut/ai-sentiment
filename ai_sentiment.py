@@ -556,26 +556,34 @@ class SentimentDB:
         keyword_map   = {msg_id: kw_name      for (msg_id, comp, proj, post_user, kw_name) in list_id_with_info}
         list_id = [msg_id for (msg_id, comp, proj, post_user, kw_name) in list_id_with_info]
 
-        try:
-            DB_CONNECTION = CONN.get_mongo_client()
-            DB = DB_CONNECTION[self.config.get("mongo_db", "blue_eye")]
-            DB_COLLECTION = DB[collection]
+        for attempt in range(1, 4):
+            try:
+                DB_CONNECTION = CONN.get_mongo_client()
+                if DB_CONNECTION is None:
+                    raise Exception("Mongo Client connection returned None")
+                DB = DB_CONNECTION[self.config.get("mongo_db", "blue_eye")]
+                DB_COLLECTION = DB[collection]
 
-            result = DB_COLLECTION.find({"_id": {"$in": list_id}})
-            columnName = "feedcontent" if collection == "Feed" else "commentcontent"
+                result = DB_COLLECTION.find({"_id": {"$in": list_id}})
+                columnName = "feedcontent" if collection == "Feed" else "commentcontent"
 
-            for e in result:
-                feedcontent = e.get(columnName, "")
-                msg_id = e["_id"]
-                comp_name = company_map.get(msg_id, "")
-                proj_name = project_map.get(msg_id, "")
-                post_user = post_user_map.get(msg_id, "")
-                kw_name   = keyword_map.get(msg_id, "")
-                if not post_user:
-                    post_user = str(msg_id).split("_")[0]
-                list_content.append((msg_id, feedcontent, comp_name, proj_name, post_user, kw_name))
-        except Exception as e:
-            print(f"❌ Error fetching Mongo content: {e}")
+                for e in result:
+                    feedcontent = e.get(columnName, "")
+                    msg_id = e["_id"]
+                    comp_name = company_map.get(msg_id, "")
+                    proj_name = project_map.get(msg_id, "")
+                    post_user = post_user_map.get(msg_id, "")
+                    kw_name   = keyword_map.get(msg_id, "")
+                    if not post_user:
+                        post_user = str(msg_id).split("_")[0]
+                    list_content.append((msg_id, feedcontent, comp_name, proj_name, post_user, kw_name))
+                break
+            except Exception as e:
+                print(f"❌ Error fetching Mongo content (Attempt {attempt}/3): {e}")
+                if hasattr(CONN, 'reset_mongo'):
+                    CONN.reset_mongo()
+                if attempt < 3:
+                    time.sleep(3)
 
         return list_content
 
@@ -589,135 +597,148 @@ class SentimentDB:
             print(f"❌ Error connecting to MySQL Server {server} ({host}): {e}")
             return
 
-        BATCH_SIZE = 5
-        total = len(list_content)
-        print(f"\n📦 [Direct DB Server {server}] พบข้อความที่ต้องวิเคราะห์ ({table_prefix}): {total} โพสต์")
+        try:
+            BATCH_SIZE = 5
+            total = len(list_content)
+            print(f"\n📦 [Direct DB Server {server}] พบข้อความที่ต้องวิเคราะห์ ({table_prefix}): {total} โพสต์")
 
-        for batch_start in range(0, total, BATCH_SIZE):
-            batch = list_content[batch_start:batch_start + BATCH_SIZE]
-            batch_end = min(batch_start + BATCH_SIZE, total)
-            print(f"\n🔄 [Direct DB Server {server}] กำลังประมวลผล Batch {batch_start + 1}-{batch_end} จากทั้งหมด {total} โพสต์...")
+            for batch_start in range(0, total, BATCH_SIZE):
+                batch = list_content[batch_start:batch_start + BATCH_SIZE]
+                batch_end = min(batch_start + BATCH_SIZE, total)
+                print(f"\n🔄 [Direct DB Server {server}] กำลังประมวลผล Batch {batch_start + 1}-{batch_end} จากทั้งหมด {total} โพสต์...")
 
-            is_competitor = (table_prefix == "competitor_match")
-            posts_for_ai = []
-            batch_company_name = ""
-            batch_project_name = ""
-            for (_id, content, company_name, project_name, post_user, kw_name) in batch:
-                text = re.sub(r"<[^>]+>", "", str(content))
-                text = re.sub(r"\s+", " ", text).strip()
+                is_competitor = (table_prefix == "competitor_match")
+                posts_for_ai = []
+                batch_company_name = ""
+                batch_project_name = ""
+                for (_id, content, company_name, project_name, post_user, kw_name) in batch:
+                    text = re.sub(r"<[^>]+>", "", str(content))
+                    text = re.sub(r"\s+", " ", text).strip()
 
-                if not batch_company_name and company_name:
-                    batch_company_name = company_name
-                if not batch_project_name and project_name:
-                    batch_project_name = project_name
+                    if not batch_company_name and company_name:
+                        batch_company_name = company_name
+                    if not batch_project_name and project_name:
+                        batch_project_name = project_name
 
-                if text:
-                    first_keyword = kw_name.split(",")[0].strip() if kw_name else ""
-                    clean_short_content = get_keyword_context(text, first_keyword, window=150)
+                    if text:
+                        first_keyword = kw_name.split(",")[0].strip() if kw_name else ""
+                        clean_short_content = get_keyword_context(text, first_keyword, window=150)
 
-                    if is_competitor:
-                        actual_target = first_keyword if first_keyword else project_name
-                    else:
-                        actual_target = company_name
+                        if is_competitor:
+                            actual_target = first_keyword if first_keyword else project_name
+                        else:
+                            actual_target = company_name
 
-                    posts_for_ai.append({
-                        "post_id": str(_id),
-                        "post_user": post_user,
-                        "company_name": company_name,
-                        "keyword_name": kw_name,
-                        "actual_target": actual_target,
-                        "content": clean_short_content,
-                        "full_text": text
-                    })
+                        posts_for_ai.append({
+                            "post_id": str(_id),
+                            "post_user": post_user,
+                            "company_name": company_name,
+                            "keyword_name": kw_name,
+                            "actual_target": actual_target,
+                            "content": clean_short_content,
+                            "full_text": text
+                        })
 
-            if not posts_for_ai:
-                continue
+                if not posts_for_ai:
+                    continue
 
-            json_str = json.dumps(posts_for_ai, ensure_ascii=False)
-            target_label = f"{'COMPETITOR' if is_competitor else 'OWN'} | Company: {batch_company_name} | Proj: {batch_project_name}"
-            print(f"  🚀 ส่ง {len(posts_for_ai)} โพสต์ไปยัง Ollama ({target_label})")
+                json_str = json.dumps(posts_for_ai, ensure_ascii=False)
+                target_label = f"{'COMPETITOR' if is_competitor else 'OWN'} | Company: {batch_company_name} | Proj: {batch_project_name}"
+                print(f"  🚀 ส่ง {len(posts_for_ai)} โพสต์ไปยัง Ollama ({target_label})")
 
-            ollama_response = self.ollama.analyze_post_sentiments(json_str, batch_company_name)
-            ollama_results = ollama_response.get("data", [])
+                ollama_response = self.ollama.analyze_post_sentiments(json_str, batch_company_name)
+                ollama_results = ollama_response.get("data", [])
 
-            ollama_map = {}
-            if isinstance(ollama_results, list):
-                for res in ollama_results:
-                    if "post_id" in res and "ai_sentiment" in res:
-                        ollama_map[str(res["post_id"])] = {
-                            "ai_sentiment": res["ai_sentiment"],
-                            "confidence": res.get("confidence", 0),
-                            "reason": res.get("reason", "")
-                        }
+                ollama_map = {}
+                if isinstance(ollama_results, list):
+                    for res in ollama_results:
+                        if "post_id" in res and "ai_sentiment" in res:
+                            ollama_map[str(res["post_id"])] = {
+                                "ai_sentiment": res["ai_sentiment"],
+                                "confidence": res.get("confidence", 0),
+                                "reason": res.get("reason", "")
+                            }
 
-            print(f"\n  📊 สรุปผลลัพธ์จาก Ollama (สำเร็จ {len(ollama_map)}/{len(batch)} โพสต์)")
-            print(f"  {'-'*90}")
-
-            for idx, (_id, content, company_name, project_name, post_user, kw_name) in enumerate(batch, 1):
-                str_id = str(_id)
-
-                if str_id in ollama_map:
-                    ollama_val = float(ollama_map[str_id]["ai_sentiment"])
-                    ai_reason = ollama_map[str_id].get("reason", "")
-                    if ollama_val > 0:
-                        icon = "🟢 Positive"
-                    elif ollama_val < 0:
-                        icon = "🔴 Negative"
-                    else:
-                        icon = "⚪ Neutral "
-                else:
-                    ollama_val = None
-                    ai_reason = ""
-                    icon = "⚠️ N/A     "
-
-                actual_target = next((p["actual_target"] for p in posts_for_ai if p["post_id"] == str_id), company_name)
-                ai_content = next((p["content"] for p in posts_for_ai if p["post_id"] == str_id), str(content))
-
-                original_preview = str(content).replace("\n", " ")
-                if len(original_preview) > 120:
-                    original_preview = original_preview[:120] + "..."
-
-                print(f"  [{idx:02d}] 🆔 {str_id[:15]:<15} | {icon:<11} | User: {str(post_user)[:12]:<12} | Target: {actual_target[:15]:<15}")
-                if ai_reason:
-                    print(f"       💡 Reason: {ai_reason}")
-                print(f"       📄 Content: {original_preview}")
+                print(f"\n  📊 สรุปผลลัพธ์จาก Ollama (สำเร็จ {len(ollama_map)}/{len(batch)} โพสต์)")
                 print(f"  {'-'*90}")
 
-            if save_db:
-                try:
-                    DB_CONNECTION.ping(reconnect=True)
-                except Exception as e:
-                    print(f"  ⚠️ Warning: MySQL Ping/Reconnect failed: {e}")
-                
-                cursor = DB_CONNECTION.cursor()
-                
-                for (_id, content, company_name, project_name, post_user, kw_name) in batch:
+                for idx, (_id, content, company_name, project_name, post_user, kw_name) in enumerate(batch, 1):
                     str_id = str(_id)
-                    if str_id not in ollama_map:
-                        continue
-                    sentiment_val = float(ollama_map[str_id]["ai_sentiment"])
-                    ai_reason_val = ollama_map[str_id].get("reason", "") or ""
-                
-                    for tbl in [table_prefix, f"{table_prefix}_daily", f"{table_prefix}_3months"]:
-                        cursor.execute(
-                            f'UPDATE `{tbl}` SET `{table_prefix}_sentiment` = %s, `sentiment_status` = %s, `ai_reason` = %s WHERE msg_id = %s',
-                            (sentiment_val, "1", ai_reason_val, str(_id))
-                        )
-                
-                DB_CONNECTION.commit()
-                cursor.close()
-                print(f"  💾 บันทึกลง MySQL เรียบร้อย ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
-            else:
-                print(f"  🚫 [MOCKUP DB] ข้ามการบันทึกลง MySQL ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
 
-        DB_CONNECTION.close()
-        if 'tunnel' in locals() and tunnel:
-            tunnel.stop()
+                    if str_id in ollama_map:
+                        ollama_val = float(ollama_map[str_id]["ai_sentiment"])
+                        ai_reason = ollama_map[str_id].get("reason", "")
+                        if ollama_val > 0:
+                            icon = "🟢 Positive"
+                        elif ollama_val < 0:
+                            icon = "🔴 Negative"
+                        else:
+                            icon = "⚪ Neutral "
+                    else:
+                        ollama_val = None
+                        ai_reason = ""
+                        icon = "⚠️ N/A     "
+
+                    actual_target = next((p["actual_target"] for p in posts_for_ai if p["post_id"] == str_id), company_name)
+                    ai_content = next((p["content"] for p in posts_for_ai if p["post_id"] == str_id), str(content))
+
+                    original_preview = str(content).replace("\n", " ")
+                    if len(original_preview) > 120:
+                        original_preview = original_preview[:120] + "..."
+
+                    print(f"  [{idx:02d}] 🆔 {str_id[:15]:<15} | {icon:<11} | User: {str(post_user)[:12]:<12} | Target: {actual_target[:15]:<15}")
+                    if ai_reason:
+                        print(f"       💡 Reason: {ai_reason}")
+                    print(f"       📄 Content: {original_preview}")
+                    print(f"  {'-'*90}")
+
+                if save_db:
+                    try:
+                        DB_CONNECTION.ping(reconnect=True)
+                    except Exception as e:
+                        print(f"  ⚠️ Warning: MySQL Ping/Reconnect failed: {e}")
+                    
+                    cursor = DB_CONNECTION.cursor()
+                    
+                    for (_id, content, company_name, project_name, post_user, kw_name) in batch:
+                        str_id = str(_id)
+                        if str_id not in ollama_map:
+                            continue
+                        sentiment_val = float(ollama_map[str_id]["ai_sentiment"])
+                        ai_reason_val = ollama_map[str_id].get("reason", "") or ""
+                    
+                        for tbl in [table_prefix, f"{table_prefix}_daily", f"{table_prefix}_3months"]:
+                            cursor.execute(
+                                f'UPDATE `{tbl}` SET `{table_prefix}_sentiment` = %s, `sentiment_status` = %s, `ai_reason` = %s WHERE msg_id = %s',
+                                (sentiment_val, "1", ai_reason_val, str(_id))
+                            )
+                    
+                    DB_CONNECTION.commit()
+                    cursor.close()
+                    print(f"  💾 บันทึกลง MySQL เรียบร้อย ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
+                else:
+                    print(f"  🚫 [MOCKUP DB] ข้ามการบันทึกลง MySQL ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
+
+        except Exception as e:
+            print(f"❌ Error during DB analysis execution: {e}")
+        finally:
+            if 'DB_CONNECTION' in locals() and DB_CONNECTION:
+                try:
+                    DB_CONNECTION.close()
+                except Exception:
+                    pass
+            if 'tunnel' in locals() and tunnel:
+                try:
+                    tunnel.stop()
+                except Exception:
+                    pass
 
     def run(self, date_from, date_to, save_db=True):
         if CONN is None:
             print("⚠️ [Direct DB] ไม่สามารถเชื่อมต่อ DB ได้เนื่องจากเชื่อมต่อ connection module ล้มเหลว")
-            return
+            return 0
+
+        total_processed_posts = 0
 
         targets = [
             {
@@ -795,6 +816,7 @@ class SentimentDB:
 
             for target in targets:
                 print(f"🎯 กำลังดึงข้อมูล: {target['name']} (Server {server_id})...")
+                list_content = []
                 
                 try:
                     _item_feed = CONN.getfromdb(
@@ -804,12 +826,11 @@ class SentimentDB:
                         server=server_id, 
                         host=current_host
                     )
-                    list_id_feed = [(x[0], x[1], x[2], x[3], x[4]) for x in _item_feed]
+                    list_id_feed = [(x[0], x[1], x[2], x[3], x[4]) for x in (_item_feed or [])]
                     print(f"  👉 พบข้อมูลจาก Feed: {len(list_id_feed)} โพสต์")
                     list_content = self.get_content(list_id_feed, "Feed")
                 except Exception as e:
                     print(f"  ❌ Error querying Feed SQL: {e}")
-                    list_content = []
 
                 try:
                     _item_comment = CONN.getfromdb(
@@ -819,16 +840,22 @@ class SentimentDB:
                         server=server_id, 
                         host=current_host
                     )
-                    list_id_comment = [(x[0], x[1], x[2], x[3], x[4]) for x in _item_comment]
+                    list_id_comment = [(x[0], x[1], x[2], x[3], x[4]) for x in (_item_comment or [])]
                     print(f"  👉 พบข้อมูลจาก Comment: {len(list_id_comment)} โพสต์")
                     list_content += self.get_content(list_id_comment, "Comment")
                 except Exception as e:
                     print(f"  ❌ Error querying Comment SQL: {e}")
 
                 if list_content:
-                    self.analysis(list_content, current_host, server=server_id, table_prefix=target["table_prefix"], save_db=save_db)
+                    total_processed_posts += len(list_content)
+                    try:
+                        self.analysis(list_content, current_host, server=server_id, table_prefix=target["table_prefix"], save_db=save_db)
+                    except Exception as e:
+                        print(f"  ❌ Error analyzing content for {target['name']} (Server {server_id}): {e}")
                 else:
                     print(f"  ⏩ ไม่มีข้อมูลใหม่สำหรับ {target['name']} (Server {server_id})")
+
+        return total_processed_posts
 
 
 # =============================================================================
@@ -841,7 +868,7 @@ if __name__ == "__main__":
 
     shared_analyzer = OllamaSentimentAnalyzer(model="qcwind/qwen3-8b-instruct-Q4-K-M:latest")
     app_api = SentimentAPI(analyzer=shared_analyzer)
-    app_db  = SentimentDB(analyzer=shared_analyzer)
+    # app_db  = SentimentDB(analyzer=shared_analyzer)
     
     SLEEP_MINUTES = int(os.environ.get("RUN_INTERVAL_MINUTES", 10))
 
@@ -862,7 +889,7 @@ if __name__ == "__main__":
             print(f"❌ เกิดข้อผิดพลาดในระบบ REST API: {e}")
 
         # ---------------------------------------------------------------------
-        # 2. รันส่วนที่ 2: Direct Database System (MySQL & MongoDB)
+        # 2. รันส่วนที่ 2: Direct Database System (MySQL & MongoDB) [ENABLED / ACTIVE]
         # ---------------------------------------------------------------------
         print("\n🔹 [STEP 2/2] เริ่มการประมวลผลผ่าน Direct Database System (MySQL + MongoDB)...")
         try:
