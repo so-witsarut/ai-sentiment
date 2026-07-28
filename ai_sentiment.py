@@ -868,7 +868,7 @@ if __name__ == "__main__":
 
     shared_analyzer = OllamaSentimentAnalyzer(model="qcwind/qwen3-8b-instruct-Q4-K-M:latest")
     app_api = SentimentAPI(analyzer=shared_analyzer)
-    # app_db  = SentimentDB(analyzer=shared_analyzer)
+    app_db  = SentimentDB(analyzer=shared_analyzer)
     
     SLEEP_MINUTES = int(os.environ.get("RUN_INTERVAL_MINUTES", 10))
 
