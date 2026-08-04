@@ -1,7 +1,7 @@
 # coding=utf-8
 """
 Sentiment Analysis System (Hybrid: REST API + Direct MySQL/MongoDB)
-Using Ollama (qwen3-8b-instruct) and Gemini Validation Cascades
+Using Ollama (qwen3-8b-instruct) Fast Triage + Gemini Deep Analysis Cascade
 """
 
 import os
@@ -66,7 +66,7 @@ def get_keyword_context(text, keyword, window=150, max_fallback_length=400):
 
 
 # =============================================================================
-# Ollama & Gemini Sentiment Analyzer Engine
+# Ollama & Gemini Sentiment Analyzer Engine (2-Pass Pipeline)
 # =============================================================================
 class OllamaSentimentAnalyzer:
     CONCURRENT_WORKERS = 3
@@ -74,13 +74,8 @@ class OllamaSentimentAnalyzer:
     def __init__(self, model="qcwind/qwen3-8b-instruct-Q4-K-M:latest"):
         self.model = model
         self.base_url = "http://localhost:11434/api/generate"
-
-        self.system_instruction = (
-            "You are an expert Thai Social Media Brand Reputation Analyst. "
-            "Given a social media post, determine the PUBLIC SENTIMENT toward a specific Target brand. "
-            "Score: 100=positive brand impact, -100=negative brand impact, 0=neutral/irrelevant. "
-            'Output ONLY minified JSON: {"reason":"<ภาษาไทย>","ai_sentiment":<-100|0|100>}'
-        )
+        self.triage_timeout = int(os.environ.get("TRIAGE_TIMEOUT_SEC", 60))
+        self.session = requests.Session()
 
     def _call_gemini_api(self, model_name, system_instruction, user_prompt, max_retries=3):
         if not GEMINI_API_KEY:
@@ -95,7 +90,7 @@ class OllamaSentimentAnalyzer:
         
         for attempt in range(max_retries):
             try:
-                response = requests.post(url, json=payload, timeout=45)
+                response = self.session.post(url, json=payload, timeout=45)
                 if response.status_code == 200:
                     res_data = response.json()
                     result_text = res_data["candidates"][0]["content"]["parts"][0]["text"]
@@ -123,7 +118,7 @@ class OllamaSentimentAnalyzer:
             "options": {"temperature": 0.0, "seed": 42}
         }
         try:
-            response = requests.post("http://localhost:11434/api/generate", json=payload_generate, timeout=120)
+            response = self.session.post("http://localhost:11434/api/generate", json=payload_generate, timeout=120)
             if response.status_code == 200:
                 result_text = response.json().get("response", "{}")
                 return self._parse_json_result(result_text)
@@ -141,7 +136,7 @@ class OllamaSentimentAnalyzer:
             "options": {"temperature": 0.0, "seed": 42}
         }
         try:
-            response = requests.post("http://localhost:11434/api/chat", json=payload_chat, timeout=120)
+            response = self.session.post("http://localhost:11434/api/chat", json=payload_chat, timeout=120)
             if response.status_code == 200:
                 result_text = response.json().get("message", {}).get("content", "{}")
                 return self._parse_json_result(result_text)
@@ -150,39 +145,189 @@ class OllamaSentimentAnalyzer:
         return None
 
     def _parse_json_result(self, result_text):
+        if not result_text:
+            return None
+
         clean_text = re.sub(r'<think>.*?</think>', '', result_text, flags=re.DOTALL).strip()
         clean_text = clean_text.replace('```json', '').replace('```', '').strip()
         
-        if not clean_text.startswith('{'):
-            json_match = re.search(r'\{[^{}]*"ai_sentiment"[^{}]*\}', clean_text)
-            if json_match:
-                clean_text = json_match.group(0)
+        json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
+        if json_match:
+            clean_text = json_match.group(0)
+
+        cleaned_json = re.sub(r',\s*([\}\]])', r'\1', clean_text)
         
         try:
-            parsed = json.loads(clean_text)
+            parsed = json.loads(cleaned_json)
             ai_sentiment = parsed.get("ai_sentiment", 0)
             try:
                 ai_sentiment = int(ai_sentiment)
             except Exception:
                 ai_sentiment = 0
-            if ai_sentiment > 0: ai_sentiment = 100
-            elif ai_sentiment < 0: ai_sentiment = -100
+            if ai_sentiment > 0:
+                ai_sentiment = 100
+            elif ai_sentiment < 0:
+                ai_sentiment = -100
+            else:
+                ai_sentiment = 0
             parsed["ai_sentiment"] = ai_sentiment
+
+            reason_val = parsed.get("reason", "")
+            if isinstance(reason_val, str):
+                reason_val = re.sub(r'\(?\s*(?:ตาม)?กฎข้อ\s*[\d\s,และ|-]+\)?', '', reason_val, flags=re.IGNORECASE)
+                reason_val = re.sub(r'\(?\s*Rule\s*[\d\s,and|-]+\)?', '', reason_val, flags=re.IGNORECASE)
+                parsed["reason"] = reason_val.strip()
+
+            entity_found = parsed.get("entity_found", True)
+            if isinstance(entity_found, str):
+                entity_found = entity_found.lower() in ("true", "1")
+            parsed["entity_found"] = bool(entity_found)
             return parsed
         except json.JSONDecodeError:
-            sentiment_match = re.search(r'[`"\']?ai_sentiment[`"\']?\s*[:=]\s*(-?100|0|100)', clean_text, re.IGNORECASE)
+            sentiment_match = re.search(r'[`"\']?ai_sentiment[`"\']?\s*[:=]\s*(-?\d+)', clean_text, re.IGNORECASE)
             reason_match = re.search(r'[`"\']?reason[`"\']?\s*[:=]\s*[`"\']?(.*?)[`"\']?(?:,|\n|\}|$)', clean_text, re.IGNORECASE)
             entity_match = re.search(r'[`"\']?entity_found[`"\']?\s*[:=]\s*(true|false)', clean_text, re.IGNORECASE)
             
             if sentiment_match:
-                ai_sentiment = int(sentiment_match.group(1))
+                try:
+                    val = int(sentiment_match.group(1))
+                    ai_sentiment = 100 if val > 0 else (-100 if val < 0 else 0)
+                except Exception:
+                    ai_sentiment = 0
                 reason = reason_match.group(1).strip() if reason_match else clean_text[:100].replace('\n', ' ')
-                entity_found = True
-                if entity_match:
-                    entity_found = entity_match.group(1).lower() == 'true'
+                reason = re.sub(r'\(?\s*(?:ตาม)?กฎข้อ\s*[\d\s,และ|-]+\)?', '', reason, flags=re.IGNORECASE)
+                reason = re.sub(r'\(?\s*Rule\s*[\d\s,and|-]+\)?', '', reason, flags=re.IGNORECASE).strip()
+                entity_found = entity_match.group(1).lower() == 'true' if entity_match else True
                 return {"ai_sentiment": ai_sentiment, "reason": reason, "entity_found": entity_found}
         return None
 
+    # -----------------------------------------------------------------
+    # PASS 1: Fast Triage (Qwen 8B Local)
+    # -----------------------------------------------------------------
+    def _parse_triage_result(self, result_text):
+        """Parse triage result from Qwen. Returns True (has sentiment) or False (no sentiment)."""
+        if not result_text:
+            return True
+
+        clean_text = re.sub(r'<think>.*?</think>', '', result_text, flags=re.DOTALL).strip()
+        clean_text = clean_text.replace('```json', '').replace('```', '').strip()
+
+        json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
+        if json_match:
+            clean_text = json_match.group(0)
+
+        try:
+            parsed = json.loads(clean_text)
+            triage_val = str(parsed.get("triage", "yes")).strip().lower()
+            return triage_val in ("yes", "true", "1")
+        except json.JSONDecodeError:
+            triage_match = re.search(r'[`"\']?triage[`"\']?\s*[:=]\s*[`"\']?(yes|no|true|false)[`"\']?', clean_text, re.IGNORECASE)
+            if triage_match:
+                val = triage_match.group(1).lower()
+                return val in ("yes", "true")
+            # Fail-safe: if unparseable, return True (send to Pass 2)
+            return True
+
+    def _triage_post(self, post_id, content):
+        """PASS 1: Fast triage via Qwen 8B. Returns True if potential sentiment detected."""
+        triage_system = (
+            "You are a fast sentiment triage classifier.\n"
+            "Determine whether the text potentially contains: "
+            "emotion, opinion, evaluation, praise, criticism, complaint, "
+            "satisfaction, dissatisfaction, or sarcasm.\n"
+            "You do NOT need to determine the final sentiment.\n"
+            "When uncertain, choose \"yes\".\n"
+            'Return ONLY JSON: {"triage":"yes"} or {"triage":"no"}'
+        )
+        triage_prompt = f"Text={content}"
+
+        payload = {
+            "model": self.model,
+            "system": triage_system,
+            "prompt": triage_prompt,
+            "stream": False,
+            "format": "json",
+            "think": False,
+            "keep_alive": -1,
+            "options": {
+                "temperature": 0.0,
+                "top_p": 0.1,
+                "seed": 42,
+                "num_predict": 16,
+                "num_ctx": 512,
+                "num_batch": 256,
+                "flash_attn": True,
+            }
+        }
+
+        try:
+            response = self.session.post(self.base_url, json=payload, timeout=self.triage_timeout)
+            if response.status_code == 200:
+                result_text = response.json().get("response", "{}")
+                return self._parse_triage_result(result_text)
+            else:
+                print(f"  -> Triage HTTP Error [{post_id}]: {response.status_code}")
+        except Exception as e:
+            print(f"  -> Triage Error [{post_id}]: {e}")
+
+        # Error → ถือว่า yes (ส่งต่อ Pass 2)
+        return True
+
+    # -----------------------------------------------------------------
+    # PASS 2: Deep Analysis (Gemma API)
+    # -----------------------------------------------------------------
+    def _deep_analyze_post(self, post_id, actual_target, source_info, expanded_content):
+        """PASS 2: Deep analysis via Gemma API. Returns sentiment result dict or None."""
+        deep_system = (
+            f"You are an expert Thai Social Media Brand Reputation Analyst for '{actual_target}'. "
+            "Analyze the PUBLIC SENTIMENT toward the Target Entity. "
+            "You MUST check if the Target Entity is EXPLICITLY mentioned. "
+            "If NOT mentioned, return ai_sentiment=0."
+        )
+
+        deep_prompt = (
+            f"Target Entity={actual_target}\n"
+            f"Source Info={source_info}\n"
+            f"Text={expanded_content}\n\n"
+            "RULES:\n"
+            "1. UNRELATED REFERENCE: Name used as location, idiom, animal breed, or unrelated -> 0\n"
+            "2. OWNED MEDIA: Posted by Target Entity's official page or PR -> 0\n"
+            "3. NEGATIVE: Criticizes, complains, anger, bad experience -> -100\n"
+            "4. POSITIVE: Praises, recommends, happiness, support -> 100\n"
+            "5. NEUTRAL: News, ads, promotions, sports, facts, ambiguous -> 0\n\n"
+            "For 'reason': explain the reason concisely in natural Thai. Do NOT mention rule numbers or phrases like 'ตามกฎข้อ X' or 'Rule X'.\n"
+            '{"entity_found":<bool>,"reason":"<ภาษาไทยสั้นๆ อธิบายเหตุผลโดยไม่ต้องระบุเลขข้อกฎ>","ai_sentiment":<-100|0|100>}'
+        )
+
+        # จำกัด fallback ไว้ 3 ตัว (primary + 2 fallback)
+        validation_models = [
+            "api:gemma-4-31b-it",
+            "api:gemma-4-26b-a4b-it",
+            "api:gemini-3.5-flash-lite"
+        ]
+
+        for val_model in validation_models:
+            if val_model.startswith("api:"):
+                actual_api_model = val_model.replace("api:", "", 1)
+                res = self._call_gemini_api(actual_api_model, deep_system, deep_prompt, max_retries=1)
+            else:
+                res = self._call_ollama_generic(val_model, deep_system, deep_prompt)
+
+            if res and "ai_sentiment" in res:
+                entity_found = res.get("entity_found", True)
+                if isinstance(entity_found, str):
+                    entity_found = entity_found.lower() in ("true", "1")
+                if not entity_found:
+                    res["ai_sentiment"] = 0
+                res["post_id"] = post_id
+                return res
+
+        # ทุก model fail → return None (DEFER — ไม่บันทึก → retry รอบถัดไป)
+        return None
+
+    # -----------------------------------------------------------------
+    # Main Pipeline: 2-Pass (Triage → Deep Analysis)
+    # -----------------------------------------------------------------
     def _analyze_single_post(self, post, company_name=""):
         post_id = str(post.get("match_post_id") or post.get("post_id", ""))
         keywords = post.get("keywords", [])
@@ -217,153 +362,29 @@ class OllamaSentimentAnalyzer:
             content = post.get("content", "")
             expanded_content = content
 
-        user_prompt = (
-            f"Target Entity={actual_target}\n"
-            f"Source Info={source_info}\n"
-            f"Text={content}\n\n"
-            "INSTRUCTIONS:\n"
-            f"Analyze the sentiment of the text specifically towards the Target Entity ({actual_target}).\n"
-            "1. UNRELATED REFERENCE: If the Target Entity name is used as a generic location, idiom, animal breed, or is completely unrelated to the intended subject -> 0.\n"
-            "2. OWNED MEDIA: If Source Info or Text indicates it's posted by the Target Entity's official page or PR, return 0.\n"
-            "3. NEGATIVE: Explicitly criticizes, complains, expresses anger, or reports a bad experience against the Target Entity -> -100.\n"
-            "4. POSITIVE: Explicitly praises, recommends, expresses happiness, or shows support for the Target Entity -> 100.\n"
-            "5. NEUTRAL: General news, ads, promotions, sports results, statements of facts, or ambiguous tone -> 0.\n\n"
-            "CRITICAL: For the 'reason' field, you MUST explain WHICH rule you applied and WHY (e.g., 'เนื้อหาเป็นการรายงานผลกีฬา', 'เป็นโพสต์จาก Official Page'). Do NOT include phrases like 'จึงจัดเป็น 0' or 'จึงได้คะแนน 100'.\n"
-            'JSON ONLY: {"reason":"เหตุผลที่อ้างอิงกฎข้างต้น (ภาษาไทยสั้นๆ)","ai_sentiment":<int>,"is_ambiguous":<bool>}'
-        )
+        # --- PASS 1: Fast Triage (Qwen 8B) ---
+        has_sentiment = self._triage_post(post_id, content)
 
-        def _call_ollama(is_deep_think=False):
-            current_payload = {
-                "model": self.model,
-                "system": self.system_instruction,
-                "prompt": user_prompt,
-                "stream": False,
-                "format": "json",
-                "think": is_deep_think,
-                "keep_alive": -1,
-                "options": {
-                    "temperature": 0.0,
-                    "top_p":       0.1,
-                    "seed":        42,
-                    "num_predict": 384 if is_deep_think else 128,
-                    "num_ctx":     768 if is_deep_think else 512,
-                    "num_batch":   256,
-                    "flash_attn":  True,
-                }
+        if not has_sentiment:
+            # triage = "no" → จบทันที (map เป็น 0/neutral ตาม existing contract)
+            print(f"  ⏩ [Pass 1 Triage] Post {post_id[:15]:<15} | triage=no -> Neutral (0)")
+            return {
+                "post_id": post_id,
+                "ai_sentiment": 0,
+                "confidence": 0,    # vestigial: ไม่ได้ใช้จริง คงไว้เพื่อ backward compat
+                "reason": "ไม่พบเนื้อหาแสดงความรู้สึก"
             }
 
-            try:
-                response = requests.post(self.base_url, json=current_payload, timeout=300 if is_deep_think else 120)
+        # --- PASS 2: Deep Analysis (Gemma API) ---
+        print(f"  🔍 [Pass 2 Deep AI] Post {post_id[:15]:<15} | triage=yes -> กำลังวิเคราะห์เชิงลึก...")
+        deep_result = self._deep_analyze_post(post_id, actual_target, source_info, expanded_content)
 
-                if response.status_code == 200:
-                    result_text = response.json().get("response", "{}")
+        if deep_result:
+            return deep_result
 
-                    clean_text = re.sub(r'<think>.*?</think>', '', result_text, flags=re.DOTALL).strip()
-                    clean_text = clean_text.replace('```json', '').replace('```', '').strip()
-
-                    if not clean_text.startswith('{'):
-                        json_match = re.search(r'\{[^{}]*"ai_sentiment"[^{}]*\}', clean_text)
-                        if json_match:
-                            clean_text = json_match.group(0)
-
-                    try:
-                        parsed = json.loads(clean_text)
-                        ai_sentiment = parsed.get("ai_sentiment", 0)
-
-                        if isinstance(ai_sentiment, str):
-                            s = ai_sentiment.upper()
-                            if s == "POSITIVE":  ai_sentiment = 100
-                            elif s == "NEGATIVE": ai_sentiment = -100
-                            else:                ai_sentiment = 0
-                        else:
-                            if ai_sentiment > 0:
-                                ai_sentiment = 100
-                            elif ai_sentiment < 0:
-                                ai_sentiment = -100
-                            else:
-                                ai_sentiment = 0
-
-                        return {
-                            "post_id":      post_id,
-                            "ai_sentiment": int(ai_sentiment),
-                            "confidence":   0,
-                            "reason":       parsed.get("reason", "")
-                        }
-                    except json.JSONDecodeError as e:
-                        print(f"  -> JSONDecodeError [{post_id}]: {e} | Raw Clean Text: {clean_text[:150]}")
-                else:
-                    print(f"  -> HTTP Error {response.status_code}: {response.text}")
-            except Exception as e:
-                print(f"  -> Request Error [{post_id}]: {e}")
-
-            return None
-
-        first_pass_result = _call_ollama(is_deep_think=False)
-
-        if first_pass_result and first_pass_result["ai_sentiment"] != 0:
-            first_sentiment = first_pass_result["ai_sentiment"]
-            first_reason = first_pass_result.get("reason", "")
-            print(f"\n  🔍 [Pass 2 Triggered] Post {post_id} ได้ค่า {first_sentiment} -> กำลังยืนยันความถูกต้อง...")
-            
-            validation_system_instruction = (
-                f"You are a strict Brand Mention Validator for '{actual_target}'. "
-                f"Your #1 priority is to check if '{actual_target}' is EXPLICITLY mentioned in the text. "
-                "If it is NOT mentioned, you MUST return ai_sentiment=0 regardless of the text's tone. "
-                "Do NOT assume or infer that the text is about the Target Entity."
-            )
-
-            validation_user_prompt = (
-                f"Target Entity={actual_target}\n"
-                f"Source Info={source_info}\n"
-                f"Text={expanded_content}\n\n"
-                f"First-Pass Sentiment={first_sentiment}\n"
-                f"First-Pass Reason={first_reason}\n\n"
-                "TASK:\n"
-                f"Validate the sentiment specifically towards '{actual_target}'.\n"
-                "   - UNRELATED REFERENCE: If the name is used as a generic location, idiom, or animal breed -> 0\n"
-                "   - OWNED MEDIA: If Source Info indicates the post is from the Target Entity's official page, return 0.\n"
-                "   - NEGATIVE: Explicitly criticizes, complains, expresses anger, or reports a bad experience -> -100\n"
-                "   - POSITIVE: Explicitly praises, recommends, expresses happiness, or shows support -> 100\n"
-                "   - NEUTRAL: General news, ads, promotions, sports results, statements of facts, or ambiguous tone -> 0\n\n"
-                "CRITICAL: You MUST output ONLY a valid JSON object. Do NOT include markdown formatting, bullet points, or thinking processes.\n"
-                "CRITICAL: For the 'reason' field, explain WHICH rule you applied and WHY (e.g., 'เนื้อหาเป็นการรายงานผลกีฬา'). Do NOT include phrases like 'จึงจัดเป็น 0' or 'จึงได้ 100'.\n"
-                '{"entity_found": <boolean>, "reason": "<อธิบายเหตุผลอ้างอิงตามกฎ เป็นภาษาไทยสั้นๆ>", "ai_sentiment": <-100|0|100>}'
-            )
-
-            validation_models = [
-                "api:gemma-4-31b-it", 
-                "gemma4:31b-cloud", 
-                "api:gemma-4-26b-a4b-it", 
-                "api:gemini-3.1-flash-lite", 
-                "api:gemini-3.5-flash-lite"
-            ]
-            second_pass_result = None
-            used_model = ""
-            
-            for val_model in validation_models:
-                if val_model.startswith("api:"):
-                    actual_api_model = val_model.replace("api:", "", 1)
-                    res = self._call_gemini_api(actual_api_model, validation_system_instruction, validation_user_prompt, max_retries=1)
-                else:
-                    res = self._call_ollama_generic(val_model, validation_system_instruction, validation_user_prompt)
-
-                if res and "ai_sentiment" in res:
-                    second_pass_result = res
-                    used_model = val_model
-                    break
-            
-            if second_pass_result:
-                entity_found = second_pass_result.get("entity_found", True)
-                if isinstance(entity_found, str):
-                    entity_found = entity_found.lower() == "true"
-                    
-                if not entity_found:
-                    second_pass_result["ai_sentiment"] = 0
-                
-                second_pass_result["post_id"] = post_id
-                return second_pass_result
-
-        return first_pass_result
+        # ทุก API fail → return None (DEFER — ไม่บันทึก → retry รอบถัดไป)
+        print(f"  ⚠️ [Pass 2 Failed] Post {post_id[:15]:<15} | ทุก API ล้มเหลว -> Defer ให้รอบถัดไป")
+        return None
 
     def analyze_post_sentiments(self, json_posts, company_name=""):
         posts = json.loads(json_posts)
@@ -521,7 +542,9 @@ class SentimentAPI:
             if save_db:
                 self.bulk_update(api_results)
             else:
-                print(f"  🚫 [MOCKUP API] ข้ามการบันทึกลง API ({len(api_results)} โพสต์)")
+                print(f"  🚫 [MOCKUP API] ข้ามการบันทึกลง API ({len(api_results)} โพสต์) — จำลอง Payload ที่จะ POST:")
+                for item in api_results:
+                    print(f"      📝 [REST API POST] `/internal/sentiment/results` -> match_post_id='{item['match_post_id']}', sentiment='{item['sentiment']}', sentiment_reason='{item['sentiment_reason']}'")
         return total
 
 
@@ -717,7 +740,15 @@ class SentimentDB:
                     cursor.close()
                     print(f"  💾 บันทึกลง MySQL เรียบร้อย ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
                 else:
-                    print(f"  🚫 [MOCKUP DB] ข้ามการบันทึกลง MySQL ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
+                    print(f"  🚫 [MOCKUP DB] ข้ามการบันทึกลง MySQL ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์) — จำลองค่าที่จะ UPDATE:")
+                    for (_id, content, company_name, project_name, post_user, kw_name) in batch:
+                        str_id = str(_id)
+                        if str_id not in ollama_map:
+                            continue
+                        sentiment_val = float(ollama_map[str_id]["ai_sentiment"])
+                        ai_reason_val = ollama_map[str_id].get("reason", "") or ""
+                        print(f"      📝 [MySQL UPDATE] Tables: [`{table_prefix}`, `{table_prefix}_daily`, `{table_prefix}_3months`]")
+                        print(f"         └─ SET `{table_prefix}_sentiment` = {sentiment_val}, `sentiment_status` = '1', `ai_reason` = '{ai_reason_val}' WHERE msg_id = '{str_id}'")
 
         except Exception as e:
             print(f"❌ Error during DB analysis execution: {e}")
@@ -870,7 +901,7 @@ if __name__ == "__main__":
     app_api = SentimentAPI(analyzer=shared_analyzer)
     app_db  = SentimentDB(analyzer=shared_analyzer)
     
-    SLEEP_MINUTES = int(os.environ.get("RUN_INTERVAL_MINUTES", 10))
+    SLEEP_MINUTES = int(os.environ.get("RUN_INTERVAL_MINUTES", 1))
 
     while True:
         start_time = time.time()
@@ -883,17 +914,18 @@ if __name__ == "__main__":
         print("-" * 75)
 
         total_posts = 0
-        try:
-            total_posts = app_api.run(yesterday, now, save_db=True)
-        except Exception as e:
-            print(f"❌ เกิดข้อผิดพลาดในระบบ REST API: {e}")
+        # Bypass REST API for testing Direct DB system only
+        # try:
+        #     total_posts = app_api.run(yesterday, now, save_db=False)
+        # except Exception as e:
+        #     print(f"❌ เกิดข้อผิดพลาดในระบบ REST API: {e}")
 
         # ---------------------------------------------------------------------
         # 2. รันส่วนที่ 2: Direct Database System (MySQL & MongoDB) [ENABLED / ACTIVE]
         # ---------------------------------------------------------------------
         print("\n🔹 [STEP 2/2] เริ่มการประมวลผลผ่าน Direct Database System (MySQL + MongoDB)...")
         try:
-            db_posts = app_db.run(yesterday, now, save_db=True)
+            db_posts = app_db.run(yesterday, now, save_db=False)
             if db_posts:
                 total_posts = (total_posts or 0) + db_posts
         except Exception as e:
@@ -910,7 +942,8 @@ if __name__ == "__main__":
                 print("\n🛑 หยุดการทำงานตามคำสั่งผู้ใช้ (Ctrl+C)")
                 sys.exit(0)
         else:
-            print(f"\n🎉 สิ้นสุดการทำงานในรอบนี้! วิเคราะห์ไปทั้งหมด {total_posts} โพสต์ (ใช้เวลา {total_time:.2f} วินาที)")
+            posts_per_min = total_posts / (total_time / 60) if total_time > 0 else 0
+            print(f"\n🎉 สิ้นสุดการทำงานในรอบนี้! วิเคราะห์ไปทั้งหมด {total_posts} โพสต์ (ใช้เวลา {total_time:.2f} วินาที | ⚡ {posts_per_min:.1f} posts/min)")
             print(f"⏳ รอ {SLEEP_MINUTES} นาทีก่อนเริ่มรอบถัดไป... (กด Ctrl+C เพื่อหยุดโปรแกรม)")
             try:
                 time.sleep(SLEEP_MINUTES * 60)
