@@ -5,6 +5,13 @@ from sshtunnel import SSHTunnelForwarder
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from datetime import datetime
 import pymysql, pymongo
+import pymongo.common
+import pymongo.topology_description
+
+# Patch PyMongo 4.x to allow connecting to MongoDB 4.0 / wire version 7 servers
+pymongo.MIN_SUPPORTED_WIRE_VERSION = 0
+pymongo.common.MIN_SUPPORTED_WIRE_VERSION = 0
+pymongo.topology_description.common.MIN_SUPPORTED_WIRE_VERSION = 0
 
 import requests, boto3
 import threading
@@ -67,42 +74,74 @@ BE_MYSQL_PORT = int(os.environ.get("MYSQL_PORT", 3306))
 BE_MYSQL_USER = os.environ.get("MYSQL_USER", "")
 BE_MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "")
 
+import time
+
 class DatabaseConnection():        
     def __init__(self):
         self._mongo_tunnel = None
         self._mongo_client = None
         self._mongo_lock = threading.Lock()
 
-    # ─── MongoDB (ผ่าน SSH Tunnel) ─────────────────────────────
-    def _get_mongo_client(self):
+    def _cleanup_mongo_unsafe(self):
+        if self._mongo_client is not None:
+            try:
+                self._mongo_client.close()
+            except Exception:
+                pass
+            self._mongo_client = None
+        if self._mongo_tunnel is not None:
+            try:
+                self._mongo_tunnel.stop()
+            except Exception:
+                pass
+            self._mongo_tunnel = None
+
+    def reset_mongo(self):
+        """ล้างการเชื่อมต่อ Mongo + SSH Tunnel เพื่อเตรียมต่อใหม่"""
         with self._mongo_lock:
-            if self._mongo_client is not None and self._mongo_tunnel is not None:
-                if self._mongo_tunnel.is_active:
+            self._cleanup_mongo_unsafe()
+
+    # ─── MongoDB (ผ่าน SSH Tunnel) ─────────────────────────────
+    def _get_mongo_client(self, retries=3, delay=3):
+        with self._mongo_lock:
+            for attempt in range(1, retries + 1):
+                try:
+                    if self._mongo_client is not None and self._mongo_tunnel is not None:
+                        if self._mongo_tunnel.is_active:
+                            try:
+                                self._mongo_client.admin.command('ping')
+                                return self._mongo_client
+                            except Exception:
+                                pass
+                        self._cleanup_mongo_unsafe()
+
+                    self._mongo_tunnel = SSHTunnelForwarder(
+                        (SSH_HOST, SSH_PORT),
+                        ssh_username=SSH_USER,
+                        ssh_password=SSH_PASSWORD,
+                        remote_bind_address=(BE_MONGO_PRIVATE_IP, BE_MONGO_PORT),
+                        set_keepalive=30
+                    )
+                    self._mongo_tunnel.start()
+                    self._mongo_client = MongoClient(
+                        host="127.0.0.1",
+                        port=self._mongo_tunnel.local_bind_port,
+                        username=BE_MONGO_USERNAME,
+                        password=BE_MONGO_PASSWORD,
+                        maxPoolSize=200,
+                        readPreference='secondaryPreferred',
+                        serverSelectionTimeoutMS=5000,
+                        directConnection=True
+                    )
+                    self._mongo_client.admin.command('ping')
                     return self._mongo_client
-                else:
-                    try:
-                        self._mongo_tunnel.stop()
-                    except:
-                        pass
-                    self._mongo_client.close()
-                    self._mongo_client = None
-                    self._mongo_tunnel = None
-            
-            self._mongo_tunnel = SSHTunnelForwarder(
-                (SSH_HOST, SSH_PORT),
-                ssh_username=SSH_USER,
-                ssh_password=SSH_PASSWORD,
-                remote_bind_address=(BE_MONGO_PRIVATE_IP, BE_MONGO_PORT),
-            )
-            self._mongo_tunnel.start()
-            self._mongo_client = MongoClient(
-                host="127.0.0.1",
-                port=self._mongo_tunnel.local_bind_port,
-                username=BE_MONGO_USERNAME,
-                password=BE_MONGO_PASSWORD,
-                maxPoolSize=200,
-            )
-            return self._mongo_client
+                except Exception as e:
+                    print(f"⚠️ [Mongo SSH Tunnel] พยายามเชื่อมต่อครั้งที่ {attempt}/{retries} ล้มเหลว: {e}")
+                    self._cleanup_mongo_unsafe()
+                    if attempt < retries:
+                        time.sleep(delay)
+            print("❌ ไม่สามารถเชื่อมต่อ Mongo SSH Tunnel ได้หลังจากลองใหม่ครบแล้ว")
+            return None
 
     def get_mongo_client(self):
         """Public method — คืน MongoClient ที่เชื่อมผ่าน SSH Tunnel แล้ว"""
@@ -128,30 +167,37 @@ class DatabaseConnection():
                 server = kwargs.get("server")
                 remote_host = kwargs.get("host")
 
-                with SSHTunnelForwarder(
-                    (SSH_MYSQL_HOST[server], SSH_MYSQL_PORT),
-                    ssh_username=SSH_MYSQL_USER[server],
-                    ssh_password=SSH_MYSQL_PASSWORD[server],
-                    remote_bind_address=(remote_host, BE_MYSQL_PORT),
-                ) as tunnel:
-                    conn = pymysql.connect(
-                        host="127.0.0.1",             # ต่อเข้า tunnel ที่ฝั่งเรา
-                        port=tunnel.local_bind_port,  # port ที่ tunnel bind ไว้
-                        user=BE_MYSQL_USER,
-                        passwd=BE_MYSQL_PASSWORD,
-                        db=database,
-                        charset="utf8",
-                        connect_timeout=10,
-                        read_timeout=30,
-                    )
+                for attempt in range(1, 4):
                     try:
-                        with conn.cursor() as cursor:
-                            cursor.execute(query)
-                            rows = cursor.fetchall()
-                        # ถ้าเป็น SELECT อย่างเดียวไม่ต้อง commit ก็ได้
-                        return rows
-                    finally:
-                        conn.close()
+                        with SSHTunnelForwarder(
+                            (SSH_MYSQL_HOST[server], SSH_MYSQL_PORT),
+                            ssh_username=SSH_MYSQL_USER[server],
+                            ssh_password=SSH_MYSQL_PASSWORD[server],
+                            remote_bind_address=(remote_host, BE_MYSQL_PORT),
+                            set_keepalive=30
+                        ) as tunnel:
+                            conn = pymysql.connect(
+                                host="127.0.0.1",             # ต่อเข้า tunnel ที่ฝั่งเรา
+                                port=tunnel.local_bind_port,  # port ที่ tunnel bind ไว้
+                                user=BE_MYSQL_USER,
+                                passwd=BE_MYSQL_PASSWORD,
+                                db=database,
+                                charset="utf8",
+                                connect_timeout=10,
+                                read_timeout=30,
+                            )
+                            try:
+                                with conn.cursor() as cursor:
+                                    cursor.execute(query)
+                                    rows = cursor.fetchall()
+                                return rows
+                            finally:
+                                conn.close()
+                    except Exception as e:
+                        print(f"⚠️ [MySQL SELECT Server {server}] พยายามเชื่อมต่อครั้งที่ {attempt}/3 ล้มเหลว: {e}")
+                        if attempt < 3:
+                            time.sleep(3)
+                return ()
 
             else:
                 MYSQL_DB_CONNECTION = pymysql.connect(
@@ -227,23 +273,36 @@ class DatabaseConnection():
         return result
 
     # ─── MySQL Connection สำหรับ UPDATE/INSERT (ต้อง commit เอง) ─
-    def get_mysql_connection(self, server=1, host="10.130.84.170", database="blue_eye"):
-        """คืนค่า (tunnel, conn) เพื่อเอาไปใช้กับ UPDATE/INSERT ที่ต้องมีการ commit() และจัดการ connection เอง"""
-        tunnel = SSHTunnelForwarder(
-            (SSH_MYSQL_HOST[server], SSH_MYSQL_PORT),
-            ssh_username=SSH_MYSQL_USER[server],
-            ssh_password=SSH_MYSQL_PASSWORD[server],
-            remote_bind_address=(host, BE_MYSQL_PORT),
-        )
-        tunnel.start()
-        conn = pymysql.connect(
-            host="127.0.0.1",
-            port=tunnel.local_bind_port,
-            user=BE_MYSQL_USER,
-            passwd=BE_MYSQL_PASSWORD,
-            db=database,
-            charset="utf8",
-            connect_timeout=10,
-            read_timeout=30,
-        )
-        return tunnel, conn
+    def get_mysql_connection(self, server=1, host="10.130.84.170", database="blue_eye", retries=3, delay=3):
+        """คืนค่า (tunnel, conn) เพื่อเอาไปใช้กับ UPDATE/INSERT พร้อมระบบ Retry"""
+        for attempt in range(1, retries + 1):
+            try:
+                tunnel = SSHTunnelForwarder(
+                    (SSH_MYSQL_HOST[server], SSH_MYSQL_PORT),
+                    ssh_username=SSH_MYSQL_USER[server],
+                    ssh_password=SSH_MYSQL_PASSWORD[server],
+                    remote_bind_address=(host, BE_MYSQL_PORT),
+                    set_keepalive=30
+                )
+                tunnel.start()
+                conn = pymysql.connect(
+                    host="127.0.0.1",
+                    port=tunnel.local_bind_port,
+                    user=BE_MYSQL_USER,
+                    passwd=BE_MYSQL_PASSWORD,
+                    db=database,
+                    charset="utf8",
+                    connect_timeout=10,
+                    read_timeout=30,
+                )
+                return tunnel, conn
+            except Exception as e:
+                print(f"⚠️ [MySQL Connection Server {server}] พยายามเชื่อมต่อครั้งที่ {attempt}/{retries} ล้มเหลว: {e}")
+                if 'tunnel' in locals() and tunnel:
+                    try:
+                        tunnel.stop()
+                    except Exception:
+                        pass
+                if attempt < retries:
+                    time.sleep(delay)
+        raise Exception(f"ไม่สามารถเชื่อมต่อ MySQL SSH Tunnel Server {server} ได้หลังจากลองใหม่ครบ {retries} ครั้ง")
