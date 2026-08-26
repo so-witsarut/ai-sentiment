@@ -826,8 +826,8 @@ class SentimentDB:
 
                             for tbl in [table_prefix, f"{table_prefix}_daily", f"{table_prefix}_3months"]:
                                 cursor.execute(
-                                    f'UPDATE `{tbl}` SET `{table_prefix}_sentiment` = %s, `positive_percent` = %s, `negative_percent` = %s, `neutral_percent` = %s, `sentiment_status` = %s, `ai_reason` = %s WHERE msg_id = %s',
-                                    (sentiment_val, int(ollama_map[str_id].get("positive_percent", 0)), int(ollama_map[str_id].get("negative_percent", 0)), int(ollama_map[str_id].get("neutral_percent", 100)), "1", ai_reason_val, str(_id))
+                                    f'UPDATE `{tbl}` SET `{table_prefix}_sentiment` = %s, `sentiment_status` = %s, `ai_reason` = %s WHERE msg_id = %s',
+                                    (sentiment_val, "1", ai_reason_val, str(_id))
                                 )
 
                         DB_CONNECTION.commit()
@@ -845,12 +845,9 @@ class SentimentDB:
                         if str_id not in ollama_map:
                             continue
                         sentiment_val = float(ollama_map[str_id]["ai_sentiment"])
-                        pos_p = int(ollama_map[str_id].get("positive_percent", 0))
-                        neg_p = int(ollama_map[str_id].get("negative_percent", 0))
-                        neu_p = int(ollama_map[str_id].get("neutral_percent", 100))
                         ai_reason_val = ollama_map[str_id].get("reason", "") or ""
                         print(f"      📝 [MySQL UPDATE] Tables: [`{table_prefix}`, `{table_prefix}_daily`, `{table_prefix}_3months`]")
-                        print(f"         └─ SET `{table_prefix}_sentiment` = {sentiment_val}, `positive_percent` = {pos_p}, `negative_percent` = {neg_p}, `neutral_percent` = {neu_p}, `sentiment_status` = '1', `ai_reason` = '{ai_reason_val}' WHERE msg_id = '{str_id}'")
+                        print(f"         └─ SET `{table_prefix}_sentiment` = {sentiment_val}, `sentiment_status` = '1', `ai_reason` = '{ai_reason_val}' WHERE msg_id = '{str_id}'")
 
         except Exception as e:
             print(f"❌ Error during DB analysis execution: {e}")
