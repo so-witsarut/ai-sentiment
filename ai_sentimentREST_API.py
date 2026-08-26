@@ -381,6 +381,7 @@ class OllamaSentimentAnalyzer:
                 if not entity_found:
                     res.update({"positive_percent":0,"negative_percent":0,"neutral_percent":100,"ai_sentiment":0})
                 res["post_id"] = post_id
+                res["model"] = actual_api_model
                 return res
         return None
 
@@ -433,7 +434,8 @@ class OllamaSentimentAnalyzer:
                 "negative_percent": 0,
                 "neutral_percent": 100,
                 "confidence": 0,
-                "reason": "ไม่พบเนื้อหาแสดงความรู้สึก"
+                "reason": "ไม่พบเนื้อหาแสดงความรู้สึก",
+                "model": self.model
             }
 
         # --- PASS 2: Deep Analysis (Gemma / Gemini API) ---
@@ -575,7 +577,11 @@ class SentimentAPI:
                     if "post_id" in res and "ai_sentiment" in res:
                         ollama_map[str(res["post_id"])] = {
                             "val": res["ai_sentiment"],
-                            "reason": res.get("reason", "")
+                            "positive_percent": res.get("positive_percent", 0),
+                            "negative_percent": res.get("negative_percent", 0),
+                            "neutral_percent": res.get("neutral_percent", 100),
+                            "reason": res.get("reason", ""),
+                            "model": res.get("model", "unknown")
                         }
 
             api_results = []
@@ -603,7 +609,13 @@ class SentimentAPI:
                     api_results.append({
                         "match_post_id": match_post_id,
                         "sentiment": sentiment_str,
-                        "sentiment_reason": ai_reason
+                        "sentiment_reason": ai_reason,
+                        "sentiment_scores": {
+                            "positive": ollama_map[match_post_id]["positive_percent"],
+                            "neutral": ollama_map[match_post_id]["neutral_percent"],
+                            "negative": ollama_map[match_post_id]["negative_percent"],
+                            "model": ollama_map[match_post_id]["model"]
+                        }
                     })
                     
                     keywords = post_for_ai.get("keywords", [])
