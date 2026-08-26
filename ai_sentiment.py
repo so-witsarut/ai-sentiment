@@ -1039,7 +1039,7 @@ if __name__ == "__main__":
         total_posts = 0
         # 1. รันส่วนที่ 1: REST API System [ACTIVE]
         try:
-            total_posts = app_api.run(yesterday, now, save_db=False)
+            total_posts = app_api.run(yesterday, now, save_db=True)
         except Exception as e:
             print(f"❌ เกิดข้อผิดพลาดในระบบ REST API: {e}")
 
@@ -1048,7 +1048,7 @@ if __name__ == "__main__":
         # ---------------------------------------------------------------------
         print("\n🔹 [STEP 2/2] เริ่มการประมวลผลผ่าน Direct Database System (MySQL + MongoDB)...")
         try:
-            db_posts = app_db.run(yesterday, now, save_db=False)
+            db_posts = app_db.run(yesterday, now, save_db=True)
             if db_posts:
                 total_posts = (total_posts or 0) + db_posts
         except Exception as e:
