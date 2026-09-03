@@ -191,6 +191,9 @@ class OllamaSentimentAnalyzer:
             return 100
         if neg > pos and neg > neu:
             return -100
+        # Tie between pos and neg, both above neutral → default to negative (conservative for brand monitoring)
+        if pos == neg and pos > neu:
+            return -100
         return 0
 
     def _parse_json_result(self, result_text):
@@ -595,11 +598,19 @@ class SentimentAPI:
                 if match_post_id in ollama_map:
                     raw_val = ollama_map[match_post_id]["val"]
                     ai_reason = ollama_map[match_post_id]["reason"]
+                    pos_score = ollama_map[match_post_id]["positive_percent"]
+                    neg_score = ollama_map[match_post_id]["negative_percent"]
+                    neu_score = ollama_map[match_post_id]["neutral_percent"]
 
-                    if raw_val > 0:
+                    # Derive sentiment_str from actual scores to stay consistent with API validation
+                    if pos_score > neg_score and pos_score > neu_score:
                         sentiment_str = "positive"
                         icon = "🟢"
-                    elif raw_val < 0:
+                    elif neg_score > pos_score and neg_score > neu_score:
+                        sentiment_str = "negative"
+                        icon = "🔴"
+                    elif pos_score == neg_score and pos_score > neu_score:
+                        # Tie between pos/neg, both above neutral → conservative default
                         sentiment_str = "negative"
                         icon = "🔴"
                     else:
@@ -611,9 +622,9 @@ class SentimentAPI:
                         "sentiment": sentiment_str,
                         "sentiment_reason": ai_reason,
                         "sentiment_scores": {
-                            "positive": ollama_map[match_post_id]["positive_percent"],
-                            "neutral": ollama_map[match_post_id]["neutral_percent"],
-                            "negative": ollama_map[match_post_id]["negative_percent"],
+                            "positive": pos_score,
+                            "neutral": neu_score,
+                            "negative": neg_score,
                             "model": ollama_map[match_post_id]["model"]
                         }
                     })
