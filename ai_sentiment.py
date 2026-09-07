@@ -104,10 +104,19 @@ class OllamaSentimentAnalyzer:
         
         for attempt in range(max_retries):
             try:
-                response = self.session.post(url, json=payload, timeout=45)
+                response = self.session.post(url, json=payload, timeout=30)
                 if response.status_code == 200:
                     res_data = response.json()
-                    result_text = res_data["candidates"][0]["content"]["parts"][0]["text"]
+                    candidate = res_data.get("candidates", [{}])[0]
+                    parts = candidate.get("content", {}).get("parts", [])
+                    result_text = ""
+                    for p in reversed(parts):
+                        if not p.get("thought") and "text" in p:
+                            result_text = p["text"]
+                            break
+                    if not result_text and parts:
+                        result_text = parts[-1].get("text", "")
+
                     parsed_res = self._parse_json_result(result_text)
                     if parsed_res is None:
                         print(f"  -> Gemini API Parsing Error [{model_name}] (attempt {attempt + 1}/{max_retries}): {result_text[:200]}")
@@ -373,8 +382,8 @@ class OllamaSentimentAnalyzer:
             '{"entity_found":true,"reason":"ผู้ใช้แสดงความไม่พอใจอย่างมาก","positive_percent":0,"negative_percent":80,"neutral_percent":20}'
         )
         validation_models = [
-            "api:gemma-4-31b-it",
             "api:gemma-4-26b-a4b-it",
+            "api:gemma-4-31b-it",
             "api:gemini-3.5-flash-lite",
             "api:gemini-3.1-flash-lite",
             "api:gemini-2.5-flash",
@@ -705,6 +714,37 @@ class SentimentDB:
 
         return list_content
 
+    def mark_missing_content(self, missing_ids, host, server=1, table_prefix="own_match"):
+        """บันทึกสถานะให้โพสต์ที่ไม่มีใน MongoDB เพื่อไม่ให้ค้างอยู่ในคิว sentiment_status = '0'"""
+        if not missing_ids or CONN is None:
+            return
+        tunnel, DB_CONNECTION = None, None
+        try:
+            tunnel, DB_CONNECTION = CONN.get_mysql_connection(server=server, host=host, database=self.config["mysql_db"])
+            cursor = DB_CONNECTION.cursor()
+            for msg_id in missing_ids:
+                for tbl in [table_prefix, f"{table_prefix}_daily", f"{table_prefix}_3months"]:
+                    cursor.execute(
+                        f'UPDATE `{tbl}` SET `{table_prefix}_sentiment` = %s, `sentiment_status` = %s, `ai_reason` = %s WHERE msg_id = %s',
+                        (0.00, "1", "Content not found in MongoDB", str(msg_id))
+                    )
+            DB_CONNECTION.commit()
+            cursor.close()
+            print(f"  ⚠️ เคลียร์โพสต์ที่ไม่มีใน MongoDB ({len(missing_ids)} โพสต์) -> ปรับ status='1' เพื่อไม่ให้ค้างคิว")
+        except Exception as e:
+            print(f"  ❌ Error marking missing content: {e}")
+        finally:
+            if DB_CONNECTION:
+                try:
+                    DB_CONNECTION.close()
+                except Exception:
+                    pass
+            if tunnel:
+                try:
+                    tunnel.stop()
+                except Exception:
+                    pass
+
     def analysis(self, list_content, host, server=1, table_prefix="own_match", save_db=True):
         if not list_content:
             return
@@ -884,10 +924,15 @@ class SentimentDB:
 
         total_processed_posts = 0
 
-        # Review pagination: เลื่อน OFFSET ทุกรอบ เพื่อไม่ให้ดึงแถวชุดเดิม (100 แถวแรก) ซ้ำตลอดไป
-        page_size = 100
-        offset = self.review_offset * page_size
-        print(f"📄 [Direct DB] Review cycle={self.review_offset} (OFFSET {offset})")
+        # Pagination logic:
+        # - ถ้า save_db=True (บันทึกจริง): offset ต้องเป็น 0 เสมอ เพราะแถวที่ทำเสร็จจะเปลี่ยนเป็น status='1' หลุดจากคิวไปเอง
+        # - ถ้า save_db=False (Mock Mode): เลื่อน offset ตาม review_offset เพื่อเปิดดูหน้าถัดไปเรื่อยๆ โดยไม่ซ้ำชุดเดิม
+        if save_db:
+            offset = 0
+        else:
+            page_size = 100
+            offset = self.review_offset * page_size
+            print(f"📄 [Direct DB Mock] Review cycle={self.review_offset} (OFFSET {offset})")
 
         targets = [
             {
@@ -982,7 +1027,15 @@ class SentimentDB:
                     )
                     list_id_feed = [(x[0], x[1], x[2], x[3], x[4]) for x in (_item_feed or [])]
                     print(f"  👉 พบข้อมูลจาก Feed: {len(list_id_feed)} โพสต์")
-                    list_content = self.get_content(list_id_feed, "Feed")
+                    feed_content = self.get_content(list_id_feed, "Feed")
+                    list_content = feed_content
+
+                    # ป้องกันโพสต์ค้างคิว: ตรวจจับและเคลียร์โพสต์ที่ไม่มีเนื้อหาใน MongoDB
+                    if save_db and list_id_feed:
+                        found_feed_ids = {item[0] for item in feed_content}
+                        missing_feed_ids = [x[0] for x in list_id_feed if x[0] not in found_feed_ids]
+                        if missing_feed_ids:
+                            self.mark_missing_content(missing_feed_ids, current_host, server=server_id, table_prefix=target["table_prefix"])
                 except Exception as e:
                     print(f"  ❌ Error querying Feed SQL: {e}")
 
@@ -996,7 +1049,15 @@ class SentimentDB:
                     )
                     list_id_comment = [(x[0], x[1], x[2], x[3], x[4]) for x in (_item_comment or [])]
                     print(f"  👉 พบข้อมูลจาก Comment: {len(list_id_comment)} โพสต์")
-                    list_content += self.get_content(list_id_comment, "Comment")
+                    comment_content = self.get_content(list_id_comment, "Comment")
+                    list_content += comment_content
+
+                    # ป้องกันโพสต์ค้างคิว: ตรวจจับและเคลียร์โพสต์ที่ไม่มีเนื้อหาใน MongoDB
+                    if save_db and list_id_comment:
+                        found_comment_ids = {item[0] for item in comment_content}
+                        missing_comment_ids = [x[0] for x in list_id_comment if x[0] not in found_comment_ids]
+                        if missing_comment_ids:
+                            self.mark_missing_content(missing_comment_ids, current_host, server=server_id, table_prefix=target["table_prefix"])
                 except Exception as e:
                     print(f"  ❌ Error querying Comment SQL: {e}")
 
@@ -1010,11 +1071,14 @@ class SentimentDB:
                     print(f"  ⏩ ไม่มีข้อมูลใหม่สำหรับ {target['name']} (Server {server_id})")
 
 
-        # เลื่อนหน้า review สำหรับรอบถัดไป; ถ้ารอบนี้ว่างเปล่าและเคยเลื่อนแล้ว ให้วนกลับไปหน้าแรก
-        if total_processed_posts == 0 and self.review_offset > 0:
-            self.review_offset = 0
+        # เลื่อนหน้า review สำหรับรอบถัดไป เฉพาะโหมด Mock (save_db=False)
+        if not save_db:
+            if total_processed_posts == 0 and self.review_offset > 0:
+                self.review_offset = 0
+            else:
+                self.review_offset += 1
         else:
-            self.review_offset += 1
+            self.review_offset = 0
         return total_processed_posts
 
 
