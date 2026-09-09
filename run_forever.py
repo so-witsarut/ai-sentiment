@@ -149,6 +149,9 @@ MOCKUP_DATA = [
 # ดึงข้อมูลจาก DB จริง
 # ═══════════════════════════════════════════════════════════════
 def process_targets(sa_obj):
+    import connection
+    CONN = connection.DatabaseConnection()
+
     yesterday = str(datetime.now() - timedelta(days=1))[:10]
     now_str   = str(datetime.now())[:10]
 
@@ -170,7 +173,7 @@ def process_targets(sa_obj):
                 f"WHERE date(omd.msg_time) BETWEEN '{yesterday}' AND '{now_str}' "
                 f"AND omd.sentiment_status = '0' AND omd.match_type = 'Feed' "
                 f"GROUP BY omd.msg_id, company_name, project_name, post_user "
-                f"ORDER BY omd.msg_time ASC"
+                f"ORDER BY MIN(omd.msg_time) ASC"
             ),
             "sql_comment": (
                 f"SELECT omd.msg_id, "
@@ -186,7 +189,7 @@ def process_targets(sa_obj):
                 f"WHERE date(omd.msg_time) BETWEEN '{yesterday}' AND '{now_str}' "
                 f"AND omd.sentiment_status = '0' AND omd.match_type = 'Comment' "
                 f"GROUP BY omd.msg_id, company_name, project_name, post_user "
-                f"ORDER BY omd.msg_time ASC"
+                f"ORDER BY MIN(omd.msg_time) ASC"
             )
         },
         {
@@ -206,7 +209,7 @@ def process_targets(sa_obj):
                 f"WHERE date(cmd.msg_time) BETWEEN '{yesterday}' AND '{now_str}' "
                 f"AND cmd.sentiment_status = '0' AND cmd.match_type = 'Feed' "
                 f"GROUP BY cmd.msg_id, company_name, project_name, post_user "
-                f"ORDER BY cmd.msg_time ASC"
+                f"ORDER BY MIN(cmd.msg_time) ASC"
             ),
             "sql_comment": (
                 f"SELECT cmd.msg_id, "
@@ -222,7 +225,7 @@ def process_targets(sa_obj):
                 f"WHERE date(cmd.msg_time) BETWEEN '{yesterday}' AND '{now_str}' "
                 f"AND cmd.sentiment_status = '0' AND cmd.match_type = 'Comment' "
                 f"GROUP BY cmd.msg_id, company_name, project_name, post_user "
-                f"ORDER BY cmd.msg_time ASC"
+                f"ORDER BY MIN(cmd.msg_time) ASC"
             )
         }
     ]
@@ -235,13 +238,6 @@ def process_targets(sa_obj):
         log.info(f"{'=' * 40}")
 
         for target in targets:
-            # log.info(target["sql_feed"])
-            import sys
-            if r"ai-sentiment" not in sys.path:
-                sys.path.append(r"ai-sentiment")
-            import connection
-            CONN = connection.DatabaseConnection()
-
             feeds = CONN.getfromdb(
                 query=target["sql_feed"], 
                 DB='mysqldb', 
@@ -260,8 +256,23 @@ def process_targets(sa_obj):
             log.info(f"DB [{target['name']}] (Server {server_id}) → Feed: {len(feeds)} | Comment: {len(comments)} รายการ")
 
             content = []
-            if feeds:    content += sa_obj.get_content(list(feeds), "Feed")
-            if comments: content += sa_obj.get_content(list(comments), "Comment")
+            if feeds:
+                feed_content = sa_obj.get_content(list(feeds), "Feed")
+                content += feed_content
+                if hasattr(sa_obj, "mark_missing_content"):
+                    found_feed_ids = {item[0] for item in feed_content}
+                    missing_feed_ids = [x[0] for x in feeds if x[0] not in found_feed_ids]
+                    if missing_feed_ids:
+                        sa_obj.mark_missing_content(missing_feed_ids, current_host, server=server_id, table_prefix=target["table_prefix"])
+
+            if comments:
+                comment_content = sa_obj.get_content(list(comments), "Comment")
+                content += comment_content
+                if hasattr(sa_obj, "mark_missing_content"):
+                    found_comment_ids = {item[0] for item in comment_content}
+                    missing_comment_ids = [x[0] for x in comments if x[0] not in found_comment_ids]
+                    if missing_comment_ids:
+                        sa_obj.mark_missing_content(missing_comment_ids, current_host, server=server_id, table_prefix=target["table_prefix"])
             
             if content:
                 sa_obj.analysis(content, current_host, server=server_id, table_prefix=target["table_prefix"])

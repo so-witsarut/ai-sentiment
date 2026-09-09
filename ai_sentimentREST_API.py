@@ -33,7 +33,7 @@ except Exception as e:
     print(f"⚠️ Warning: Could not initialize connection module for Direct DB: {e}")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-BE_API_TOKEN = os.environ.get("BE_API_TOKEN", "10b6150ab6b7a8ef90904a32ef875f2b62789753109733d0194165d9ed3e854c")
+BE_API_TOKEN = os.environ.get("BE_API_TOKEN", "")
 BE_API_BASE_URL = os.environ.get("BE_API_BASE_URL", "https://api.blueeye.io/api/v1")
 
 # Reconfigure stdout for UTF-8 output on Windows
@@ -66,19 +66,31 @@ def get_keyword_context(text, keyword, window=150, max_fallback_length=400):
 
 
 def validate_date_str(date_str):
-    """Validate YYYY-MM-DD date string (ป้องกันรูปแบบวันที่ไม่ถูกต้อง)"""
+    """Validate YYYY-MM-DD date string (ป้องกัน SQL injection และรูปแบบวันที่ไม่ถูกต้อง)"""
+    from datetime import date as dt_date
+    if date_str is None:
+        raise ValueError("Date string cannot be None")
+    if isinstance(date_str, (datetime, dt_date)):
+        return date_str.strftime("%Y-%m-%d")
+    s = str(date_str).strip()
+    if not s:
+        raise ValueError("Date string cannot be empty")
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})(?:[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$", s)
+    if not m:
+        raise ValueError(f"Invalid date format (expected YYYY-MM-DD or ISO timestamp): {date_str}")
+    date_part = m.group(1)
     try:
-        datetime.strptime(str(date_str), "%Y-%m-%d")
-        return str(date_str)
+        datetime.strptime(date_part, "%Y-%m-%d")
+        return date_part
     except ValueError:
-        raise ValueError(f"Invalid date format (expected YYYY-MM-DD): {date_str}")
+        raise ValueError(f"Invalid calendar date: {date_str}")
 
 
 # =============================================================================
 # Ollama & Gemini Sentiment Analyzer Engine
 # =============================================================================
 class OllamaSentimentAnalyzer:
-    CONCURRENT_WORKERS = 3
+    CONCURRENT_WORKERS = int(os.environ.get("CONCURRENT_WORKERS", 3))
 
     def __init__(self, model="qcwind/qwen3-8b-instruct-Q4-K-M:latest"):
         self.model = model
@@ -93,18 +105,58 @@ class OllamaSentimentAnalyzer:
             return None
         
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
-        payload = {
-            "system_instruction": {"parts": [{"text": system_instruction}]},
-            "contents": [{"parts": [{"text": user_prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.0}
-        }
+        is_gemma = "gemma" in model_name.lower()
+        if is_gemma:
+            # Gemma models on Google AI Studio API do not support native system_instruction
+            combined_prompt = f"{system_instruction}\n\n{user_prompt}"
+            payload = {
+                "contents": [{"parts": [{"text": combined_prompt}]}],
+                "generationConfig": {"temperature": 0.0}
+            }
+        else:
+            payload = {
+                "system_instruction": {"parts": [{"text": system_instruction}]},
+                "contents": [{"parts": [{"text": user_prompt}]}],
+                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.0}
+            }
+        api_timeout = int(os.environ.get("GEMINI_API_TIMEOUT", 30))
         
         for attempt in range(max_retries):
             try:
-                response = self.session.post(url, json=payload, timeout=45)
+                response = self.session.post(url, json=payload, timeout=api_timeout)
+                # Fallback for models that reject system_instruction or responseMimeType with 400 Bad Request
+                if response.status_code == 400 and not is_gemma:
+                    fallback_payload = {
+                        "contents": [{"parts": [{"text": f"{system_instruction}\n\n{user_prompt}"}]}],
+                        "generationConfig": {"temperature": 0.0}
+                    }
+                    response = self.session.post(url, json=fallback_payload, timeout=api_timeout)
+
                 if response.status_code == 200:
                     res_data = response.json()
-                    result_text = res_data["candidates"][0]["content"]["parts"][0]["text"]
+                    candidates = res_data.get("candidates") or []
+                    if not candidates:
+                        print(f"  -> Gemini API Empty Candidates [{model_name}]: {res_data}")
+                        continue
+                    candidate = candidates[0] if isinstance(candidates[0], dict) else {}
+                    content = candidate.get("content") or {}
+                    parts = content.get("parts") or [] if isinstance(content, dict) else []
+                    
+                    # Extract text: filter out thought parts (Gemma 4/Gemini thinking) and join in order
+                    non_thought_parts = [
+                        p["text"] for p in parts
+                        if isinstance(p, dict) and not p.get("thought") and "text" in p
+                    ]
+                    if non_thought_parts:
+                        result_text = "".join(non_thought_parts)
+                    elif parts:
+                        result_text = "".join(
+                            p.get("text", "") if isinstance(p, dict) else (p if isinstance(p, str) else "")
+                            for p in parts
+                        )
+                    else:
+                        result_text = ""
+
                     parsed_res = self._parse_json_result(result_text)
                     if parsed_res is None:
                         print(f"  -> Gemini API Parsing Error [{model_name}] (attempt {attempt + 1}/{max_retries}): {result_text[:200]}")
@@ -162,6 +214,8 @@ class OllamaSentimentAnalyzer:
         """Normalize percentage distribution so the total is exactly 100."""
         def num(v, default=0):
             try:
+                if isinstance(v, str):
+                    v = v.replace("%", "").strip()
                 return max(0.0, min(100.0, float(v)))
             except Exception:
                 return default
@@ -179,6 +233,8 @@ class OllamaSentimentAnalyzer:
             if val is None:
                 return default
             try:
+                if isinstance(val, str):
+                    val = val.replace("%", "").strip()
                 return float(val)
             except (ValueError, TypeError):
                 return default
@@ -199,16 +255,51 @@ class OllamaSentimentAnalyzer:
     def _parse_json_result(self, result_text):
         if not result_text:
             return None
-        clean_text = re.sub(r'<think>.*?</think>', '', result_text, flags=re.DOTALL).strip()
-        clean_text = clean_text.replace('```json', '').replace('```', '').strip()
-        json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
-        if json_match:
-            clean_text = json_match.group(0)
-        cleaned_json = re.sub(r',\s*([\}\]])', r'\1', clean_text)
+        # Clean thought/think tags (both closed and unclosed)
+        clean_text = re.sub(r'<think>.*?</think>', '', result_text, flags=re.DOTALL)
+        clean_text = re.sub(r'<thought>.*?</thought>', '', clean_text, flags=re.DOTALL)
+        clean_text = re.sub(r'<(?:think|thought)>.*?(?=(?:```|\[|\{|$))', '', clean_text, flags=re.DOTALL).strip()
+        clean_text = re.sub(r'```(?:json)?\s*', '', clean_text)
+        clean_text = clean_text.replace('```', '').strip()
 
+        def _clean_reason(s):
+            if not isinstance(s, str):
+                return ""
+            r = re.sub(r'\(?\s*(?:ตาม)?กฎข้อ\s*[\d\s,และ|-]+\)?', '', s, flags=re.I)
+            r = re.sub(r'\(?\s*Rule\s*[\d\s,and|-]+\)?', '', r, flags=re.I).strip(' "\' \t\r\n')
+            return r
+
+        parsed = None
+        # 1. Try direct parse first
         try:
-            parsed = json.loads(cleaned_json)
+            raw_parsed = json.loads(clean_text)
+            if isinstance(raw_parsed, list) and raw_parsed:
+                parsed = raw_parsed[0] if isinstance(raw_parsed[0], dict) else None
+            elif isinstance(raw_parsed, dict):
+                parsed = raw_parsed
         except json.JSONDecodeError:
+            pass
+
+        # 2. Try regex extraction of JSON object {...} or array of objects [{...}]
+        if parsed is None:
+            for pattern in (r'\{.*\}', r'\[\s*\{.*\}\s*\]'):
+                m = re.search(pattern, clean_text, re.DOTALL)
+                if m:
+                    sub_text = re.sub(r',\s*([\}\]])', r'\1', m.group(0))
+                    try:
+                        raw_parsed = json.loads(sub_text)
+                        if isinstance(raw_parsed, list) and raw_parsed:
+                            if isinstance(raw_parsed[0], dict):
+                                parsed = raw_parsed[0]
+                                break
+                        elif isinstance(raw_parsed, dict):
+                            parsed = raw_parsed
+                            break
+                    except json.JSONDecodeError:
+                        pass
+
+        if parsed is None:
+            # Recover percentage fields even when model JSON is malformed.
             def find_num(names):
                 for name in names:
                     m = re.search(r'[`"\']?' + re.escape(name) + r'[`"\']?\s*[:=]\s*(-?\d+(?:\.\d+)?)', clean_text, re.I)
@@ -233,7 +324,7 @@ class OllamaSentimentAnalyzer:
                 dist = self._normalize_distribution(pos or 0, neg or 0, neu or 0)
             reason_m = re.search(r'[`"\']?reason[`"\']?\s*[:=]\s*[`"\']?(.*?)[`"\']?(?:,|\n|\}|$)', clean_text, re.I)
             entity_m = re.search(r'[`"\']?entity_found[`"\']?\s*[:=]\s*(true|false)', clean_text, re.I)
-            reason = reason_m.group(1).strip() if reason_m else clean_text[:100].replace("\n", " ")
+            reason = _clean_reason(reason_m.group(1)) if reason_m else _clean_reason(clean_text[:100].replace("\n", " "))
             entity_found = entity_m.group(1).lower() == "true" if entity_m else True
             return {"ai_sentiment": self._distribution_to_sentiment(**dist),
                     "reason": reason, "entity_found": entity_found, **dist}
@@ -251,12 +342,7 @@ class OllamaSentimentAnalyzer:
         else:
             dist = self._normalize_distribution(pos or 0, neg or 0, neu or 0)
 
-        reason = parsed.get("reason", "")
-        if isinstance(reason, str):
-            reason = re.sub(r'\(?\s*(?:ตาม)?กฎข้อ\s*[\d\s,และ|-]+\)?', '', reason, flags=re.I)
-            reason = re.sub(r'\(?\s*Rule\s*[\d\s,and|-]+\)?', '', reason, flags=re.I).strip()
-        else:
-            reason = ""
+        reason = _clean_reason(parsed.get("reason", ""))
         entity_found = parsed.get("entity_found", True)
         if isinstance(entity_found, str):
             entity_found = entity_found.lower() in ("true", "1")
@@ -274,8 +360,10 @@ class OllamaSentimentAnalyzer:
         if not result_text:
             return True
 
-        clean_text = re.sub(r'<think>.*?</think>', '', result_text, flags=re.DOTALL).strip()
-        clean_text = clean_text.replace('```json', '').replace('```', '').strip()
+        clean_text = re.sub(r'<think>.*?</think>', '', result_text, flags=re.DOTALL)
+        clean_text = re.sub(r'<thought>.*?</thought>', '', clean_text, flags=re.DOTALL)
+        clean_text = re.sub(r'<(?:think|thought)>.*?(?=(?:```|\[|\{|$))', '', clean_text, flags=re.DOTALL).strip()
+        clean_text = re.sub(r'```(?:json)?\s*', '', clean_text).replace('```', '').strip()
 
         json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
         if json_match:
@@ -283,17 +371,23 @@ class OllamaSentimentAnalyzer:
 
         try:
             parsed = json.loads(clean_text)
-            triage_val = str(parsed.get("triage", "yes")).strip().lower()
-            return triage_val in ("yes", "true", "1")
+            if isinstance(parsed, dict):
+                triage_val = str(parsed.get("triage", "yes")).strip().lower()
+                return triage_val in ("yes", "true", "1")
         except json.JSONDecodeError:
-            triage_match = re.search(r'[`"\']?triage[`"\']?\s*[:=]\s*[`"\']?(yes|no|true|false)[`"\']?', clean_text, re.IGNORECASE)
-            if triage_match:
-                val = triage_match.group(1).lower()
-                return val in ("yes", "true")
-            return True
+            pass
+
+        triage_match = re.search(r'[`"\']?triage[`"\']?\s*[:=]\s*[`"\']?(yes|no|true|false)[`"\']?', clean_text, re.IGNORECASE)
+        if triage_match:
+            val = triage_match.group(1).lower()
+            return val in ("yes", "true")
+        return True
 
     def _triage_post(self, post_id, content, actual_target=""):
         """PASS 1: conservative relevance + sentiment triage."""
+        if not content or not str(content).strip():
+            return False
+
         triage_system = (
             "You are a fast, conservative triage classifier for Thai social-media sentiment monitoring.\n"
             "Decide ONLY whether this post should be sent to a deeper sentiment analysis model.\n"
@@ -368,11 +462,11 @@ class OllamaSentimentAnalyzer:
             '{"entity_found":true,"reason":"ผู้ใช้แสดงความไม่พอใจอย่างมาก","positive_percent":0,"negative_percent":80,"neutral_percent":20}'
         )
         validation_models = [
-            "api:gemma-4-31b-it",
             "api:gemma-4-26b-a4b-it",
-            "api:gemini-3.5-flash-lite",
+            "api:gemma-4-31b-it",
             "api:gemini-3.1-flash-lite",
             "api:gemini-2.5-flash",
+            "api:gemini-3.5-flash-lite",
         ]
         for val_model in validation_models:
             actual_api_model = val_model.replace("api:", "", 1)
@@ -392,11 +486,18 @@ class OllamaSentimentAnalyzer:
     # Main Pipeline: 2-Pass (Triage → Deep Analysis)
     # -----------------------------------------------------------------
     def _analyze_single_post(self, post, company_name=""):
-        post_id = str(post.get("match_post_id") or post.get("post_id", ""))
-        keywords = post.get("keywords", [])
+        post_id = str(post.get("match_post_id") or post.get("post_id") or post.get("id", ""))
+        raw_kw = post.get("keywords")
+        if isinstance(raw_kw, str):
+            keywords = [k.strip() for k in raw_kw.split(",") if k.strip()]
+        elif isinstance(raw_kw, (list, tuple)):
+            keywords = [str(k).strip() for k in raw_kw if str(k).strip()]
+        else:
+            keywords = []
+
         kw_name = post.get("keyword_name", "")
         if not keywords and kw_name:
-            keywords = [k.strip() for k in kw_name.split(",") if k.strip()]
+            keywords = [k.strip() for k in str(kw_name).split(",") if k.strip()]
 
         actual_target = post.get("actual_target")
         if not actual_target:
@@ -418,12 +519,13 @@ class OllamaSentimentAnalyzer:
 
         first_keyword = keywords[0] if keywords else ""
 
-        if "full_text" in post and first_keyword:
-            content = get_keyword_context(post["full_text"], str(first_keyword), window=150)
-            expanded_content = get_keyword_context(post["full_text"], str(first_keyword), window=300)
+        full_text = post.get("full_text") or post.get("content", "") or ""
+        if full_text and first_keyword:
+            content = get_keyword_context(full_text, str(first_keyword), window=150)
+            expanded_content = get_keyword_context(full_text, str(first_keyword), window=300)
         else:
-            content = post.get("content", "")
-            expanded_content = content
+            content = full_text
+            expanded_content = full_text
 
         # --- PASS 1: Fast Triage (Qwen 8B Local) ---
         has_sentiment = self._triage_post(post_id, content, actual_target)
@@ -489,52 +591,63 @@ class SentimentAPI:
             'Content-Type': 'application/json'
         }
 
-    def fetch_pending(self, date_from, date_to):
+    def fetch_pending(self, date_from, date_to, retries=3, delay=2):
         url = f"{BE_API_BASE_URL}/internal/sentiment/pending?date_from={date_from}&date_to={date_to}"
         print(f"\n🌐 [Flow 1: REST API] กำลังดึงข้อมูลผ่าน REST API...")
-        try:
-            response = requests.get(url, headers=self.headers, timeout=60)
-            if response.status_code == 200:
-                data = response.json()
-                if isinstance(data, list):
-                    return data
-                elif isinstance(data, dict) and "data" in data:
-                    return data["data"]
-                elif isinstance(data, dict) and "results" in data:
-                    return data["results"]
+        for attempt in range(1, retries + 1):
+            try:
+                response = requests.get(url, headers=self.headers, timeout=60)
+                if response.status_code == 200:
+                    data = response.json()
+                    if isinstance(data, list):
+                        return data
+                    elif isinstance(data, dict) and "data" in data:
+                        return data["data"]
+                    elif isinstance(data, dict) and "results" in data:
+                        return data["results"]
+                    else:
+                        print("⚠️ API คืนค่ามาในรูปแบบที่ไม่คาดคิด (ไม่มีฟิลด์ list/data)")
+                        return []
                 else:
-                    print("⚠️ API คืนค่ามาในรูปแบบที่ไม่คาดคิด (ไม่มีฟิลด์ list/data)")
-                    return []
-            else:
-                print(f"❌ API Fetch Error {response.status_code}: {response.text}")
-                return []
-        except Exception as e:
-            print(f"❌ Exception in fetch_pending: {e}")
-            return []
+                    print(f"❌ API Fetch Error (attempt {attempt}/{retries}) {response.status_code}: {response.text}")
+                    if attempt < retries:
+                        time.sleep(delay)
+            except Exception as e:
+                print(f"❌ Exception in fetch_pending (attempt {attempt}/{retries}): {e}")
+                if attempt < retries:
+                    time.sleep(delay)
+        return []
 
-    def bulk_update(self, results):
+    def bulk_update(self, results, retries=3, delay=2):
         if not results:
-            return
+            return False
             
         url = f"{BE_API_BASE_URL}/internal/sentiment/results"
         payload = {"results": results}
         
-        try:
-            response = requests.post(url, headers=self.headers, json=payload, timeout=60)
-            if response.status_code in [200, 201]:
-                try:
-                    resp_body = response.json()
-                    actual_updated = resp_body.get("updated", "?")
-                    not_found = resp_body.get("not_found", [])
-                    print(f"  ✅ [REST API] บันทึกข้อมูลสำเร็จ (ส่ง {len(results)} โพสต์ → API อัปเดตจริง {actual_updated} รายการ)")
-                    if not_found:
-                        print(f"  ⚠️ [REST API] ไม่พบ match_post_id เหล่านี้ในระบบ: {not_found}")
-                except Exception:
-                    print(f"  ✅ [REST API] บันทึกข้อมูลสำเร็จ ({len(results)} โพสต์)")
-            else:
-                print(f"  ❌ API Update Error {response.status_code}: {response.text}")
-        except Exception as e:
-            print(f"  ❌ Exception in bulk_update: {e}")
+        for attempt in range(1, retries + 1):
+            try:
+                response = requests.post(url, headers=self.headers, json=payload, timeout=60)
+                if response.status_code in [200, 201]:
+                    try:
+                        resp_body = response.json()
+                        actual_updated = resp_body.get("updated", "?")
+                        not_found = resp_body.get("not_found", [])
+                        print(f"  ✅ [REST API] บันทึกข้อมูลสำเร็จ (ส่ง {len(results)} โพสต์ → API อัปเดตจริง {actual_updated} รายการ)")
+                        if not_found:
+                            print(f"  ⚠️ [REST API] ไม่พบ match_post_id เหล่านี้ในระบบ: {not_found}")
+                    except Exception:
+                        print(f"  ✅ [REST API] บันทึกข้อมูลสำเร็จ ({len(results)} โพสต์)")
+                    return True
+                else:
+                    print(f"  ❌ API Update Error (attempt {attempt}/{retries}) {response.status_code}: {response.text}")
+                    if attempt < retries:
+                        time.sleep(delay)
+            except Exception as e:
+                print(f"  ❌ Exception in bulk_update (attempt {attempt}/{retries}): {e}")
+                if attempt < retries:
+                    time.sleep(delay)
+        return False
 
     def run(self, date_from, date_to, save_db=True):
         date_from = validate_date_str(date_from)
@@ -557,21 +670,27 @@ class SentimentAPI:
             posts_for_ai = []
             for post in batch:
                 content = post.get("content", "")
-                text = re.sub(r"<[^>]+>", "", str(content))
+                raw_content = "" if content is None or str(content).strip().lower() == "none" else str(content)
+                text = re.sub(r"<[^>]+>", "", raw_content)
                 text = re.sub(r"\s+", " ", text).strip()
                 
-                keywords = post.get("keywords", [])
-                keyword = str(keywords[0]) if keywords else str(post.get("project_id", ""))
+                raw_kw = post.get("keywords")
+                if isinstance(raw_kw, str):
+                    keywords = [k.strip() for k in raw_kw.split(",") if k.strip()]
+                elif isinstance(raw_kw, (list, tuple)):
+                    keywords = [str(k).strip() for k in raw_kw if str(k).strip()]
+                else:
+                    keywords = []
+                keyword = keywords[0] if keywords else str(post.get("project_id", "") or "")
                 clean_short_content = get_keyword_context(text, keyword, window=150)
                 
                 modified_post = post.copy()
                 modified_post["content"] = clean_short_content
                 modified_post["full_text"] = text
+                modified_post["keywords"] = keywords
                 posts_for_ai.append(modified_post)
 
-            json_str = json.dumps(posts_for_ai, ensure_ascii=False)
-            
-            ollama_response = self.ollama.analyze_post_sentiments(json_str)
+            ollama_response = self.ollama.analyze_post_sentiments(posts_for_ai)
             ollama_results = ollama_response.get("data", [])
             
             ollama_map = {}
@@ -589,7 +708,9 @@ class SentimentAPI:
 
             api_results = []
             for idx, post_for_ai in enumerate(posts_for_ai, 1):
-                match_post_id = str(post_for_ai.get("match_post_id", ""))
+                match_post_id = str(post_for_ai.get("match_post_id") or post_for_ai.get("post_id") or post_for_ai.get("id", ""))
+                if not match_post_id:
+                    continue
                 ai_content = post_for_ai.get("content", "").replace("\n", " ")
                 
                 if len(ai_content) > 120:
@@ -637,6 +758,7 @@ class SentimentAPI:
                     print(f"       🔑 Keyword: {keyword_str}")
                     print(f"       🔗 Source: {feed_link}")
                     print(f"       📄 Content: {ai_content}")
+                    print(f"       📊 Distribution: POS {ollama_map[match_post_id]['positive_percent']}% | NEG {ollama_map[match_post_id]['negative_percent']}% | NEU {ollama_map[match_post_id]['neutral_percent']}% | Legacy={raw_val}")
                     if ai_reason:
                         print(f"       💡 Reason: {ai_reason}")
                     print(f"  {'-'*90}")
@@ -653,20 +775,15 @@ class SentimentAPI:
 # =============================================================================
 class SentimentDB:
     def __init__(self, config=None, analyzer=None):
+        # หมายเหตุ: credentials (user/password) จัดการโดย connection.py ผ่าน .env เท่านั้น — ห้าม hardcode ในโค้ด
         self.config = config or {
             "mysql_host_1":   os.environ.get("MYSQL_HOST_1",   "10.130.84.170"),
             "mysql_host_2":   os.environ.get("MYSQL_HOST_2",   "10.130.69.57"),
-            "mysql_port":     int(os.environ.get("MYSQL_PORT", 3306)),
-            "mysql_user":     os.environ.get("MYSQL_USER",     "blueeyeremote"),
-            "mysql_password": os.environ.get("MYSQL_PASSWORD", "BEremotemysql3075"),
             "mysql_db":       os.environ.get("MYSQL_DB",       "blue_eye"),
-            "mongo_host":     os.environ.get("MONGO_HOST",     "10.130.72.139"),
-            "mongo_port":     int(os.environ.get("MONGO_PORT", 34596)),
-            "mongo_user":     os.environ.get("MONGO_USER",     "blueeyeharvest"),
-            "mongo_password": os.environ.get("MONGO_PASSWORD", "BEharvest3075"),
             "mongo_db":       os.environ.get("MONGO_DB",       "blue_eye"),
         }
         self.ollama = analyzer or OllamaSentimentAnalyzer()
+        self.review_offset = 0
 
     def get_content(self, list_id_with_info, collection):
         list_content = []
@@ -681,6 +798,7 @@ class SentimentDB:
 
         for attempt in range(1, 4):
             try:
+                attempt_content = []
                 DB_CONNECTION = CONN.get_mongo_client()
                 if DB_CONNECTION is None:
                     raise Exception("Mongo Client connection returned None")
@@ -691,7 +809,7 @@ class SentimentDB:
                 columnName = "feedcontent" if collection == "Feed" else "commentcontent"
 
                 for e in result:
-                    feedcontent = e.get(columnName, "")
+                    feedcontent = e.get(columnName) or ""
                     msg_id = e["_id"]
                     comp_name = company_map.get(msg_id, "")
                     proj_name = project_map.get(msg_id, "")
@@ -699,7 +817,8 @@ class SentimentDB:
                     kw_name   = keyword_map.get(msg_id, "")
                     if not post_user:
                         post_user = str(msg_id).split("_")[0]
-                    list_content.append((msg_id, feedcontent, comp_name, proj_name, post_user, kw_name))
+                    attempt_content.append((msg_id, feedcontent, comp_name, proj_name, post_user, kw_name))
+                list_content = attempt_content
                 break
             except Exception as e:
                 print(f"❌ Error fetching Mongo content (Attempt {attempt}/3): {e}")
@@ -710,15 +829,61 @@ class SentimentDB:
 
         return list_content
 
-    def analysis(self, list_content, host, server=1, table_prefix="own_match", save_db=True):
-        if not list_content or CONN is None:
+    def mark_missing_content(self, missing_ids, host, server=1, table_prefix="own_match"):
+        """บันทึกสถานะให้โพสต์ที่ไม่มีใน MongoDB เพื่อไม่ให้ค้างอยู่ในคิว sentiment_status = '0'"""
+        if not missing_ids or CONN is None:
             return
-
+        tunnel, DB_CONNECTION = None, None
         try:
             tunnel, DB_CONNECTION = CONN.get_mysql_connection(server=server, host=host, database=self.config["mysql_db"])
+            cursor = None
+            try:
+                cursor = DB_CONNECTION.cursor()
+                for msg_id in missing_ids:
+                    for tbl in [table_prefix, f"{table_prefix}_daily", f"{table_prefix}_3months"]:
+                        try:
+                            cursor.execute(
+                                f'UPDATE `{tbl}` SET `{table_prefix}_sentiment` = %s, `sentiment_status` = %s, `ai_reason` = %s WHERE msg_id = %s',
+                                (0.00, "1", "Content not found in MongoDB", str(msg_id))
+                            )
+                        except Exception:
+                            pass
+                DB_CONNECTION.commit()
+                print(f"  ⚠️ เคลียร์โพสต์ที่ไม่มีใน MongoDB ({len(missing_ids)} โพสต์) -> ปรับ status='1' เพื่อไม่ให้ค้างคิว")
+            finally:
+                if cursor is not None:
+                    try:
+                        cursor.close()
+                    except Exception:
+                        pass
         except Exception as e:
-            print(f"❌ Error connecting to MySQL Server {server} ({host}): {e}")
+            print(f"  ❌ Error marking missing content: {e}")
+        finally:
+            if DB_CONNECTION:
+                try:
+                    DB_CONNECTION.close()
+                except Exception:
+                    pass
+            if tunnel:
+                try:
+                    tunnel.stop()
+                except Exception:
+                    pass
+
+    def analysis(self, list_content, host, server=1, table_prefix="own_match", save_db=True):
+        if not list_content:
             return
+
+        tunnel, DB_CONNECTION = None, None
+        if save_db:
+            if CONN is None:
+                print("⚠️ [Direct DB] ไม่สามารถเชื่อมต่อ DB ได้เนื่องจากเชื่อมต่อ connection module ล้มเหลว")
+                return
+            try:
+                tunnel, DB_CONNECTION = CONN.get_mysql_connection(server=server, host=host, database=self.config["mysql_db"])
+            except Exception as e:
+                print(f"❌ Error connecting to MySQL Server {server} ({host}): {e}")
+                return
 
         try:
             BATCH_SIZE = 5
@@ -734,8 +899,10 @@ class SentimentDB:
                 posts_for_ai = []
                 batch_company_name = ""
                 batch_project_name = ""
+                empty_text_ids = []
                 for (_id, content, company_name, project_name, post_user, kw_name) in batch:
-                    text = re.sub(r"<[^>]+>", "", str(content))
+                    raw_content = "" if content is None or str(content).strip().lower() == "none" else str(content)
+                    text = re.sub(r"<[^>]+>", "", raw_content)
                     text = re.sub(r"\s+", " ", text).strip()
 
                     if not batch_company_name and company_name:
@@ -761,26 +928,41 @@ class SentimentDB:
                             "content": clean_short_content,
                             "full_text": text
                         })
-
-                if not posts_for_ai:
-                    continue
-
-                json_str = json.dumps(posts_for_ai, ensure_ascii=False)
-                target_label = f"{'COMPETITOR' if is_competitor else 'OWN'} | Company: {batch_company_name} | Proj: {batch_project_name}"
-                print(f"  🚀 ส่ง {len(posts_for_ai)} โพสต์ไปยัง Ollama ({target_label})")
-
-                ollama_response = self.ollama.analyze_post_sentiments(json_str, batch_company_name)
-                ollama_results = ollama_response.get("data", [])
+                    else:
+                        empty_text_ids.append(str(_id))
 
                 ollama_map = {}
-                if isinstance(ollama_results, list):
-                    for res in ollama_results:
-                        if "post_id" in res and "ai_sentiment" in res:
-                            ollama_map[str(res["post_id"])] = {
-                                "ai_sentiment": res["ai_sentiment"],
-                                "confidence": res.get("confidence", 0),
-                                "reason": res.get("reason", "")
-                            }
+                for eid in empty_text_ids:
+                    ollama_map[eid] = {
+                        "ai_sentiment": 0,
+                        "positive_percent": 0,
+                        "negative_percent": 0,
+                        "neutral_percent": 100,
+                        "confidence": 0,
+                        "reason": "ไม่มีข้อความให้วิเคราะห์"
+                    }
+
+                if posts_for_ai:
+                    target_label = f"{'COMPETITOR' if is_competitor else 'OWN'} | Company: {batch_company_name} | Proj: {batch_project_name}"
+                    print(f"  🚀 ส่ง {len(posts_for_ai)} โพสต์ไปยัง Ollama ({target_label})")
+
+                    ollama_response = self.ollama.analyze_post_sentiments(posts_for_ai, batch_company_name)
+                    ollama_results = ollama_response.get("data", [])
+
+                    if isinstance(ollama_results, list):
+                        for res in ollama_results:
+                            if "post_id" in res and "ai_sentiment" in res:
+                                ollama_map[str(res["post_id"])] = {
+                                    "ai_sentiment": res["ai_sentiment"],
+                                    "positive_percent": res.get("positive_percent", 0),
+                                    "negative_percent": res.get("negative_percent", 0),
+                                    "neutral_percent": res.get("neutral_percent", 100),
+                                    "confidence": res.get("confidence", 0),
+                                    "reason": res.get("reason", "")
+                                }
+
+                if not ollama_map:
+                    continue
 
                 print(f"\n  📊 สรุปผลลัพธ์จาก Ollama (สำเร็จ {len(ollama_map)}/{len(batch)} โพสต์)")
                 print(f"  {'-'*90}")
@@ -810,6 +992,8 @@ class SentimentDB:
                         original_preview = original_preview[:120] + "..."
 
                     print(f"  [{idx:02d}] 🆔 {str_id[:15]:<15} | {icon:<11} | User: {str(post_user)[:12]:<12} | Target: {actual_target[:15]:<15}")
+                    if str_id in ollama_map:
+                        print(f"       📊 Distribution: POS {ollama_map[str_id].get('positive_percent', 0)}% | NEG {ollama_map[str_id].get('negative_percent', 0)}% | NEU {ollama_map[str_id].get('neutral_percent', 100)}% | Legacy={ollama_val}")
                     if ai_reason:
                         print(f"       💡 Reason: {ai_reason}")
                     print(f"       📄 Content: {original_preview}")
@@ -818,27 +1002,49 @@ class SentimentDB:
                 if save_db:
                     try:
                         DB_CONNECTION.ping(reconnect=True)
-                    except Exception as e:
-                        print(f"  ⚠️ Warning: MySQL Ping/Reconnect failed: {e}")
+                    except Exception:
+                        try:
+                            if DB_CONNECTION:
+                                try: DB_CONNECTION.close()
+                                except Exception: pass
+                            if tunnel:
+                                try: tunnel.stop()
+                                except Exception: pass
+                            tunnel, DB_CONNECTION = CONN.get_mysql_connection(server=server, host=host, database=self.config["mysql_db"])
+                        except Exception as reconn_err:
+                            print(f"  ❌ Reconnecting to MySQL failed: {reconn_err}")
+                            DB_CONNECTION = None
                     
-                    cursor = DB_CONNECTION.cursor()
-                    
-                    for (_id, content, company_name, project_name, post_user, kw_name) in batch:
-                        str_id = str(_id)
-                        if str_id not in ollama_map:
-                            continue
-                        sentiment_val = float(ollama_map[str_id]["ai_sentiment"])
-                        ai_reason_val = ollama_map[str_id].get("reason", "") or ""
-                    
-                        for tbl in [table_prefix, f"{table_prefix}_daily", f"{table_prefix}_3months"]:
-                            cursor.execute(
-                                f'UPDATE `{tbl}` SET `{table_prefix}_sentiment` = %s, `sentiment_status` = %s, `ai_reason` = %s WHERE msg_id = %s',
-                                (sentiment_val, "1", ai_reason_val, str(_id))
-                            )
-                    
-                    DB_CONNECTION.commit()
-                    cursor.close()
-                    print(f"  💾 บันทึกลง MySQL เรียบร้อย ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
+                    if DB_CONNECTION is not None:
+                        cursor = None
+                        try:
+                            cursor = DB_CONNECTION.cursor()
+                            for (_id, content, company_name, project_name, post_user, kw_name) in batch:
+                                str_id = str(_id)
+                                if str_id not in ollama_map:
+                                    continue
+                                sentiment_val = float(ollama_map[str_id]["ai_sentiment"])
+                                ai_reason_val = ollama_map[str_id].get("reason", "") or ""
+                            
+                                for tbl in [table_prefix, f"{table_prefix}_daily", f"{table_prefix}_3months"]:
+                                    try:
+                                        cursor.execute(
+                                            f'UPDATE `{tbl}` SET `{table_prefix}_sentiment` = %s, `sentiment_status` = %s, `ai_reason` = %s WHERE msg_id = %s',
+                                            (sentiment_val, "1", ai_reason_val, str(_id))
+                                        )
+                                    except Exception as tbl_err:
+                                        print(f"    ⚠️ Warning updating {tbl}: {tbl_err}")
+                            
+                            DB_CONNECTION.commit()
+                        finally:
+                            if cursor is not None:
+                                try:
+                                    cursor.close()
+                                except Exception:
+                                    pass
+                        print(f"  💾 บันทึกลง MySQL เรียบร้อย ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
+                    else:
+                        print(f"  ❌ ไม่สามารถบันทึกลง MySQL ได้เนื่องจากการเชื่อมต่อ DB ล้มเหลว")
                 else:
                     print(f"  🚫 [MOCKUP DB] ข้ามการบันทึกลง MySQL ({len([x for x in batch if str(x[0]) in ollama_map])} โพสต์)")
 
@@ -857,11 +1063,24 @@ class SentimentDB:
                     pass
 
     def run(self, date_from, date_to, save_db=True):
+        date_from = validate_date_str(date_from)
+        date_to = validate_date_str(date_to)
+
         if CONN is None:
             print("⚠️ [Direct DB] ไม่สามารถเชื่อมต่อ DB ได้เนื่องจากเชื่อมต่อ connection module ล้มเหลว")
             return 0
 
         total_processed_posts = 0
+
+        # Pagination logic:
+        # - ถ้า save_db=True (บันทึกจริง): offset ต้องเป็น 0 เสมอ เพราะแถวที่ทำเสร็จจะเปลี่ยนเป็น status='1' หลุดจากคิวไปเอง
+        # - ถ้า save_db=False (Mock Mode): เลื่อน offset ตาม review_offset เพื่อเปิดดูหน้าถัดไปเรื่อยๆ โดยไม่ซ้ำชุดเดิม
+        if save_db:
+            offset = 0
+        else:
+            page_size = 100
+            offset = self.review_offset * page_size
+            print(f"📄 [Direct DB Mock] Review cycle={self.review_offset} (OFFSET {offset})")
 
         targets = [
             {
@@ -879,7 +1098,8 @@ class SentimentDB:
                     f"WHERE date(omd.msg_time) BETWEEN '{date_from}' AND '{date_to}' "
                     f"AND omd.sentiment_status = '0' AND omd.match_type = 'Feed' "
                     f"GROUP BY omd.msg_id, company_name, project_name, post_user "
-                    f"ORDER BY omd.msg_time ASC "
+                    f"ORDER BY MIN(omd.msg_time) ASC "
+                    f"LIMIT 100 OFFSET {offset}"
                 ),
                 "sql_comment": (
                     f"SELECT omd.msg_id, IFNULL(c.company_name, '') as company_name, "
@@ -893,7 +1113,8 @@ class SentimentDB:
                     f"WHERE date(omd.msg_time) BETWEEN '{date_from}' AND '{date_to}' "
                     f"AND omd.sentiment_status = '0' AND omd.match_type = 'Comment' "
                     f"GROUP BY omd.msg_id, company_name, project_name, post_user "
-                    f"ORDER BY omd.msg_time ASC "
+                    f"ORDER BY MIN(omd.msg_time) ASC "
+                    f"LIMIT 100 OFFSET {offset}"
                 )
             },
             {
@@ -911,7 +1132,8 @@ class SentimentDB:
                     f"WHERE date(cmd.msg_time) BETWEEN '{date_from}' AND '{date_to}' "
                     f"AND cmd.sentiment_status = '0' AND cmd.match_type = 'Feed' "
                     f"GROUP BY cmd.msg_id, company_name, project_name, post_user "
-                    f"ORDER BY cmd.msg_time ASC "
+                    f"ORDER BY MIN(cmd.msg_time) ASC "
+                    f"LIMIT 100 OFFSET {offset}"
                 ),
                 "sql_comment": (
                     f"SELECT cmd.msg_id, IFNULL(c.company_name, '') as company_name, "
@@ -925,7 +1147,8 @@ class SentimentDB:
                     f"WHERE date(cmd.msg_time) BETWEEN '{date_from}' AND '{date_to}' "
                     f"AND cmd.sentiment_status = '0' AND cmd.match_type = 'Comment' "
                     f"GROUP BY cmd.msg_id, company_name, project_name, post_user "
-                    f"ORDER BY cmd.msg_time ASC "
+                    f"ORDER BY MIN(cmd.msg_time) ASC "
+                    f"LIMIT 100 OFFSET {offset}"
                 )
             }
         ]
@@ -951,7 +1174,14 @@ class SentimentDB:
                     )
                     list_id_feed = [(x[0], x[1], x[2], x[3], x[4]) for x in (_item_feed or [])]
                     print(f"  👉 พบข้อมูลจาก Feed: {len(list_id_feed)} โพสต์")
-                    list_content = self.get_content(list_id_feed, "Feed")
+                    feed_content = self.get_content(list_id_feed, "Feed")
+                    list_content += feed_content
+
+                    if save_db and list_id_feed:
+                        found_feed_ids = {item[0] for item in feed_content}
+                        missing_feed_ids = [x[0] for x in list_id_feed if x[0] not in found_feed_ids]
+                        if missing_feed_ids:
+                            self.mark_missing_content(missing_feed_ids, current_host, server=server_id, table_prefix=target["table_prefix"])
                 except Exception as e:
                     print(f"  ❌ Error querying Feed SQL: {e}")
 
@@ -965,7 +1195,14 @@ class SentimentDB:
                     )
                     list_id_comment = [(x[0], x[1], x[2], x[3], x[4]) for x in (_item_comment or [])]
                     print(f"  👉 พบข้อมูลจาก Comment: {len(list_id_comment)} โพสต์")
-                    list_content += self.get_content(list_id_comment, "Comment")
+                    comment_content = self.get_content(list_id_comment, "Comment")
+                    list_content += comment_content
+
+                    if save_db and list_id_comment:
+                        found_comment_ids = {item[0] for item in comment_content}
+                        missing_comment_ids = [x[0] for x in list_id_comment if x[0] not in found_comment_ids]
+                        if missing_comment_ids:
+                            self.mark_missing_content(missing_comment_ids, current_host, server=server_id, table_prefix=target["table_prefix"])
                 except Exception as e:
                     print(f"  ❌ Error querying Comment SQL: {e}")
 
@@ -978,7 +1215,19 @@ class SentimentDB:
                 else:
                     print(f"  ⏩ ไม่มีข้อมูลใหม่สำหรับ {target['name']} (Server {server_id})")
 
+        # เลื่อนหน้า review สำหรับรอบถัดไป เฉพาะโหมด Mock (save_db=False)
+        if not save_db:
+            if total_processed_posts == 0 and self.review_offset > 0:
+                self.review_offset = 0
+            else:
+                self.review_offset += 1
+        else:
+            self.review_offset = 0
         return total_processed_posts
+
+
+# Backward compatibility alias
+sentiment = SentimentDB
 
 
 # =============================================================================

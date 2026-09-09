@@ -166,13 +166,21 @@ class DatabaseConnection():
             if database == "blue_eye":
                 server = kwargs.get("server")
                 remote_host = kwargs.get("host")
+                try:
+                    server_key = int(server)
+                except (ValueError, TypeError):
+                    server_key = 1
+
+                ssh_host = SSH_MYSQL_HOST.get(server_key, "")
+                ssh_user = SSH_MYSQL_USER.get(server_key, "")
+                ssh_pass = SSH_MYSQL_PASSWORD.get(server_key, "")
 
                 for attempt in range(1, 4):
                     try:
                         with SSHTunnelForwarder(
-                            (SSH_MYSQL_HOST[server], SSH_MYSQL_PORT),
-                            ssh_username=SSH_MYSQL_USER[server],
-                            ssh_password=SSH_MYSQL_PASSWORD[server],
+                            (ssh_host, SSH_MYSQL_PORT),
+                            ssh_username=ssh_user,
+                            ssh_password=ssh_pass,
                             remote_bind_address=(remote_host, BE_MYSQL_PORT),
                             set_keepalive=30
                         ) as tunnel:
@@ -200,7 +208,7 @@ class DatabaseConnection():
                 return ()
 
             else:
-                MYSQL_DB_CONNECTION = pymysql.connect(
+                conn = pymysql.connect(
                     host = os.environ.get("DO_MYSQL_HOST", ""),
                     port = int(os.environ.get("DO_MYSQL_PORT", 25060)),
                     user = os.environ.get("DO_MYSQL_USER", ""),
@@ -208,21 +216,22 @@ class DatabaseConnection():
                     db = os.environ.get("DO_MYSQL_DB", "blueeye"),
                     charset = "utf8"
                 )
-                CURSOR = MYSQL_DB_CONNECTION.cursor()
-                CURSOR.execute(query)
-                result = CURSOR.fetchall()
-
-                MYSQL_DB_CONNECTION.close()
-                return result
+                try:
+                    with conn.cursor() as cursor:
+                        cursor.execute(query)
+                        return cursor.fetchall()
+                finally:
+                    conn.close()
             
             # ถ้าอยากรองรับ DB แบบอื่น ค่อยมาเติมด้านล่าง
             # raise ValueError("Unsupported DB or database in getfromdb")
 
         elif db_type == "mongodb":
+            result = []
             if database == "blue_eye":
                 if kwargs.get("__type") == "update_engagement":
                     DB_CONNECTION = self._get_mongo_client()
-                    if True:
+                    if DB_CONNECTION is not None:
                         DB = DB_CONNECTION[database]
                     
                         # Collections Definitions
@@ -238,10 +247,13 @@ class DatabaseConnection():
 
                         proj = {"_id": 1, "feedlink": 1}
                         result = list(COLL_dailyfeed.find(flt, proj))
+                    else:
+                        print("❌ MongoDB client connection returned None in update_engagement")
+                        result = []
 
                 elif kwargs.get("__type") == "thumbnail":
                     DB_CONNECTION = self._get_mongo_client()
-                    if True:
+                    if DB_CONNECTION is not None:
                         DB = DB_CONNECTION[database]
 
                         coll_dailyfeed = DB["DairyFeed"] # collection dairyFeed
@@ -260,27 +272,45 @@ class DatabaseConnection():
                         # ดึงเฉพาะ field ที่ต้องใช้ก็ได้ จะเร็วขึ้นนิดหน่อย
                         cursor = coll_3monthsfeed.find(query, {"_id": 1, "feedlink": 1, "thumbnails": 1})
                         return list(cursor)
+                    else:
+                        print("❌ MongoDB client connection returned None in thumbnail query")
+                        return []
                 else:
                     DB_CONNECTION = self._get_mongo_client()
-                    DB = DB_CONNECTION[database]
-                    COLL_dailyfeed = DB["DairyFeed"] # collection dairyfeed
-                    COLL_feed = DB["Feed"] # collection feed
-                    count_daily = COLL_dailyfeed.count_documents({ "_id": {"$regex": query } })
-                    count_feed = COLL_feed.count_documents({ "_id": {"$regex": query } })
-                    result = count_daily + count_feed
+                    if DB_CONNECTION is not None:
+                        DB = DB_CONNECTION[database]
+                        COLL_dailyfeed = DB["DairyFeed"] # collection dairyfeed
+                        COLL_feed = DB["Feed"] # collection feed
+                        count_daily = COLL_dailyfeed.count_documents({ "_id": {"$regex": query } })
+                        count_feed = COLL_feed.count_documents({ "_id": {"$regex": query } })
+                        result = count_daily + count_feed
+                    else:
+                        print("❌ MongoDB client connection returned None in count query")
+                        result = 0
 
             # DB_CONNECTION.close() # Shared connection should not be closed
-        return result
+            return result
+        return ()
 
     # ─── MySQL Connection สำหรับ UPDATE/INSERT (ต้อง commit เอง) ─
     def get_mysql_connection(self, server=1, host="10.130.84.170", database="blue_eye", retries=3, delay=3):
         """คืนค่า (tunnel, conn) เพื่อเอาไปใช้กับ UPDATE/INSERT พร้อมระบบ Retry"""
+        try:
+            server_key = int(server)
+        except (ValueError, TypeError):
+            server_key = 1
+
+        ssh_host = SSH_MYSQL_HOST.get(server_key, "")
+        ssh_user = SSH_MYSQL_USER.get(server_key, "")
+        ssh_pass = SSH_MYSQL_PASSWORD.get(server_key, "")
+
         for attempt in range(1, retries + 1):
+            tunnel = None
             try:
                 tunnel = SSHTunnelForwarder(
-                    (SSH_MYSQL_HOST[server], SSH_MYSQL_PORT),
-                    ssh_username=SSH_MYSQL_USER[server],
-                    ssh_password=SSH_MYSQL_PASSWORD[server],
+                    (ssh_host, SSH_MYSQL_PORT),
+                    ssh_username=ssh_user,
+                    ssh_password=ssh_pass,
                     remote_bind_address=(host, BE_MYSQL_PORT),
                     set_keepalive=30
                 )
@@ -298,7 +328,7 @@ class DatabaseConnection():
                 return tunnel, conn
             except Exception as e:
                 print(f"⚠️ [MySQL Connection Server {server}] พยายามเชื่อมต่อครั้งที่ {attempt}/{retries} ล้มเหลว: {e}")
-                if 'tunnel' in locals() and tunnel:
+                if tunnel:
                     try:
                         tunnel.stop()
                     except Exception:
