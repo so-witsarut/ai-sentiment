@@ -178,6 +178,7 @@ class OllamaSentimentAnalyzer:
         return None
 
     def _call_ollama_generic(self, model_name, system_instruction, user_prompt):
+        deep_timeout = int(os.environ.get("OLLAMA_DEEP_TIMEOUT", 30))
         payload_generate = {
             "model": model_name,
             "system": system_instruction,
@@ -187,12 +188,16 @@ class OllamaSentimentAnalyzer:
             "options": {"temperature": 0.0, "seed": 42}
         }
         try:
-            response = self.session.post(self.base_url, json=payload_generate, timeout=120)
+            response = self.session.post(self.base_url, json=payload_generate, timeout=deep_timeout)
             if response.status_code == 200:
                 result_text = response.json().get("response", "{}")
-                return self._parse_json_result(result_text)
-        except Exception:
-            pass
+                parsed = self._parse_json_result(result_text)
+                if parsed:
+                    return parsed
+            else:
+                print(f"  -> Ollama Deep Model [{model_name}] error {response.status_code}: {response.text[:150]}")
+        except Exception as e:
+            print(f"  -> Ollama Deep Model [{model_name}] exception: {e}")
             
         payload_chat = {
             "model": model_name,
@@ -205,12 +210,14 @@ class OllamaSentimentAnalyzer:
             "options": {"temperature": 0.0, "seed": 42}
         }
         try:
-            response = self.session.post(self.chat_url, json=payload_chat, timeout=120)
+            response = self.session.post(self.chat_url, json=payload_chat, timeout=deep_timeout)
             if response.status_code == 200:
                 result_text = response.json().get("message", {}).get("content", "{}")
                 return self._parse_json_result(result_text)
-        except Exception:
-            pass
+            else:
+                print(f"  -> Ollama Chat Model [{model_name}] error {response.status_code}: {response.text[:150]}")
+        except Exception as e:
+            print(f"  -> Ollama Chat Model [{model_name}] exception: {e}")
         return None
 
     def _normalize_distribution(self, positive=0, negative=0, neutral=100):
@@ -466,6 +473,7 @@ class OllamaSentimentAnalyzer:
             '{"entity_found":true,"reason":"ผู้ใช้แสดงความไม่พอใจอย่างมาก","positive_percent":0,"negative_percent":80,"neutral_percent":20}'
         )
         validation_models = [
+            "gemma4:31b-cloud",
             "api:gemma-4-26b-a4b-it",
             "api:gemma-4-31b-it",
             "api:gemini-3.1-flash-lite",
@@ -473,8 +481,13 @@ class OllamaSentimentAnalyzer:
             "api:gemini-3.5-flash-lite",
         ]
         for val_model in validation_models:
-            actual_api_model = val_model.replace("api:", "", 1)
-            res = self._call_gemini_api(actual_api_model, deep_system, deep_prompt, max_retries=1)
+            if val_model.startswith("api:"):
+                actual_model = val_model.replace("api:", "", 1)
+                res = self._call_gemini_api(actual_model, deep_system, deep_prompt, max_retries=1)
+            else:
+                actual_model = val_model
+                res = self._call_ollama_generic(val_model, deep_system, deep_prompt)
+
             if res and "ai_sentiment" in res:
                 entity_found = res.get("entity_found", True)
                 if isinstance(entity_found, str):
@@ -482,7 +495,7 @@ class OllamaSentimentAnalyzer:
                 if not entity_found:
                     res.update({"positive_percent":0,"negative_percent":0,"neutral_percent":100,"ai_sentiment":0})
                 res["post_id"] = post_id
-                res["model"] = actual_api_model
+                res["model"] = actual_model
                 return res
         return None
 
