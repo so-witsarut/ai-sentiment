@@ -1,8 +1,8 @@
 # coding=utf-8
 """
 tests/probabilistic/test_hybrid_throughput.py
-Concurrency, bounded sliding window, semaphore limits, and transaction safety tests.
-Tests both ai_sentimentREST_API_new.py and ai_sentiment_new.py without live networks or DB.
+Concurrency, bounded sliding window, and semaphore limit tests.
+Tests the REST-only production worker without live networks or DB.
 """
 
 import os
@@ -14,20 +14,16 @@ from unittest.mock import MagicMock, patch
 
 # Disable network / live db
 os.environ["PYTHON_DOTENV_DISABLED"] = "1"
-os.environ["DO_MYSQL_HOST"] = ""
-os.environ["DO_MYSQL_USER"] = ""
-os.environ["DO_MYSQL_PASSWORD"] = ""
 
 # Add repository root directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-import ai_sentimentREST_API_new as rest_module
-import ai_sentiment_new as dual_module
+import ai_sentiment as sentiment_module
 
 
 class TestHybridThroughput(unittest.TestCase):
     def setUp(self):
-        self.modules = [rest_module, dual_module]
+        self.modules = [sentiment_module]
 
     def test_max_in_flight_bounds(self):
         """Verify that submitted futures never exceed MAX_IN_FLIGHT when input batch is larger"""
@@ -202,46 +198,15 @@ class TestHybridThroughput(unittest.TestCase):
 
             with patch.object(analyzer, "_analyze_single_post", side_effect=mock_analyze):
                 res = analyzer.analyze_post_sentiments(posts)
-                # 2 out of 3 should succeed
-                self.assertEqual(len(res["data"]), 2)
+                # The failed worker produces a neutral default without cancelling siblings.
+                self.assertEqual(len(res["data"]), 3)
                 returned_ids = {p["post_id"] for p in res["data"]}
-                self.assertEqual(returned_ids, {"1", "3"})
-
-    def test_mysql_batch_rollback_on_failure(self):
-        """On SQL error during direct-DB analysis, rollback is executed and 0 is counted as persisted"""
-        for mod in self.modules:
-            mock_conn = MagicMock()
-            mock_cursor = MagicMock()
-            mock_conn.cursor.return_value = mock_cursor
-
-            # Table 1 succeeds, Table 2 raises DB error
-            def mock_executemany(sql, params):
-                if "_daily" in sql:
-                    raise RuntimeError("Simulated DB error on daily table")
-                return len(params)
-
-            mock_cursor.executemany.side_effect = mock_executemany
-
-            db = mod.SentimentDB()
-            raw_posts = [
-                (101, "ดีมากครับ บริการประทับใจ", "SCB", "SCB Project", "UserA", "SCB"),
-                (102, "แย่มาก ช้ามาก", "SCB", "SCB Project", "UserB", "SCB")
-            ]
-
-            with patch.object(db, "get_db_connection", return_value=(mock_conn, None)), \
-                 patch.object(db.ollama, "analyze_post_sentiments", return_value={
-                     "data": [
-                         {"post_id": "101", "ai_sentiment": 100, "sentiment": "positive", "positive_percent": 90, "negative_percent": 5, "neutral_percent": 5, "irony_score": 0, "reason": "ดีมาก", "model": "jev"},
-                         {"post_id": "102", "ai_sentiment": 100, "sentiment": "positive", "positive_percent": 90, "negative_percent": 5, "neutral_percent": 5, "irony_score": 0, "reason": "ดีมาก", "model": "jev"}
-                     ]
-                 }):
-                persisted = db.analysis(raw_posts, current_host="localhost", server=1, table_prefix="own_match", save_db=True)
-                # Zero rows persisted due to rollback
-                self.assertEqual(persisted, 0)
-                # Rollback must be called
-                self.assertTrue(mock_conn.rollback.called)
-                mock_cursor.close.assert_called()
-
+                self.assertEqual(returned_ids, {"1", "2", "3"})
+                by_id = {p["post_id"]: p for p in res["data"]}
+                self.assertEqual(by_id["2"]["model"], "rule:provider_failure")
+                self.assertEqual(by_id["2"]["sentiment"], "neutral")
+                self.assertEqual(by_id["1"]["sentiment"], "positive")
+                self.assertEqual(by_id["3"]["sentiment"], "positive")
 
 if __name__ == "__main__":
     unittest.main()

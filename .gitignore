@@ -4,23 +4,39 @@
 
 # ❌ NEVER commit credentials
 .env
+*.env
+!.env.example
 
 # Python virtual environment
 .venv/
 venv/
 env/
+ENV/
+
+# Python caches
 __pycache__/
 *.pyc
 *.pyo
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.cache/
 
 # OS / IDE files
 .DS_Store
 Thumbs.db
 *.swp
+*.swo
 .idea/
 .vscode/
 
 # Logs / output files
+# Logs
+logs/
 *.log
+
+# Generated artifacts & outputs
+artifacts/
 output/
 results/

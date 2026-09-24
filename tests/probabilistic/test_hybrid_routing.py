@@ -2,7 +2,7 @@
 """
 tests/probabilistic/test_hybrid_routing.py
 Comprehensive unit tests verifying the 17 hybrid routing behaviors specified in .ai/HANDOFF.md.
-Tests both ai_sentimentREST_API_new.py and ai_sentiment_new.py candidates with no network access.
+Tests the REST-only production worker with no network access.
 """
 
 import os
@@ -14,21 +14,17 @@ from unittest.mock import MagicMock, patch
 
 # Disable network / live db
 os.environ["PYTHON_DOTENV_DISABLED"] = "1"
-os.environ["DO_MYSQL_HOST"] = ""
-os.environ["DO_MYSQL_USER"] = ""
-os.environ["DO_MYSQL_PASSWORD"] = ""
 os.environ["OPENROUTER_API_KEY"] = "mock-openrouter-key-for-unit-tests"
 
 # Add repository root directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-import ai_sentimentREST_API_new as rest_module
-import ai_sentiment_new as dual_module
+import ai_sentiment as sentiment_module
 
 
 class TestHybridRouting(unittest.TestCase):
     def setUp(self):
-        self.modules = [rest_module, dual_module]
+        self.modules = [sentiment_module]
 
     # -------------------------------------------------------------------------
     # 1. Gate boundary 0.6500 accepted vs 0.6499 rejected
@@ -311,7 +307,7 @@ class TestHybridRouting(unittest.TestCase):
     # 7. DeepSeek Failure Never Falls Back to Rejected Jev
     # -------------------------------------------------------------------------
     def test_deepseek_failure_never_falls_back_to_rejected_jev(self):
-        """When Jev is rejected and DeepSeek returns None, result is None (never save bad Jev)"""
+        """DeepSeek failure produces the explicit neutral default, never rejected Jev."""
         for mod in self.modules:
             analyzer = mod.OllamaSentimentAnalyzer()
             low_conf_jev = {
@@ -335,7 +331,10 @@ class TestHybridRouting(unittest.TestCase):
                     "capped_text": "พอใช้ได้"
                 }
                 res = analyzer._hybrid_analyze_post(context)
-                self.assertIsNone(res, "Must return None when DeepSeek fails, never low-conf Jev!")
+                self.assertEqual(res["model"], "rule:provider_failure")
+                self.assertEqual(res["sentiment"], "neutral")
+                self.assertEqual(res["ai_sentiment"], 0)
+                self.assertEqual(res["neutral_percent"], 100)
 
     # -------------------------------------------------------------------------
     # 8. Provider Reason Ignored & Deterministic Synthetic Reason
@@ -682,22 +681,15 @@ class TestHybridRouting(unittest.TestCase):
                     self.assertEqual(captured_targets[-1], "the Target Entity")
 
     # -------------------------------------------------------------------------
-    # 18. Architectural Role Parity
+    # 18. REST-only architecture
     # -------------------------------------------------------------------------
     def test_architectural_role_parity(self):
-        """Both modules have identical router threshold, pure helper signatures, and policy mappings"""
-        self.assertEqual(rest_module.JEV_ACCEPTANCE_THRESHOLD, dual_module.JEV_ACCEPTANCE_THRESHOLD)
-        self.assertEqual(rest_module.JEV_ACCEPTANCE_THRESHOLD, 0.65)
-        self.assertEqual(rest_module.ENABLE_JEV_HYBRID, dual_module.ENABLE_JEV_HYBRID)
-        self.assertEqual(rest_module.DEEPSEEK_MAX_CONCURRENCY, dual_module.DEEPSEEK_MAX_CONCURRENCY)
-        self.assertEqual(rest_module.MAX_IN_FLIGHT, dual_module.MAX_IN_FLIGHT)
-
-        self.assertTrue(hasattr(rest_module, "OllamaSentimentAnalyzer"))
-        self.assertTrue(hasattr(dual_module, "OllamaSentimentAnalyzer"))
-        self.assertTrue(hasattr(rest_module, "SentimentDB"))
-        self.assertTrue(hasattr(dual_module, "SentimentDB"))
-        self.assertTrue(hasattr(rest_module, "SentimentAPI"))
-        self.assertTrue(hasattr(dual_module, "SentimentAPI"))
+        """The production worker exposes the hybrid router and REST client, not Direct DB."""
+        self.assertEqual(sentiment_module.JEV_ACCEPTANCE_THRESHOLD, 0.65)
+        self.assertTrue(sentiment_module.ENABLE_JEV_HYBRID)
+        self.assertTrue(hasattr(sentiment_module, "OllamaSentimentAnalyzer"))
+        self.assertTrue(hasattr(sentiment_module, "SentimentAPI"))
+        self.assertFalse(hasattr(sentiment_module, "SentimentDB"))
 
 
 if __name__ == "__main__":

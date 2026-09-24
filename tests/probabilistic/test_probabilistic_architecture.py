@@ -2,7 +2,7 @@
 """
 tests/probabilistic/test_probabilistic_architecture.py
 Unit tests verifying the 100% Cloud API Single-Pass Probabilistic Architecture
-in both ai_sentimentREST_API_new.py and ai_sentiment_new.py.
+in the REST-only production worker.
 """
 
 import unittest
@@ -14,13 +14,12 @@ import sys
 # Add repository root directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-import ai_sentimentREST_API_new as rest_module
-import ai_sentiment_new as dual_module
+import ai_sentiment as sentiment_module
 
 
 class TestProbabilisticArchitecture(unittest.TestCase):
     def setUp(self):
-        self.modules = [rest_module, dual_module]
+        self.modules = [sentiment_module]
 
     def test_environment_defaults(self):
         """Verify safe defaults: ENABLE_PROBABILISTIC_MODE=True, BYPASS_LOCAL_TRIAGE=True, ENABLE_JEV_HYBRID=True, SAVE_DB=False"""
