@@ -319,7 +319,8 @@ class TestHybridRouting(unittest.TestCase):
                 "entity_choice": "relevant"
             }
 
-            with patch.object(analyzer, "_call_typesafe_jev", return_value=(low_conf_jev, "typesafe/jev-1.13")), \
+            with patch.object(mod, "AI_COST_MODE", "standard"), \
+                 patch.object(analyzer, "_call_typesafe_jev", return_value=(low_conf_jev, "typesafe/jev-1.13")), \
                  patch.object(analyzer, "_call_deepseek_fallback", return_value=(None, "")):
                 context = {
                     "post_id": "999",
@@ -409,12 +410,68 @@ class TestHybridRouting(unittest.TestCase):
 
             # 2. Slow path
             low_jev = dict(valid_jev, sentiment_confidence=0.50)
-            with patch.object(analyzer, "_call_typesafe_jev", return_value=(low_jev, "typesafe/jev-1.13")) as mock_jev, \
+            with patch.object(mod, "AI_COST_MODE", "standard"), \
+                 patch.object(analyzer, "_call_typesafe_jev", return_value=(low_jev, "typesafe/jev-1.13")) as mock_jev, \
                  patch.object(analyzer, "_call_deepseek_fallback", return_value=(valid_ds, "deepseek/deepseek-v4-flash-0731")) as mock_ds:
                 res = analyzer._hybrid_analyze_post(context)
                 self.assertIsNotNone(res)
                 self.assertEqual(mock_jev.call_count, 1)
                 self.assertEqual(mock_ds.call_count, 1)
+
+    def test_low_cost_mode_skips_deepseek_for_usable_jev(self):
+        """Moderate relevant and confident unrelated Jev decisions save a second paid call."""
+        for mod in self.modules:
+            analyzer = mod.OllamaSentimentAnalyzer()
+            context = {
+                "post_id": "low-cost", "actual_target": "BLCP", "project_name": "BLCP",
+                "sentiment_target": "BLCP", "keywords": ["electricity"],
+                "source_info": "User=test", "clean_text": "electricity costs rose",
+                "capped_text": "electricity costs rose", "analysis_scope": "keyword"
+            }
+            jev = {
+                "sentiment_probabilities": {"positive": 0.10, "neutral": 0.55, "negative": 0.30, "irony": 0.05},
+                "sentiment_confidence": 0.55, "sentiment_choice": "neutral",
+                "entity_probabilities": {"relevant": 0.60, "unrelated": 0.30, "uncertain": 0.10},
+                "entity_confidence": 0.60, "entity_choice": "relevant", "intent": "information"
+            }
+            with patch.object(mod, "AI_COST_MODE", "low"), \
+                 patch.object(analyzer, "_call_typesafe_jev", return_value=(jev, "jev")), \
+                 patch.object(analyzer, "_call_deepseek_fallback") as deepseek:
+                result = analyzer._hybrid_analyze_post(context)
+                self.assertEqual(result["route"], "jev")
+                self.assertTrue(result["low_cost_accepted"])
+                self.assertEqual(result["intent"], "information")
+                deepseek.assert_not_called()
+
+                unrelated = dict(jev, entity_choice="unrelated", entity_confidence=0.72,
+                                 entity_probabilities={"relevant": 0.15, "unrelated": 0.72,
+                                                       "uncertain": 0.13})
+                with patch.object(analyzer, "_call_typesafe_jev", return_value=(unrelated, "jev")):
+                    result = analyzer._hybrid_analyze_post(context)
+                self.assertEqual(result["sentiment"], "neutral")
+                self.assertFalse(result["entity_found"])
+                self.assertIsNone(result["intent"])
+                deepseek.assert_not_called()
+
+    def test_low_cost_mode_still_escalates_uncertain_entity(self):
+        for mod in self.modules:
+            analyzer = mod.OllamaSentimentAnalyzer()
+            jev = {
+                "sentiment_probabilities": {"positive": 0.10, "neutral": 0.70, "negative": 0.15, "irony": 0.05},
+                "sentiment_confidence": 0.70, "sentiment_choice": "neutral",
+                "entity_probabilities": {"relevant": 0.25, "unrelated": 0.25, "uncertain": 0.50},
+                "entity_confidence": 0.50, "entity_choice": "uncertain"
+            }
+            context = {"post_id": "uncertain", "actual_target": "BLCP", "project_name": "BLCP",
+                       "sentiment_target": "BLCP", "keywords": [], "source_info": "",
+                       "clean_text": "unclear", "capped_text": "unclear", "analysis_scope": "keyword"}
+            ds = {"entity_found": False, "probabilities": {"POSITIVE": 0.0, "NEUTRAL": 1.0,
+                                                         "NEGATIVE": 0.0, "AMBIGUOUS_OR_IRONY": 0.0}}
+            with patch.object(mod, "AI_COST_MODE", "low"), \
+                 patch.object(analyzer, "_call_typesafe_jev", return_value=(jev, "jev")), \
+                 patch.object(analyzer, "_call_deepseek_fallback", return_value=(ds, "deepseek")) as deepseek:
+                self.assertEqual(analyzer._hybrid_analyze_post(context)["route"], "deepseek")
+                deepseek.assert_called_once()
 
     # -------------------------------------------------------------------------
     # 10. REST Payload Schema & No Internal Leakage

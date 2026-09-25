@@ -69,6 +69,9 @@ def valid_deepseek_body():
 
 class TestCostTelemetry(unittest.TestCase):
     def setUp(self):
+        cost_mode_patch = patch.object(module, "AI_COST_MODE", "standard")
+        cost_mode_patch.start()
+        self.addCleanup(cost_mode_patch.stop)
         self.context_post = {
             "match_post_id": "cost-1",
             "content": "SCB ให้บริการดีมาก",
@@ -120,6 +123,40 @@ class TestCostTelemetry(unittest.TestCase):
         deepseek_row = next(row for row in telemetry["providers"] if row["route"] == "deepseek")
         self.assertEqual(deepseek_row["provider"], "sail-research/fp4")
         self.assertEqual(deepseek_row["model"], "deepseek/deepseek-v4-flash-0731")
+
+    def test_rest_fallback_passes_jev_hint_and_counts_escalation(self):
+        analyzer = module.OllamaSentimentAnalyzer()
+        post = {**self.context_post, "_analysis_scope": "keyword"}
+        mock_session = MagicMock()
+        mock_session.post.side_effect = [
+            response(200, valid_jev_body(confidence=0.50)),
+            response(200, valid_deepseek_body()),
+        ]
+        with patch.object(module, "OPENROUTER_API_KEY", "offline-test-key"), \
+             patch.object(analyzer, "get_session", return_value=mock_session), \
+             patch.dict(os.environ, {"DEEPSEEK_INCLUDE_JEV_SIGNAL": "true"}), \
+             redirect_stdout(io.StringIO()):
+            result = analyzer.analyze_post_sentiments([post])
+
+        prompt = mock_session.post.call_args_list[1].kwargs["json"]["messages"][1]["content"]
+        self.assertIn("Jev preliminary", prompt)
+        self.assertIn("sentiment=positive(0.50)", prompt)
+        self.assertIn("relevance=relevant(0.90)", prompt)
+        self.assertIn("route_confidence=0.50", prompt)
+        self.assertEqual(result["data"][0]["route"], "deepseek")
+        self.assertEqual(result["telemetry"]["escalated_posts"], 1)
+        self.assertEqual(result["telemetry"]["escalation_rate_percent"], 100.0)
+
+    def test_failed_fallback_still_counts_as_escalated(self):
+        analyzer = module.OllamaSentimentAnalyzer()
+        jev = module.validate_jev_response(valid_jev_body(confidence=0.50))
+        with patch.object(analyzer, "_call_typesafe_jev", return_value=(jev, "jev")), \
+             patch.object(analyzer, "_call_deepseek_fallback", return_value=(None, "")), \
+             redirect_stdout(io.StringIO()):
+            result = analyzer.analyze_post_sentiments([{**self.context_post, "_analysis_scope": "keyword"}])
+        self.assertEqual(result["data"][0]["model"], "rule:provider_failure")
+        self.assertEqual(result["telemetry"]["escalated_posts"], 1)
+        self.assertEqual(result["telemetry"]["escalation_rate_percent"], 100.0)
 
     def test_retry_count_counts_only_calls_after_first_attempt(self):
         analyzer = module.OllamaSentimentAnalyzer()

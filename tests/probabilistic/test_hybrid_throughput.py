@@ -24,6 +24,9 @@ import ai_sentiment as sentiment_module
 class TestHybridThroughput(unittest.TestCase):
     def setUp(self):
         self.modules = [sentiment_module]
+        cost_mode_patch = patch.object(sentiment_module, "AI_COST_MODE", "standard")
+        cost_mode_patch.start()
+        self.addCleanup(cost_mode_patch.stop)
 
     def test_max_in_flight_bounds(self):
         """Verify that submitted futures never exceed MAX_IN_FLIGHT when input batch is larger"""

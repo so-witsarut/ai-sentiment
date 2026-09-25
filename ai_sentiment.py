@@ -6,17 +6,20 @@ Using Ollama (qwen3-8b-instruct) Fast Triage + Gemini Deep Analysis Cascade
 
 import os
 import argparse
+import hashlib
 import re
 import json
 import time
 import sys
 import math
 import random
+import sqlite3
 import requests
 import threading
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from urllib.parse import urlsplit
 from typing import Any, Optional, Dict, List, Tuple, Union
 
 try:
@@ -41,6 +44,18 @@ except Exception:
     pass
 
 
+def _find_term_index(text, term):
+    """Find an entity/keyword without matching short Latin names inside other words."""
+    if not text or not term:
+        return -1
+    term = str(term)
+    if term.isascii() and term[0].isalnum() and term[-1].isalnum():
+        match = re.search(r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])",
+                          text, flags=re.IGNORECASE)
+        return match.start() if match else -1
+    return text.casefold().find(term.casefold())
+
+
 def get_keyword_context(text, keyword, window=150, max_fallback_length=400):
     """
     Extract text context surrounding the Keyword
@@ -48,10 +63,10 @@ def get_keyword_context(text, keyword, window=150, max_fallback_length=400):
     if not text:
         return ""
         
-    if not keyword or keyword not in text:
+    start_idx = _find_term_index(text, keyword)
+    if start_idx < 0:
         return text[:max_fallback_length] + ("..." if len(text) > max_fallback_length else "")
 
-    start_idx = text.find(keyword)
     left_bound = max(0, start_idx - window)
     right_bound = min(len(text), start_idx + len(keyword) + window)
     
@@ -107,6 +122,14 @@ BYPASS_LOCAL_TRIAGE = os.environ.get("BYPASS_LOCAL_TRIAGE", "true").lower() in (
 
 # Jev acceptance threshold is code-owned constant exactly 0.65, inclusive
 JEV_ACCEPTANCE_THRESHOLD = 0.65
+
+# Low mode trades some classification accuracy for fewer DeepSeek calls.
+# Standard mode preserves the original confidence/conflict router.
+AI_COST_MODE = os.environ.get("AI_COST_MODE", "low").strip().lower()
+if AI_COST_MODE not in ("low", "standard"):
+    raise ValueError("Configuration error: AI_COST_MODE must be 'low' or 'standard'")
+JEV_TEXT_MAX_CHARS = parse_bounded_int("JEV_TEXT_MAX_CHARS", 1800, min_val=600, max_val=3000)
+OVERALL_POST_LABEL = "โพสต์โดยรวม"
 HYBRID_PROMPT_V2 = os.environ.get("HYBRID_PROMPT_V2", "false").lower() in ("true", "1", "yes")
 
 JEV_MODEL = os.environ.get("JEV_MODEL", "typesafe/jev-1.13")
@@ -221,12 +244,21 @@ class _BatchUsageMetrics:
             providers = [dict(row) for row in self._providers.values()]
         providers.sort(key=lambda row: (row["route"], row["model"], row["provider"]))
         routes = {"jev": 0, "deepseek": 0, "rule": 0}
+        escalated_posts = 0
+        low_cost_accepted = 0
         for result in results:
             route = result.get("route") if isinstance(result, dict) else None
             if route:
                 routes[route] = routes.get(route, 0) + 1
+            if isinstance(result, dict) and (result.get("fallback_attempted") or route == "deepseek"):
+                escalated_posts += 1
+            if isinstance(result, dict) and result.get("low_cost_accepted"):
+                low_cost_accepted += 1
         return {
             "routes": routes,
+            "escalated_posts": escalated_posts,
+            "escalation_rate_percent": round(100 * escalated_posts / len(results), 2) if results else 0.0,
+            "low_cost_accepted": low_cost_accepted,
             "providers": providers,
             "input_tokens": sum(row["input_tokens"] for row in providers),
             "output_tokens": sum(row["output_tokens"] for row in providers),
@@ -242,6 +274,8 @@ def _log_cost_telemetry(telemetry):
     routes = telemetry.get("routes", {})
     print("  💰 [AI Usage] "
           f"routes=jev:{routes.get('jev', 0)},deepseek:{routes.get('deepseek', 0)},rule:{routes.get('rule', 0)} | "
+          f"escalated={telemetry.get('escalated_posts', 0)} ({telemetry.get('escalation_rate_percent', 0.0):.1f}%) | "
+          f"low_cost_accepted={telemetry.get('low_cost_accepted', 0)} | "
           f"input={telemetry.get('input_tokens', 0)} output={telemetry.get('output_tokens', 0)} "
           f"cached={telemetry.get('cached_tokens', 0)} retries={telemetry.get('retries', 0)} "
           f"cost=${telemetry.get('cost', 0.0):.6f} cache_discount=${telemetry.get('cache_discount', 0.0):.6f}")
@@ -257,7 +291,12 @@ PROBABILISTIC_SYSTEM_PROMPT = (
     "POSITIVE=praise/satisfaction/recommendation; NEUTRAL=facts/news/questions/PR or unrelated sentiment; "
     "NEGATIVE=complaint/criticism/damage; AMBIGUOUS_OR_IRONY=sarcasm/mixed or unclear tone.\n"
     "Use semantic evidence about the target. Four probabilities must be finite, 0..1, and sum to 1.00.\n"
-    "entity_found is true only when the text directly refers to the target.\n"
+    "entity_found is true only when the text directly refers to the target. "
+    "Publisher and URL are context, not proof of relevance or official ownership. "
+    "Official target PR and self-praise are neutral unless an independent opinion is clearly quoted. "
+    "Choose the main intent toward target: complaint, information, recommendation, or enquiry. "
+    "Pure praise is information; recommendation includes improvement suggestions and recommending target to others. "
+    "Omit intent when target is unrelated.\n"
     "{\n"
     '  "probabilities": {\n'
     '    "POSITIVE": <float 0.00-1.00>,\n'
@@ -265,7 +304,8 @@ PROBABILISTIC_SYSTEM_PROMPT = (
     '    "NEGATIVE": <float 0.00-1.00>,\n'
     '    "AMBIGUOUS_OR_IRONY": <float 0.00-1.00>\n'
     "  },\n"
-    '  "entity_found": <boolean>\n'
+    '  "entity_found": <boolean>,\n'
+    '  "intent": <one of complaint, information, recommendation, enquiry when related>\n'
     "}"
 )
 
@@ -276,27 +316,58 @@ HYBRID_SYSTEM_PROMPT = (
     "attributable link to it. If unrelated, set entity_found=false and NEUTRAL=1. "
     "Sentiment about a topic or another entity is not sentiment about Target. "
     "Return JSON only: {\"probabilities\":{\"POSITIVE\":number,\"NEUTRAL\":number,"
-    "\"NEGATIVE\":number,\"AMBIGUOUS_OR_IRONY\":number},\"entity_found\":boolean}. "
+    "\"NEGATIVE\":number,\"AMBIGUOUS_OR_IRONY\":number},\"entity_found\":boolean,"
+    "\"intent\":string}. "
     "Probabilities must be finite, between 0 and 1, and sum to 1. "
     "POSITIVE=praise; NEGATIVE=criticism; NEUTRAL=facts/no target sentiment; "
-    "AMBIGUOUS_OR_IRONY=sarcasm or mixed/unclear sentiment."
+    "AMBIGUOUS_OR_IRONY=sarcasm or mixed/unclear sentiment. "
+    "Official Target announcements and self-praise are neutral unless an independent opinion is clearly quoted. "
+    "Publisher and URL alone do not prove relevance or official ownership. "
+    "Also return intent as one of complaint, information, recommendation, enquiry when Target is relevant. "
+    "Classify the main purpose toward Target; pure praise is information. "
+    "Recommendation includes suggestions to improve Target and recommending Target to others. "
+    "If Target is unrelated, omit intent."
 )
 
 KEYWORD_SYSTEM_PROMPT = (
-    "Assess Thai social text toward the listed Target keywords only. "
-    "A keyword mention alone does not establish sentiment. Match the intended place, brand, or topic, not an unrelated homonym. "
+    "Assess Thai social text toward the named Target project only. Keywords were used only to select the text excerpt. "
+    "A keyword mention alone does not establish a connection to Target. A post about a broad topic "
+    "in general is unrelated unless the text explicitly links that topic to Target. "
     "Emotion about another person, hardship, or event is neutral for Target unless it explicitly evaluates Target. "
-    "A venue or institution named only as the location of an event does not inherit criticism of the event, film, cinema operator, or another person. "
-    "Set entity_found=true when the text refers to any Target keyword in its intended sense, even in neutral factual text; "
-    "otherwise set entity_found=false and NEUTRAL=1. "
+    "A venue named only as the location of an event does not inherit criticism of the event or another person. "
+    "Set entity_found=true only when the text names Target or clearly attributes the discussed subject to Target; "
+    "otherwise set entity_found=false and NEUTRAL=1. Publisher and URL are context, not proof of relevance. "
     "Return JSON only: {\"probabilities\":{\"POSITIVE\":number,\"NEUTRAL\":number,"
-    "\"NEGATIVE\":number,\"AMBIGUOUS_OR_IRONY\":number},\"entity_found\":boolean}. "
+    "\"NEGATIVE\":number,\"AMBIGUOUS_OR_IRONY\":number},\"entity_found\":boolean,"
+    "\"intent\":string}. "
     "Probabilities must be finite, between 0 and 1, and sum to 1. "
     "POSITIVE=explicit independent praise, satisfaction, or support toward Target from a speaker, not the advertiser's own slogan; "
     "NEGATIVE=explicit complaint or criticism attributable to Target; hardship, crime news, or bad events merely mentioning Target are neutral; "
     "NEUTRAL=factual news, job ads, PR, ads, sales slogans, calls to buy, and the seller's own praise, even with words like 'love' or 'great'; "
     "for example 'Love X? Shop today' is an ad, not a consumer endorsement; "
-    "AMBIGUOUS_OR_IRONY=sarcasm or mixed/unclear sentiment."
+    "AMBIGUOUS_OR_IRONY=sarcasm or mixed/unclear sentiment. "
+    "Official Target posts and self-praise are neutral unless they clearly quote an independent person's opinion. "
+    "For intent, classify the main purpose toward Target: complaint=grievance, information=facts or pure praise, "
+    "recommendation=suggestion to improve Target or recommend Target to others, enquiry=request for information. "
+    "A rhetorical question in a grievance is complaint. Omit intent when Target is unrelated. "
+    "A preliminary Jev judgment may be included as a hint. Check the text independently, "
+    "confirm the hint only when supported by the text, and correct it when the text disagrees. "
+    "Do not mention Jev or the hint in the output."
+)
+
+OVERALL_SYSTEM_PROMPT = (
+    "Assess the overall sentiment and main intent of the whole Thai social post. "
+    "There is no named target; keywords only selected the excerpt and are not the subject. "
+    "Return JSON only: {\"probabilities\":{\"POSITIVE\":number,\"NEUTRAL\":number,"
+    "\"NEGATIVE\":number,\"AMBIGUOUS_OR_IRONY\":number},\"entity_found\":true,\"intent\":string}. "
+    "Probabilities must be finite, between 0 and 1, and sum to 1. "
+    "POSITIVE=overall praise or satisfaction; NEGATIVE=overall complaint or criticism; "
+    "NEUTRAL=facts, news, PR, ads, or questions without a clear opinion; "
+    "AMBIGUOUS_OR_IRONY=sarcasm or mixed/unclear sentiment. "
+    "Official self-praise and sales slogans are neutral unless an independent opinion is clearly quoted. "
+    "Intent is the main purpose of the post: complaint, information, recommendation, or enquiry. "
+    "Pure praise is information; recommendation includes suggestions and advice to others. "
+    "A Jev preliminary judgment is only a hint; verify it against the text."
 )
 
 
@@ -408,7 +479,8 @@ def parse_probabilistic_response(parsed_dict):
             "NEGATIVE": round(neg, 4),
             "AMBIGUOUS_OR_IRONY": round(irony, 4)
         },
-        "entity_found": entity_found
+        "entity_found": entity_found,
+        "intent": normalize_intent(parsed_dict.get("intent")) if entity_found else None
     }
 
 
@@ -562,6 +634,11 @@ def is_placeholder_target(target) -> bool:
     return s in ("", "the target entity", "target entity", "unknown", "none", "null", "เป้าหมายที่ระบุ")
 
 
+def _overall_reason(sentiment):
+    labels = {"positive": "เชิงบวก", "negative": "เชิงลบ", "neutral": "เป็นกลาง"}
+    return f"วิเคราะห์น้ำเสียงของโพสต์โดยรวมเป็น{labels.get(sentiment, 'เป็นกลาง')}"
+
+
 def sanitize_target(target: str, max_chars: int = 100) -> str:
     """Sanitize target entity name for synthetic reasons (strip HTML/control chars, cap length)."""
     if not target or is_placeholder_target(target):
@@ -591,12 +668,11 @@ def cap_text(text: str, max_chars: int = 8000, keyword: str = "", target: str = 
         return text[:max_chars]
 
     separator = " ... "
-    folded = text.casefold()
     intervals = []
     for term, width in ((target, max_chars // 3), (keyword, max_chars // 4)):
         if not term:
             continue
-        index = folded.find(str(term).casefold())
+        index = _find_term_index(text, term)
         if index < 0:
             continue
         width = max(len(term), width)
@@ -656,11 +732,53 @@ def _sentiment_target(explicit_target, project_name, company_name, keywords, res
     return ""
 
 
+VALID_INTENTS = frozenset(("complaint", "information", "recommendation", "enquiry"))
+
+
+def normalize_intent(value):
+    """Keep only the four public intent labels."""
+    if not isinstance(value, str):
+        return None
+    intent = value.strip().lower()
+    return intent if intent in VALID_INTENTS else None
+
+
+def _source_context(post):
+    """Use supplied publisher and URL metadata without fetching a page."""
+    publisher = str(post.get("post_user") or "").strip()[:120]
+    raw_url = str(post.get("feed_link") or "").strip()
+    lines = []
+    if publisher:
+        lines.append(f"Publisher={publisher}")
+    if raw_url:
+        try:
+            parsed = urlsplit(raw_url)
+            if parsed.scheme in ("http", "https") and parsed.hostname:
+                lines.append(f"Source URL={parsed.hostname}{parsed.path[:180]}")
+        except ValueError:
+            pass
+    return "\n".join(lines)
+
+
 def _compact_context_lines(resolved_context, text_override=None):
     """Build stable context lines while omitting exact duplicate metadata."""
+    if resolved_context.get("analysis_scope") == "overall":
+        text = text_override if text_override is not None else resolved_context.get("capped_text") or ""
+        lines = ["Scope=overall post sentiment and intent"]
+        source = resolved_context.get("source_info") or ""
+        if source:
+            lines.append(str(source))
+        lines.append(f"Text={text}")
+        return lines
     if resolved_context.get("analysis_scope") == "keyword":
         text = text_override if text_override is not None else resolved_context.get("capped_text") or ""
-        return [f"Target keywords={resolved_context.get('sentiment_target') or ''}", f"Text={text}"]
+        target = resolved_context.get("sentiment_target") or resolved_context.get("actual_target") or ""
+        lines = [f"Target={target}"]
+        source = resolved_context.get("source_info") or ""
+        if source:
+            lines.append(str(source))
+        lines.append(f"Text={text}")
+        return lines
     target_value = (resolved_context.get("sentiment_target", resolved_context.get("actual_target"))
                     if HYBRID_PROMPT_V2 else resolved_context.get("actual_target"))
     target = str(target_value or "the Target Entity").strip()
@@ -697,13 +815,41 @@ def build_jev_state_prompt(resolved_context):
 
 
 def build_deepseek_user_prompt(resolved_context, jev_signal=None, include_jev_signal=None):
-    if resolved_context.get("analysis_scope") == "keyword":
+    scope = resolved_context.get("analysis_scope")
+    if scope in ("keyword", "overall"):
         max_chars = parse_bounded_int("DEEPSEEK_TEXT_MAX_CHARS", 3000, min_val=3000, max_val=8000)
         full_text = resolved_context.get("clean_text") or resolved_context.get("capped_text") or ""
         keywords = resolved_context.get("keywords") or []
-        first_match = next((k for k in keywords if k.casefold() in full_text.casefold()), "")
-        excerpt = cap_text(full_text, max_chars=max_chars, keyword=first_match) if len(full_text) > max_chars else full_text
-        return "\n".join(_compact_context_lines(resolved_context, text_override=excerpt))
+        first_match = next((k for k in keywords if _find_term_index(full_text, k) >= 0), "")
+        target = resolved_context.get("sentiment_target") if scope == "keyword" else ""
+        excerpt = cap_text(full_text, max_chars=max_chars, keyword=first_match, target=target)
+        lines = _compact_context_lines(resolved_context, text_override=excerpt)
+        if include_jev_signal is None:
+            include_jev_signal = os.environ.get("DEEPSEEK_INCLUDE_JEV_SIGNAL", "true").lower() in ("true", "1", "yes")
+        if include_jev_signal and isinstance(jev_signal, dict):
+            sentiment = str(jev_signal.get("sentiment") or "unknown").lower()
+            sentiment_confidence = jev_signal.get("sentiment_confidence")
+            relevance = str(jev_signal.get("entity_relevance") or "unknown").lower()
+            entity_confidence = jev_signal.get("entity_confidence")
+            intent = jev_signal.get("intent") or "unknown"
+            route_confidence = jev_signal.get("confidence")
+            conflicts = ",".join(jev_signal.get("conflict_reasons") or []) or "none"
+            def confidence_text(value):
+                return f"{float(value):.2f}" if isinstance(value, (int, float)) and not isinstance(value, bool) else "unknown"
+            if scope == "overall":
+                hint = ("Jev preliminary (hint; verify against text): "
+                        f"sentiment={sentiment}({confidence_text(sentiment_confidence)}); "
+                        f"intent={intent}; route_confidence={confidence_text(route_confidence)}; "
+                        f"conflicts={conflicts}")
+            else:
+                hint = ("Jev preliminary (hint; verify against text): "
+                        f"sentiment={sentiment}({confidence_text(sentiment_confidence)}); "
+                        f"relevance={relevance}({confidence_text(entity_confidence)}); "
+                        f"intent={intent}; route_confidence={confidence_text(route_confidence)}; "
+                        f"conflicts={conflicts}")
+            # Keep the source and text together at the end of the prompt.
+            lines.insert(max(1, len(lines) - 1), hint)
+        return "\n".join(lines)
     if not HYBRID_PROMPT_V2:
         lines = _compact_context_lines(resolved_context)
         if isinstance(jev_signal, dict):
@@ -738,7 +884,7 @@ def build_deepseek_user_prompt(resolved_context, jev_signal=None, include_jev_si
     return "\n".join(lines)
 
 
-def validate_jev_response(data: Any) -> Optional[Dict[str, Any]]:
+def validate_jev_response(data: Any, overall_scope: bool = False) -> Optional[Dict[str, Any]]:
     """
     Strict validation for TypeSafe Jev OpenRouter Decisions API response.
     Returns normalized structure if valid, or None if invalid/corrupt.
@@ -749,6 +895,12 @@ def validate_jev_response(data: Any) -> Optional[Dict[str, Any]]:
     answers = data.get("answers")
     if not isinstance(answers, dict):
         return None
+    if overall_scope:
+        # Entity relevance is undefined without a named target; the whole post is the subject.
+        answers = {**answers, "entity_relevance": {
+            "choice": "relevant", "confidence": 1.0,
+            "probabilities": {"relevant": 1.0, "unrelated": 0.0, "uncertain": 0.0}
+        }}
 
     # 1. Sentiment question
     sentiment_ans = answers.get("sentiment")
@@ -848,13 +1000,17 @@ def validate_jev_response(data: Any) -> Optional[Dict[str, Any]]:
         if e_choice not in required_e_keys:
             return None
 
+    intent_ans = answers.get("intent")
+    intent = normalize_intent(intent_ans.get("choice")) if isinstance(intent_ans, dict) else None
+
     return {
         "sentiment_probabilities": normalized_s_probs,
         "sentiment_confidence": s_conf,
         "sentiment_choice": s_choice,
         "entity_probabilities": normalized_e_probs,
         "entity_confidence": e_conf,
-        "entity_choice": e_choice
+        "entity_choice": e_choice,
+        "intent": intent
     }
 
 
@@ -905,7 +1061,8 @@ def validate_deepseek_response(parsed_data: Any) -> Optional[Dict[str, Any]]:
 
     return {
         "probabilities": {key: value / total for key, value in zip(required_keys, values)},
-        "entity_found": raw_entity
+        "entity_found": raw_entity,
+        "intent": normalize_intent(parsed_data.get("intent"))
     }
 
 
@@ -1003,6 +1160,28 @@ def route_sentiment(jev_data: Optional[Dict[str, Any]], actual_target: str) -> D
             "AMBIGUOUS_OR_IRONY": irony
         }
     }
+
+
+def _accept_jev_in_low_cost_mode(jev_data, route_info):
+    """Accept usable Jev decisions that the conservative router would escalate."""
+    if AI_COST_MODE != "low" or not jev_data or not route_info.get("probabilities"):
+        return False
+    conflicts = set(route_info.get("conflict_reasons") or [])
+    if "generic_placeholder_target" in conflicts or "entity_uncertain" in conflicts:
+        return False
+
+    entity_probs = jev_data["entity_probabilities"]
+    entity_choice = jev_data.get("entity_choice")
+    if (entity_choice == "unrelated" and
+            entity_probs["unrelated"] >= 0.55 and
+            entity_probs["unrelated"] > max(entity_probs["relevant"], entity_probs["uncertain"]) and
+            jev_data["entity_confidence"] >= 0.55):
+        # Sentiment expressed about some other subject cannot affect this target.
+        return True
+
+    return (entity_choice == "relevant" and
+            route_info["routing_confidence"] >= 0.50 and
+            not conflicts)
 
 
 # =============================================================================
@@ -1579,10 +1758,13 @@ class OllamaSentimentAnalyzer:
             "7. PERCENTAGES: positive_percent + negative_percent + neutral_percent MUST equal exactly 100. "
             "Use multiples of 5: 0,5,10,15,...,100.\n"
             "8. Never assign Target sentiment from an emotion that is directed at another entity.\n\n"
+            "9. Classify the main intent toward Target as complaint, information, recommendation, or enquiry. "
+            "Pure praise is information; suggestions to improve Target and recommendations to others are recommendation. "
+            "Omit intent when Target is unrelated. Publisher and URL alone do not prove relevance or official ownership.\n\n"
             "For reason, explain concisely in natural Thai and mention the Target-related context. No rule numbers.\n"
             'Return ONLY valid JSON with exactly these keys:\n'
             'Examples:\n'
-            '{"entity_found":true,"reason":"ผู้ใช้ชื่นชมบริการ แต่บ่นเรื่องราคาเล็กน้อย","positive_percent":60,"negative_percent":15,"neutral_percent":25}\n'
+            '{"entity_found":true,"intent":"information","reason":"ผู้ใช้ชื่นชมบริการ แต่บ่นเรื่องราคาเล็กน้อย","positive_percent":60,"negative_percent":15,"neutral_percent":25}\n'
             '{"entity_found":true,"reason":"เป็นข่าวรายงานข้อเท็จจริง มีโทนเชิงบวกเล็กน้อย","positive_percent":15,"negative_percent":0,"neutral_percent":85}\n'
             '{"entity_found":true,"reason":"ผู้ใช้แสดงความไม่พอใจอย่างมาก","positive_percent":0,"negative_percent":80,"neutral_percent":20}'
         )
@@ -1625,6 +1807,7 @@ class OllamaSentimentAnalyzer:
                     entity_found = entity_found.lower() in ("true", "1")
                 if not entity_found:
                     res.update({"positive_percent":0,"negative_percent":0,"neutral_percent":100,"ai_sentiment":0})
+                res["intent"] = normalize_intent(res.get("intent")) if entity_found else None
                 res["post_id"] = post_id
                 res["model"] = actual_model
                 return res
@@ -1682,6 +1865,7 @@ class OllamaSentimentAnalyzer:
                         "post_id": post_id,
                         "ai_sentiment": policy["score"],
                         "sentiment": policy["sentiment"],
+                        "intent": norm.get("intent") if entity_found else None,
                         "positive_percent": policy["pos"],
                         "negative_percent": policy["neg"],
                         "neutral_percent": policy["neu"],
@@ -1704,11 +1888,13 @@ class OllamaSentimentAnalyzer:
             return None
         return parsed if isinstance(parsed, dict) else None
 
-    def _call_typesafe_jev(self, state_prompt: str, actual_target: str, keyword_scope: bool = False) -> Tuple[Optional[Dict[str, Any]], str]:
+    def _call_typesafe_jev(self, state_prompt: str, actual_target: str, keyword_scope: bool = False,
+                           overall_scope: bool = False) -> Tuple[Optional[Dict[str, Any]], str]:
         """
-        Invoke TypeSafe Jev via OpenRouter Decisions API with two typed questions:
+        Invoke TypeSafe Jev via OpenRouter Decisions API with typed questions:
         1. sentiment (choice: positive, neutral, negative, irony)
-        2. entity_relevance (choice: relevant, unrelated, uncertain)
+        2. entity_relevance (choice: relevant, unrelated, uncertain) when a target exists
+        3. intent (choice: complaint, information, recommendation, enquiry)
         """
         api_key = OPENROUTER_API_KEY or os.environ.get("OPENROUTER_API_KEY", "")
         if not api_key:
@@ -1728,37 +1914,64 @@ class OllamaSentimentAnalyzer:
             "questions": {
                 "sentiment": {
                     "type": "choice",
-                    "instructions": ("In one pass, check whether the text expresses an opinion or emotion, then identify what it evaluates. Classify sentiment toward Target keywords only. If no opinion evaluates Target, choose neutral even when the text is emotional about someone else or Target is only a venue. Factual news, job ads, PR and seller slogans are neutral; a reported quote explicitly praising or criticizing Target still counts."
+                    "instructions": ("Classify the overall sentiment expressed by the whole post. No named target exists; keywords only selected the excerpt. Factual news, PR and self-praise are neutral unless an independent opinion is clearly quoted."
+                                     if overall_scope else
+                                     "Classify sentiment toward the named Target project only. Keywords only selected the excerpt. A general topic mention without a clear connection to Target is neutral. Official Target news, PR and seller self-praise are neutral; a clearly attributed independent opinion about Target still counts. Publisher and URL alone do not prove Target relevance or official ownership."
                                      if keyword_scope else
                                      "Classify sentiment toward Target only; unrelated topic sentiment is neutral."
                                      if HYBRID_PROMPT_V2 else f"Classify sentiment toward '{actual_target}'."),
                     "criteria": {
-                        "positive": ("Independent praise, satisfaction, or support explicitly directed at a Target keyword, including an attributed quote; favorable news or advertiser self-praise alone does not qualify."
+                        "positive": ("Praise, satisfaction, or support expressed in the post."
+                                     if overall_scope else
+                                     "Independent praise, satisfaction, or support explicitly directed at Target, including an attributed quote; favorable news or advertiser self-praise alone does not qualify."
                                      if keyword_scope else "Praise, satisfaction, recommendation, endorsement, or directly beneficial news."),
-                        "neutral": ("No subjective evaluation of Target: factual news, job ads, PR, seller slogans, or emotion about another person, film, event, or operator at a named venue."
+                        "neutral": ("Factual reporting, PR, ads, or a question without a clear opinion."
+                                    if overall_scope else
+                                    "No subjective evaluation of Target: factual news, job ads, PR, seller slogans, or emotion about another person, film, event, or operator at a named venue."
                                     if keyword_scope else "Facts, news, PR, or a general inquiry without sentiment."),
-                        "negative": ("Complaint, blame, or criticism explicitly directed at a Target keyword, including an attributed quote; a venue named only as a location does not inherit criticism of others."
+                        "negative": ("Complaint, blame, criticism, or dissatisfaction expressed in the post."
+                                     if overall_scope else
+                                     "Complaint, blame, or criticism explicitly directed at Target, including an attributed quote; a venue named only as a location does not inherit criticism of others."
                                      if keyword_scope else "Criticism, complaint, defect, boycott, damage, or frustration."),
                         "irony": "Sarcasm, mockery, cynical humor, satire, or backhanded praise."
                     }
                 },
                 "entity_relevance": {
                     "type": "choice",
-                    "instructions": ("Does the text refer to any Target keyword in its intended sense? Mere mention can be relevant but sentiment-neutral; homonyms are unrelated."
+                    "instructions": ("Is the text clearly about the named Target project? A keyword or general topic mention alone is insufficient. Publisher and URL are context, not proof of relevance."
                                      if keyword_scope else
                                      "Is the text about Target? A keyword match alone is insufficient; require a named or attributable link in the text."
                                      if HYBRID_PROMPT_V2 else f"Does the text directly refer to '{actual_target}'?"),
                     "criteria": {
-                        "relevant": ("At least one Target keyword is mentioned in its intended sense, even in neutral news or a list."
-                                     if keyword_scope else "The opinion, experience, or fact is directly about the target."),
-                        "unrelated": ("No Target keyword is referred to in its intended sense; a homonym or different entity does not count."
-                                      if keyword_scope else "The mention is coincidental, about another entity, or unrelated."),
+                        "relevant": ("The text names Target or clearly attributes the discussed subject to Target, including neutral news."
+                                      if keyword_scope else "The opinion, experience, or fact is directly about the target."),
+                        "unrelated": ("Only the retrieval keyword or a general topic appears, with no clear link to Target."
+                                       if keyword_scope else "The mention is coincidental, about another entity, or unrelated."),
                         "uncertain": ("It is unclear whether the text refers to a Target keyword."
                                       if keyword_scope else "Relevance is ambiguous or impossible to determine.")
+                    }
+                },
+                "intent": {
+                    "type": "choice",
+                    "instructions": ("Classify the main purpose of the whole post. A rhetorical question inside a grievance is a complaint. Pure praise is information."
+                                     if overall_scope else
+                                     "Classify the main purpose of the text concerning Target. A rhetorical question inside a grievance is a complaint. Pure praise is information. If Target is unrelated, choose information; the caller will omit intent."),
+                    "criteria": {
+                        "complaint": ("The main purpose is to criticize, blame, or complain."
+                                      if overall_scope else "The main purpose is to criticize, blame, or complain about Target."),
+                        "information": ("The main purpose is to report facts, news, promotion, or pure praise."
+                                        if overall_scope else "The main purpose is to report facts, news, promotion, or pure praise about Target."),
+                        "recommendation": ("The main purpose is to suggest an improvement or recommend something to other people."
+                                           if overall_scope else "The main purpose is to suggest an improvement to Target or recommend Target to other people."),
+                        "enquiry": ("The main purpose is to ask for information."
+                                    if overall_scope else "The main purpose is to ask for information about Target.")
                     }
                 }
             }
         }
+
+        if overall_scope:
+            del payload["questions"]["entity_relevance"]
 
         candidates = [JEV_MODEL]
         for m in JEV_FALLBACK_MODELS:
@@ -1783,7 +1996,7 @@ class OllamaSentimentAnalyzer:
                             self._record_provider_attempt("jev", cand_model, attempt > 0, provider_hint="openrouter")
                             return None, cand_model
                         self._record_provider_attempt("jev", cand_model, attempt > 0, resp_json, "openrouter")
-                        validated = validate_jev_response(resp_json)
+                        validated = validate_jev_response(resp_json, overall_scope=overall_scope)
                         if validated:
                             return validated, cand_model
                         else:
@@ -1843,7 +2056,8 @@ class OllamaSentimentAnalyzer:
         payload = {
             "model": DEEPSEEK_MODEL,
             "messages": [
-                {"role": "system", "content": (KEYWORD_SYSTEM_PROMPT if resolved_context.get("analysis_scope") == "keyword"
+                {"role": "system", "content": (OVERALL_SYSTEM_PROMPT if resolved_context.get("analysis_scope") == "overall"
+                                               else KEYWORD_SYSTEM_PROMPT if resolved_context.get("analysis_scope") == "keyword"
                                                else HYBRID_SYSTEM_PROMPT if HYBRID_PROMPT_V2 else PROBABILISTIC_SYSTEM_PROMPT)},
                 {"role": "user", "content": user_prompt}
             ],
@@ -1917,7 +2131,8 @@ class OllamaSentimentAnalyzer:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}"
         user_prompt = build_deepseek_user_prompt(resolved_context)
         payload = {
-            "system_instruction": {"parts": [{"text": (KEYWORD_SYSTEM_PROMPT if resolved_context.get("analysis_scope") == "keyword"
+            "system_instruction": {"parts": [{"text": (OVERALL_SYSTEM_PROMPT if resolved_context.get("analysis_scope") == "overall"
+                                                      else KEYWORD_SYSTEM_PROMPT if resolved_context.get("analysis_scope") == "keyword"
                                                       else HYBRID_SYSTEM_PROMPT if HYBRID_PROMPT_V2 else PROBABILISTIC_SYSTEM_PROMPT)}]},
             "contents": [{"parts": [{"text": user_prompt}]}],
             "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json", "maxOutputTokens": 400}
@@ -1971,25 +2186,39 @@ class OllamaSentimentAnalyzer:
         sentiment_target = (resolved_context.get("sentiment_target", actual_target)
                             if HYBRID_PROMPT_V2 else actual_target)
         keyword_scope = resolved_context.get("analysis_scope") == "keyword"
+        overall_scope = resolved_context.get("analysis_scope") == "overall"
 
         is_placeholder = is_placeholder_target(sentiment_target)
-        if HYBRID_PROMPT_V2 and is_placeholder:
-            return self._neutral_unresolved_target_result(post_id, project_name)
+        if is_placeholder and not overall_scope:
+            text = resolved_context.get("clean_text") or resolved_context.get("capped_text") or ""
+            keywords = resolved_context.get("keywords") or []
+            first_keyword = next((k for k in keywords if _find_term_index(text, k) >= 0), "")
+            return self._hybrid_analyze_post({
+                **resolved_context,
+                "analysis_scope": "overall",
+                "actual_target": OVERALL_POST_LABEL,
+                "sentiment_target": OVERALL_POST_LABEL,
+                "capped_text": cap_text(text, max_chars=JEV_TEXT_MAX_CHARS, keyword=first_keyword)
+            })
 
         jev_raw = None
         jev_model_used = ""
 
-        if not is_placeholder:
+        if not is_placeholder or overall_scope:
             state_prompt = build_jev_state_prompt(resolved_context)
-            if keyword_scope:
+            if overall_scope:
+                jev_raw, jev_model_used = self._call_typesafe_jev(
+                    state_prompt, sentiment_target, overall_scope=True)
+            elif keyword_scope:
                 jev_raw, jev_model_used = self._call_typesafe_jev(state_prompt, sentiment_target, keyword_scope=True)
             else:
                 jev_raw, jev_model_used = self._call_typesafe_jev(state_prompt, sentiment_target)
 
         route_info = route_sentiment(jev_raw, sentiment_target)
 
-        # 1. Accept Jev if confidence >= 0.65 and no conflicts
-        if route_info["accept_jev"]:
+        # In low mode, avoid a second paid model when Jev gives a usable decision.
+        low_cost_accepted = not route_info["accept_jev"] and _accept_jev_in_low_cost_mode(jev_raw, route_info)
+        if route_info["accept_jev"] or low_cost_accepted:
             probs = route_info["probabilities"]
             entity_found = route_info["entity_found"]
             policy = resolve_policy(probs, entity_found=entity_found)
@@ -1997,10 +2226,13 @@ class OllamaSentimentAnalyzer:
             reason = generate_synthetic_reason(
                 sanitized_tgt, probs["POSITIVE"], probs["NEGATIVE"], probs["NEUTRAL"],
                 probs["AMBIGUOUS_OR_IRONY"], entity_found=entity_found)
+            if overall_scope:
+                reason = _overall_reason(policy["sentiment"])
             return {
                 "post_id": post_id,
                 "ai_sentiment": policy["score"],
                 "sentiment": policy["sentiment"],
+                "intent": jev_raw.get("intent") if entity_found else None,
                 "positive_percent": policy["pos"],
                 "negative_percent": policy["neg"],
                 "neutral_percent": policy["neu"],
@@ -2010,6 +2242,7 @@ class OllamaSentimentAnalyzer:
                 "entity_found": entity_found,
                 "model": jev_model_used or JEV_MODEL,
                 "route": "jev",
+                "low_cost_accepted": low_cost_accepted,
                 "conflict_reasons": route_info["conflict_reasons"],
                 "raw_probabilities": probs,
                 "project_name": project_name
@@ -2018,10 +2251,21 @@ class OllamaSentimentAnalyzer:
         # 2. Otherwise route to DeepSeek deep-reasoning fallback
         jev_signal = None
         if jev_raw is not None:
+            sentiment_probabilities = route_info.get("probabilities") or {}
+            entity_probabilities = jev_raw.get("entity_probabilities") or {}
             jev_signal = {
-                "probabilities": route_info.get("probabilities"),
+                "probabilities": sentiment_probabilities,
                 "confidence": route_info.get("routing_confidence"),
-                "conflict_reasons": route_info.get("conflict_reasons", [])
+                "conflict_reasons": route_info.get("conflict_reasons", []),
+                "sentiment": jev_raw.get("sentiment_choice") or
+                             (max(sentiment_probabilities, key=sentiment_probabilities.get)
+                              if sentiment_probabilities else None),
+                "sentiment_confidence": jev_raw.get("sentiment_confidence"),
+                "entity_relevance": jev_raw.get("entity_choice") or
+                                    (max(entity_probabilities, key=entity_probabilities.get)
+                                     if entity_probabilities else None),
+                "entity_confidence": jev_raw.get("entity_confidence"),
+                "intent": jev_raw.get("intent") if route_info.get("entity_found") else None
             }
 
         if getattr(self._thread_local, "defer_deepseek", False):
@@ -2042,19 +2286,30 @@ class OllamaSentimentAnalyzer:
 
         ds_result, ds_model_used = self._call_deepseek_fallback(resolved_context, jev_signal)
         if ds_result is None:
-            return self._neutral_error_result(post_id, project_name)
+            failure = self._neutral_error_result(post_id, project_name)
+            failure["fallback_attempted"] = True
+            failure["conflict_reasons"] = route_info.get("conflict_reasons", [])
+            return failure
 
         ds_probs = ds_result["probabilities"]
         ds_entity_found = ds_result["entity_found"]
+        jev_intent = jev_signal.get("intent") if isinstance(jev_signal, dict) else None
 
-        if not HYBRID_PROMPT_V2 and is_placeholder_target(sentiment_target) and not ds_entity_found:
-            return self._neutral_error_result(post_id, project_name)
+        if not HYBRID_PROMPT_V2 and resolved_context.get("analysis_scope") != "overall" and is_placeholder_target(sentiment_target) and not ds_entity_found:
+            failure = self._neutral_error_result(post_id, project_name)
+            failure["fallback_attempted"] = True
+            failure["conflict_reasons"] = route_info.get("conflict_reasons", [])
+            return failure
 
+        if resolved_context.get("analysis_scope") == "overall":
+            ds_entity_found = True
         policy = resolve_policy(ds_probs, entity_found=ds_entity_found)
         sanitized_tgt = sanitize_target(sentiment_target)
         reason = generate_synthetic_reason(
             sanitized_tgt, ds_probs["POSITIVE"], ds_probs["NEGATIVE"], ds_probs["NEUTRAL"],
             ds_probs["AMBIGUOUS_OR_IRONY"], entity_found=ds_entity_found)
+        if resolved_context.get("analysis_scope") == "overall":
+            reason = _overall_reason(policy["sentiment"])
 
         ds_confidence = round(max(ds_probs.values()), 4)
 
@@ -2062,6 +2317,7 @@ class OllamaSentimentAnalyzer:
             "post_id": post_id,
             "ai_sentiment": policy["score"],
             "sentiment": policy["sentiment"],
+            "intent": (ds_result.get("intent") or jev_intent) if ds_entity_found else None,
             "positive_percent": policy["pos"],
             "negative_percent": policy["neg"],
             "neutral_percent": policy["neu"],
@@ -2071,6 +2327,7 @@ class OllamaSentimentAnalyzer:
             "entity_found": ds_entity_found,
             "model": ds_model_used or DEEPSEEK_MODEL,
             "route": "deepseek",
+            "fallback_attempted": True,
             "conflict_reasons": route_info.get("conflict_reasons", []),
             "raw_probabilities": ds_probs,
             "project_name": project_name
@@ -2149,23 +2406,25 @@ class OllamaSentimentAnalyzer:
             if isinstance(raw_keywords, str):
                 raw_keywords = raw_keywords.split(",")
             keywords = [str(value).strip() for value in raw_keywords if str(value).strip()]
-            if not keywords:
-                return self._neutral_unresolved_target_result(post_id)
-            folded_text = clean_raw_text.casefold()
-            matched_keywords = [value for value in keywords if value.casefold() in folded_text]
+            matched_keywords = [value for value in keywords if _find_term_index(clean_raw_text, value) >= 0]
             target_keywords = matched_keywords or keywords
-            keyword_target = ", ".join(target_keywords)
+            project_name = str(post.get("project_name") or "").strip()
+            # A retrieval keyword is not an entity to assess sentiment toward.
+            overall_scope = is_placeholder_target(project_name)
+            analysis_target = OVERALL_POST_LABEL if overall_scope else project_name
+            first_keyword = target_keywords[0] if target_keywords else ""
             return self._hybrid_analyze_post({
                 "post_id": post_id,
-                "analysis_scope": "keyword",
-                "actual_target": keyword_target,
-                "sentiment_target": keyword_target,
-                "project_name": "",
-                "project_desc": "",
+                "analysis_scope": "overall" if overall_scope else "keyword",
+                "actual_target": analysis_target,
+                "sentiment_target": analysis_target,
+                "project_name": project_name,
+                "project_desc": post.get("project_desc") or "",
                 "keywords": target_keywords,
-                "source_info": "",
+                "source_info": _source_context(post),
                 "clean_text": clean_raw_text,
-                "capped_text": cap_text(clean_raw_text, max_chars=3000, keyword=target_keywords[0])
+                "capped_text": cap_text(clean_raw_text, max_chars=JEV_TEXT_MAX_CHARS,
+                                        keyword=first_keyword, target="" if overall_scope else project_name)
             })
 
         raw_kw = post.get("keywords") or post.get("keyword_name") or post.get("keyword")
@@ -2224,7 +2483,8 @@ class OllamaSentimentAnalyzer:
             if HYBRID_PROMPT_V2 else actual_target
         )
         first_keyword = keywords[0] if keywords else ""
-        capped_text = (cap_text(clean_raw_text, max_chars=3000, keyword=first_keyword, target=sentiment_target)
+        capped_text = (cap_text(clean_raw_text, max_chars=JEV_TEXT_MAX_CHARS,
+                               keyword=first_keyword, target=sentiment_target)
                        if HYBRID_PROMPT_V2 else _legacy_cap_text(clean_raw_text, max_chars=8000,
                                                                    keyword=first_keyword))
 
@@ -2390,8 +2650,55 @@ class OllamaSentimentAnalyzer:
 # =============================================================================
 # FLOW 1: Sentiment REST API Manager
 # =============================================================================
+class AnalysisResultCache:
+    """Persist successful AI decisions so pending REST rows can be retried cheaply."""
+
+    def __init__(self, path=None):
+        self.path = path or os.environ.get("SENTIMENT_CACHE_PATH") or os.path.join(
+            os.path.dirname(__file__), ".cache", "sentiment_results.sqlite3")
+        self.ttl_seconds = parse_bounded_int("SENTIMENT_CACHE_TTL_DAYS", 30, 1, 365) * 86400
+        with open(__file__, "rb") as source:
+            self.code_digest = hashlib.sha256(source.read()).hexdigest()
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        self.db = sqlite3.connect(self.path, timeout=5)
+        self.db.execute("CREATE TABLE IF NOT EXISTS analysis_results "
+                        "(cache_key TEXT PRIMARY KEY, result_json TEXT NOT NULL, expires_at REAL NOT NULL)")
+        self.db.execute("DELETE FROM analysis_results WHERE expires_at < ?", (time.time(),))
+        self.db.commit()
+
+    def key(self, post):
+        # IDs and publication dates do not affect the answer. All prompt inputs do.
+        fields = ("content", "full_text", "keywords", "project_id", "project_name",
+                  "project_desc", "tracking_kind",
+                  "feed_link", "post_user", "_analysis_scope")
+        payload = {
+            "code": self.code_digest,
+            "models": [JEV_MODEL, DEEPSEEK_MODEL],
+            "hybrid": ENABLE_JEV_HYBRID,
+            "prompt_v2": HYBRID_PROMPT_V2,
+            "cost_mode": AI_COST_MODE,
+            "jev_text_max_chars": JEV_TEXT_MAX_CHARS,
+            "deepseek_text_max_chars": os.environ.get("DEEPSEEK_TEXT_MAX_CHARS", "3000"),
+            "deepseek_include_jev_signal": os.environ.get("DEEPSEEK_INCLUDE_JEV_SIGNAL", "true"),
+            "post": {field: post.get(field) for field in fields},
+        }
+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def get(self, key):
+        row = self.db.execute("SELECT result_json FROM analysis_results "
+                              "WHERE cache_key = ? AND expires_at >= ?", (key, time.time())).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def put(self, key, result):
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO analysis_results VALUES (?, ?, ?)",
+                            (key, json.dumps(result, ensure_ascii=False, default=str),
+                             time.time() + self.ttl_seconds))
+
+
 class SentimentAPI:
-    def __init__(self, analyzer=None):
+    def __init__(self, analyzer=None, result_cache=None):
         self.ollama = analyzer or OllamaSentimentAnalyzer()
         self.headers = {
             'X-Internal-Token': BE_API_TOKEN,
@@ -2399,6 +2706,89 @@ class SentimentAPI:
         }
         self.last_pending_count = 0
         self.last_fetch_error = False
+        self.result_cache = result_cache
+        if (self.result_cache is None and isinstance(self.ollama, OllamaSentimentAnalyzer)
+                and os.environ.get("SENTIMENT_CACHE_ENABLED", "true").lower() in ("true", "1", "yes")):
+            try:
+                self.result_cache = AnalysisResultCache()
+            except (OSError, sqlite3.Error) as exc:
+                print(f"  [Cache] Disabled: {exc}")
+
+    @staticmethod
+    def _cacheable_result(result):
+        if not isinstance(result, dict) or result.get("sentiment") not in ("positive", "neutral", "negative"):
+            return False
+        if "ai_sentiment" not in result:
+            return False
+        model = str(result.get("model") or "").lower()
+        if model == "rule:provider_failure":
+            return result["sentiment"] == "neutral" and result["ai_sentiment"] == 0
+        return result.get("route") in ("jev", "deepseek") or ("jev" in model or "deepseek" in model)
+
+    @staticmethod
+    def _analysis_id(post):
+        return str(post.get("match_post_id") or post.get("id") or post.get("post_id") or post.get("msg_id") or "")
+
+    def _analyze_with_cache(self, posts):
+        cache = self.result_cache
+        if cache is None or GLOBAL_PROJECT_RESOLVER is not None:
+            return self.ollama.analyze_post_sentiments(posts).get("data", [])
+
+        groups = {}
+        results = []
+        cached_count = 0
+        try:
+            for post in posts:
+                key = cache.key(post)
+                cached = cache.get(key)
+                if self._cacheable_result(cached):
+                    results.append({**cached, "post_id": self._analysis_id(post)})
+                    cached_count += 1
+                else:
+                    groups.setdefault(key, []).append(post)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            print(f"  [Cache] Read failed; using AI for this batch: {exc}")
+            return self.ollama.analyze_post_sentiments(posts).get("data", [])
+
+        representatives = [group[0] for group in groups.values()]
+        analyzed = (self.ollama.analyze_post_sentiments(representatives).get("data", [])
+                    if representatives else [])
+        by_id = {str(row.get("post_id")): row for row in analyzed if isinstance(row, dict)}
+        retry_individually = []
+        shared_count = 0
+        for key, group in groups.items():
+            first = group[0]
+            row = by_id.get(self._analysis_id(first))
+            if row is None:
+                row = OllamaSentimentAnalyzer._neutral_error_result(
+                    self._analysis_id(first), first.get("project_name", ""))
+            results.append(row)
+            if self._cacheable_result(row):
+                try:
+                    cache.put(key, row)
+                except (OSError, sqlite3.Error, ValueError) as exc:
+                    print(f"  [Cache] Write failed: {exc}")
+                for duplicate in group[1:]:
+                    results.append({**row, "post_id": self._analysis_id(duplicate)})
+                    shared_count += 1
+            else:
+                # Targets without project metadata remain pending for a proper analysis.
+                retry_individually.extend(group[1:])
+        if retry_individually:
+            retried = self.ollama.analyze_post_sentiments(retry_individually).get("data", [])
+            results.extend(retried)
+            retried_by_id = {str(row.get("post_id")): row for row in retried if isinstance(row, dict)}
+            for post in retry_individually:
+                row = retried_by_id.get(self._analysis_id(post))
+                if self._cacheable_result(row):
+                    try:
+                        cache.put(cache.key(post), row)
+                    except (OSError, sqlite3.Error, ValueError) as exc:
+                        print(f"  [Cache] Write failed: {exc}")
+        if cached_count or shared_count:
+            print(f"  [Cache] Reused {cached_count} saved results and {shared_count} identical rows; "
+                  f"AI analyzed {len(representatives) + len(retry_individually)} rows")
+        return results
 
     def fetch_pending(self, date_from, date_to, retries=3, delay=2):
         self.last_fetch_error = False
@@ -2542,8 +2932,7 @@ class SentimentAPI:
                 modified_post["_analysis_scope"] = "keyword"
                 posts_for_ai.append(modified_post)
 
-            ollama_response = self.ollama.analyze_post_sentiments(posts_for_ai)
-            ollama_results = ollama_response.get("data", [])
+            ollama_results = self._analyze_with_cache(posts_for_ai)
             
             ollama_map = {}
             if isinstance(ollama_results, list):
@@ -2553,6 +2942,7 @@ class SentimentAPI:
                             "val": res["ai_sentiment"],
                             "ai_sentiment": res["ai_sentiment"],
                             "sentiment": res.get("sentiment"),
+                            "intent": normalize_intent(res.get("intent")) if res.get("entity_found", True) else None,
                             "positive_percent": res.get("positive_percent", 0),
                             "negative_percent": res.get("negative_percent", 0),
                             "neutral_percent": res.get("neutral_percent", 100),
@@ -2576,7 +2966,7 @@ class SentimentAPI:
                 if match_post_id in ollama_map:
                     if ollama_map[match_post_id]["model"] == "rule:unresolved_target":
                         unresolved_count += 1
-                        continue  # Unknown project is not a valid neutral classification.
+                        continue  # No target to classify against.
                     raw_val = ollama_map[match_post_id]["val"]
                     ai_reason = ollama_map[match_post_id]["reason"]
                     pos_score = ollama_map[match_post_id]["positive_percent"]
@@ -2617,6 +3007,9 @@ class SentimentAPI:
                             "model": model_used
                         }
                     })
+                    intent = ollama_map[match_post_id].get("intent")
+                    if intent:
+                        api_results[-1]["intent"] = intent
                     
                     keywords = post_for_ai.get("keywords", [])
                     keyword_str = ", ".join(keywords) if keywords else "None"
@@ -2624,7 +3017,8 @@ class SentimentAPI:
                     p_name = post_for_ai.get("project_name", "")
                     p_desc = post_for_ai.get("project_desc", "")
 
-                    print(f"  [{idx:02d}] {icon} 🆔 {match_post_id[:15]:<15} | {sentiment_str.upper():<8}")
+                    intent_label = ollama_map[match_post_id].get("intent") or "-"
+                    print(f"  [{idx:02d}] {icon} 🆔 {match_post_id[:15]:<15} | {sentiment_str.upper():<8} | intent={intent_label}")
                     if p_name:
                         desc_info = f" ({p_desc})" if p_desc else ""
                         print(f"       🏢 Project: {p_name}{desc_info}")
@@ -2637,17 +3031,17 @@ class SentimentAPI:
                     print(f"  {'-'*90}")
                         
             if unresolved_count:
-                print(f"  ⚠️ [REST API] Skipped {unresolved_count} posts with unresolved targets; they remain pending for project metadata.")
+                print(f"  ⚠️ [REST API] Skipped {unresolved_count} posts without a resolved target; they remain pending.")
             if save_db:
                 updated_count = self.bulk_update(api_results)
                 total_updated += updated_count
             else:
                 print(f"  🔒 [DRY-RUN: ปิดการบันทึก] ข้ามการบันทึกลง REST API ({len(api_results)} โพสต์) — จำลอง Payload ที่จะ POST:")
                 for item in api_results:
-                    print(f"      📝 [DRY-RUN POST] `/internal/sentiment/results` -> match_post_id='{item['match_post_id']}', id={item.get('id')}, sentiment='{item['sentiment']}', sentiment_scores={item['sentiment_scores']}")
+                    print(f"      📝 [DRY-RUN POST] `/internal/sentiment/results` -> match_post_id='{item['match_post_id']}', id={item.get('id')}, sentiment='{item['sentiment']}', intent={item.get('intent')}, sentiment_scores={item['sentiment_scores']}")
                 total_updated += len(api_results)
             fallback_count = sum(1 for item in ollama_map.values()
-                                 if item.get("model") in ("rule:provider_failure", "rule:unresolved_target"))
+                                 if item.get("model") == "rule:provider_failure")
             _log_batch_timing("REST API", batch_start, batch_end, len(batch), total_updated - updated_before,
                               fallback_count, save_db, batch_started)
         return total_updated

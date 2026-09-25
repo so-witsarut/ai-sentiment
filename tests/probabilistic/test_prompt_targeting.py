@@ -67,7 +67,8 @@ class PromptTargetingTests(unittest.TestCase):
         }
         session = MagicMock()
         session.post.return_value = response
-        post = {"match_post_id": "venue-mention", "keywords": ["Central Mall"],
+        post = {"match_post_id": "venue-mention", "project_name": "Central Mall",
+                "keywords": ["Central Mall"],
                 "content": "The cinema has too few film showings at Central Mall",
                 "_analysis_scope": "keyword"}
         with patch.object(module, "OPENROUTER_API_KEY", "offline-key"), \
@@ -78,12 +79,11 @@ class PromptTargetingTests(unittest.TestCase):
         self.assertEqual(session.post.call_count, 1)
         deepseek.assert_not_called()
         payload = session.post.call_args.kwargs["json"]
-        self.assertEqual(set(payload["questions"]), {"sentiment", "entity_relevance"})
-        self.assertIn("Target keywords=Central Mall", payload["state"])
+        self.assertEqual(set(payload["questions"]), {"sentiment", "entity_relevance", "intent"})
+        self.assertIn("Target=Central Mall", payload["state"])
         instructions = payload["questions"]["sentiment"]["instructions"].lower()
-        self.assertIn("in one pass", instructions)
-        self.assertIn("identify what it evaluates", instructions)
-        self.assertIn("reported quote", instructions)
+        self.assertIn("target project only", instructions)
+        self.assertIn("independent opinion", instructions)
         self.assertIn("named venue", payload["questions"]["sentiment"]["criteria"]["neutral"])
         self.assertEqual((result["sentiment"], result["route"]), ("neutral", "jev"))
 
@@ -122,34 +122,40 @@ class PromptTargetingTests(unittest.TestCase):
                          ("positive", True, "jev"))
         self.assertIn("BLCP", result["reason"])
 
-    def test_missing_entity_skips_paid_providers(self):
+    def test_missing_entity_uses_overall_post_sentiment(self):
         self.resolver.resolve_target.return_value = {
             "actual_target": "ค่าไฟ", "project_name": "", "project_desc": "",
             "is_rival": False, "competitor_matched": "",
         }
+        overall = jev_result(
+            {"positive": 0.02, "neutral": 0.04, "negative": 0.92, "irony": 0.02},
+            {"relevant": 1.0, "unrelated": 0.0, "uncertain": 0.0})
         with patch.object(module, "GLOBAL_PROJECT_RESOLVER", self.resolver), \
-             patch.object(self.analyzer, "_call_typesafe_jev") as call_jev, \
+             patch.object(self.analyzer, "_call_typesafe_jev", return_value=(overall, "jev")) as call_jev, \
              patch.object(self.analyzer, "_call_deepseek_fallback") as call_deepseek:
             result = self.analyzer._analyze_single_post(
                 {"match_post_id": "unknown-1", "project_id": "missing", "keywords": ["ค่าไฟ"],
                  "content": "ค่าไฟแพง"}
             )
-        call_jev.assert_not_called()
+        self.assertTrue(call_jev.call_args.kwargs["overall_scope"])
         call_deepseek.assert_not_called()
         self.assertEqual((result["model"], result["sentiment"], result["entity_found"]),
-                         ("rule:unresolved_target", "neutral", False))
+                         ("jev", "negative", True))
 
     def test_competitor_keyword_does_not_become_client_target(self):
         post = {"post_id": "rival-1", "content": "สิงห์ออกสินค้าใหม่", "tracking_kind": "competitor",
                 "actual_target": "สิงห์", "company_name": "Demo", "project_name": "Boonrawd",
                 "keywords": ["สิงห์"]}
+        overall = jev_result(
+            {"positive": 0.02, "neutral": 0.94, "negative": 0.02, "irony": 0.02},
+            {"relevant": 1.0, "unrelated": 0.0, "uncertain": 0.0})
         with patch.object(module, "GLOBAL_PROJECT_RESOLVER", None), \
-             patch.object(self.analyzer, "_call_typesafe_jev") as call_jev, \
+             patch.object(self.analyzer, "_call_typesafe_jev", return_value=(overall, "jev")) as call_jev, \
              patch.object(self.analyzer, "_call_deepseek_fallback") as call_deepseek:
             result = self.analyzer._analyze_single_post(post)
-        call_jev.assert_not_called()
+        self.assertTrue(call_jev.call_args.kwargs["overall_scope"])
         call_deepseek.assert_not_called()
-        self.assertEqual(result["model"], "rule:unresolved_target")
+        self.assertEqual((result["model"], result["sentiment"]), ("jev", "neutral"))
 
     def test_jev_payload_and_deepseek_prompt_use_same_target_contract(self):
         response = MagicMock(status_code=200)
@@ -210,7 +216,7 @@ class PromptTargetingTests(unittest.TestCase):
         self.assertEqual(model, module.DEEPSEEK_MODEL)
 
     def test_long_text_hard_cap_and_deepseek_variants(self):
-        text = "A" * 2500 + "BLCP ดำเนินงาน" + "B" * 2500 + "ค่าไฟ" + "C" * 2500
+        text = "A" * 2500 + " BLCP ดำเนินงาน " + "B" * 2500 + "ค่าไฟ" + "C" * 2500
         clipped = module.cap_text(text, max_chars=3000, keyword="ค่าไฟ", target="BLCP")
         self.assertLessEqual(len(clipped), 3000)
         self.assertIn("BLCP ดำเนินงาน", clipped)
