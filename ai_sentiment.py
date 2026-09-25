@@ -1364,10 +1364,13 @@ class OllamaSentimentAnalyzer:
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": user_prompt}
             ],
-            "response_format": {"type": "json_object"},
             "temperature": 0.0,
             "provider": provider_cfg
         }
+        # DeepSeek providers differ in JSON-mode support. The prompt already requests JSON,
+        # and the response is parsed and validated after generation.
+        if "deepseek" not in model_name.lower():
+            payload["response_format"] = {"type": "json_object"}
         if max_tokens:
             payload["max_tokens"] = max_tokens
         api_timeout = int(os.environ.get("OPENROUTER_API_TIMEOUT", 45))
@@ -2061,11 +2064,11 @@ class OllamaSentimentAnalyzer:
                                                else HYBRID_SYSTEM_PROMPT if HYBRID_PROMPT_V2 else PROBABILISTIC_SYSTEM_PROMPT)},
                 {"role": "user", "content": user_prompt}
             ],
-            "response_format": {"type": "json_object"},
             "temperature": 0.0,
             "max_tokens": DEEPSEEK_MAX_TOKENS,
             "provider": provider_cfg
         }
+        # Do not require provider-specific JSON mode; validate the prompted JSON below.
 
         session = self.get_session()
         provider_hint = providers[0] if providers else "openrouter"
@@ -2680,6 +2683,8 @@ class AnalysisResultCache:
             "jev_text_max_chars": JEV_TEXT_MAX_CHARS,
             "deepseek_text_max_chars": os.environ.get("DEEPSEEK_TEXT_MAX_CHARS", "3000"),
             "deepseek_include_jev_signal": os.environ.get("DEEPSEEK_INCLUDE_JEV_SIGNAL", "true"),
+            "openrouter_providers": os.environ.get("OPENROUTER_PROVIDERS", "OpenInference,Relace"),
+            "openrouter_allow_fallbacks": os.environ.get("OPENROUTER_ALLOW_FALLBACKS", "true"),
             "post": {field: post.get(field) for field in fields},
         }
         serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)

@@ -6,7 +6,7 @@ The worker evaluates sentiment and intent toward `project_name` when provided. K
 
 When `project_name` is absent, the worker classifies the overall sentiment and intent of the post. Jev then asks only the sentiment and intent questions; keywords still select the excerpt. The REST result can therefore be submitted without project metadata. Empty content remains neutral by rule.
 
-The exact prompts and REST input mapping are documented in [PROMPTS_REST_CURRENT.md](PROMPTS_REST_CURRENT.md).
+Set `OPENROUTER_PROVIDERS=relace/fp4` to prioritize Relace for DeepSeek. List several provider endpoint slugs separated by commas to try them in order. The DeepSeek route asks for JSON in its prompt and validates the result, so providers that do not support `response_format=json_object` can also run. Set `OPENROUTER_ALLOW_FALLBACKS=false` to restrict routing to the listed providers. Restart the worker after changing `.env`.
 
 `AI_COST_MODE=low` is the default. It accepts Jev results with moderate confidence when there is no conflict, and also accepts confidently unrelated results as neutral toward the project. This reduces DeepSeek calls but can miss subtle mentions or mixed opinions. `JEV_TEXT_MAX_CHARS=1800` limits Jev's excerpt around the project name and keyword; DeepSeek can still inspect up to `DEEPSEEK_TEXT_MAX_CHARS` (default 3000) when called. Set `AI_COST_MODE=standard` and `JEV_TEXT_MAX_CHARS=3000` to restore the previous routing and excerpt size. The usage log reports `low_cost_accepted` and `escalated` for each batch.
 
