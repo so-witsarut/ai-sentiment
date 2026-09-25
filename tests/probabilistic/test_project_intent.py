@@ -161,7 +161,7 @@ class ProjectIntentTests(unittest.TestCase):
         self.assertLessEqual(len(excerpt), module.JEV_TEXT_MAX_CHARS)
         self.assertEqual(result["intent"], "information")
 
-    def test_unrelated_keyword_is_neutral_and_has_no_intent(self):
+    def test_unrelated_keyword_is_neutral_and_keeps_intent(self):
         unrelated = module.validate_jev_response(jev_response("complaint", related=False))
         post = {"match_post_id": "p2", "project_name": "BLCP", "keywords": ["ค่าไฟ"],
                 "content": "ค่าไฟแพงมากในเดือนนี้", "_analysis_scope": "keyword"}
@@ -169,7 +169,7 @@ class ProjectIntentTests(unittest.TestCase):
             result = self.analyzer._analyze_single_post(post)
         self.assertEqual(result["sentiment"], "neutral")
         self.assertFalse(result["entity_found"])
-        self.assertIsNone(result["intent"])
+        self.assertEqual(result["intent"], "complaint")
 
     def test_short_latin_target_does_not_match_inside_other_words(self):
         self.assertEqual(module._find_term_index("The actor will appear on stage", "PEA"), -1)
@@ -236,7 +236,7 @@ class ProjectIntentTests(unittest.TestCase):
             api.run("2026-09-25", "2026-09-25", save_db=True)
         sent = {str(row["match_post_id"]): row for row in bulk.call_args.args[0]}
         self.assertEqual(sent["1"]["intent"], "enquiry")
-        self.assertNotIn("intent", sent["2"])
+        self.assertEqual(sent["2"]["intent"], "complaint")
         self.assertNotIn("intent", sent["3"])
 
 

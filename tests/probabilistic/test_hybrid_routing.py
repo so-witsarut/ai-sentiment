@@ -450,7 +450,7 @@ class TestHybridRouting(unittest.TestCase):
                     result = analyzer._hybrid_analyze_post(context)
                 self.assertEqual(result["sentiment"], "neutral")
                 self.assertFalse(result["entity_found"])
-                self.assertIsNone(result["intent"])
+                self.assertEqual(result["intent"], "information")
                 deepseek.assert_not_called()
 
     def test_low_cost_mode_still_escalates_uncertain_entity(self):

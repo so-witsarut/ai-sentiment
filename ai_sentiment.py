@@ -323,10 +323,9 @@ HYBRID_SYSTEM_PROMPT = (
     "AMBIGUOUS_OR_IRONY=sarcasm or mixed/unclear sentiment. "
     "Official Target announcements and self-praise are neutral unless an independent opinion is clearly quoted. "
     "Publisher and URL alone do not prove relevance or official ownership. "
-    "Also return intent as one of complaint, information, recommendation, enquiry when Target is relevant. "
-    "Classify the main purpose toward Target; pure praise is information. "
-    "Recommendation includes suggestions to improve Target and recommending Target to others. "
-    "If Target is unrelated, omit intent."
+    "Always return intent as one of complaint, information, recommendation, enquiry (even if Target is unrelated). "
+    "Classify the main purpose of the post; pure praise is information. "
+    "Recommendation includes suggestions to improve or recommending to others."
 )
 
 KEYWORD_SYSTEM_PROMPT = (
@@ -347,9 +346,10 @@ KEYWORD_SYSTEM_PROMPT = (
     "for example 'Love X? Shop today' is an ad, not a consumer endorsement; "
     "AMBIGUOUS_OR_IRONY=sarcasm or mixed/unclear sentiment. "
     "Official Target posts and self-praise are neutral unless they clearly quote an independent person's opinion. "
-    "For intent, classify the main purpose toward Target: complaint=grievance, information=facts or pure praise, "
-    "recommendation=suggestion to improve Target or recommend Target to others, enquiry=request for information. "
-    "A rhetorical question in a grievance is complaint. Omit intent when Target is unrelated. "
+    "For intent, always classify the main purpose of the post as complaint, information, recommendation, or enquiry (even if Target is unrelated): "
+    "complaint=grievance, information=facts or pure praise, "
+    "recommendation=suggestion to improve or recommend to others, enquiry=request for information. "
+    "A rhetorical question in a grievance is complaint. "
     "A preliminary Jev judgment may be included as a hint. Check the text independently, "
     "confirm the hint only when supported by the text, and correct it when the text disagrees. "
     "Do not mention Jev or the hint in the output."
@@ -1761,9 +1761,9 @@ class OllamaSentimentAnalyzer:
             "7. PERCENTAGES: positive_percent + negative_percent + neutral_percent MUST equal exactly 100. "
             "Use multiples of 5: 0,5,10,15,...,100.\n"
             "8. Never assign Target sentiment from an emotion that is directed at another entity.\n\n"
-            "9. Classify the main intent toward Target as complaint, information, recommendation, or enquiry. "
-            "Pure praise is information; suggestions to improve Target and recommendations to others are recommendation. "
-            "Omit intent when Target is unrelated. Publisher and URL alone do not prove relevance or official ownership.\n\n"
+            "9. Always classify the main intent of the post as complaint, information, recommendation, or enquiry (even if Target is unrelated). "
+            "Pure praise is information; suggestions to improve and recommendations to others are recommendation. "
+            "Publisher and URL alone do not prove relevance or official ownership.\n\n"
             "For reason, explain concisely in natural Thai and mention the Target-related context. No rule numbers.\n"
             'Return ONLY valid JSON with exactly these keys:\n'
             'Examples:\n'
@@ -1810,7 +1810,7 @@ class OllamaSentimentAnalyzer:
                     entity_found = entity_found.lower() in ("true", "1")
                 if not entity_found:
                     res.update({"positive_percent":0,"negative_percent":0,"neutral_percent":100,"ai_sentiment":0})
-                res["intent"] = normalize_intent(res.get("intent")) if entity_found else None
+                res["intent"] = normalize_intent(res.get("intent"))
                 res["post_id"] = post_id
                 res["model"] = actual_model
                 return res
@@ -1868,7 +1868,7 @@ class OllamaSentimentAnalyzer:
                         "post_id": post_id,
                         "ai_sentiment": policy["score"],
                         "sentiment": policy["sentiment"],
-                        "intent": norm.get("intent") if entity_found else None,
+                        "intent": normalize_intent(norm.get("intent")),
                         "positive_percent": policy["pos"],
                         "negative_percent": policy["neg"],
                         "neutral_percent": policy["neu"],
@@ -1958,7 +1958,7 @@ class OllamaSentimentAnalyzer:
                     "type": "choice",
                     "instructions": ("Classify the main purpose of the whole post. A rhetorical question inside a grievance is a complaint. Pure praise is information."
                                      if overall_scope else
-                                     "Classify the main purpose of the text concerning Target. A rhetorical question inside a grievance is a complaint. Pure praise is information. If Target is unrelated, choose information; the caller will omit intent."),
+                                     "Classify the main purpose of the post. A rhetorical question inside a grievance is a complaint. Pure praise is information. Always classify intent even if Target is unrelated."),
                     "criteria": {
                         "complaint": ("The main purpose is to criticize, blame, or complain."
                                       if overall_scope else "The main purpose is to criticize, blame, or complain about Target."),
@@ -2235,7 +2235,7 @@ class OllamaSentimentAnalyzer:
                 "post_id": post_id,
                 "ai_sentiment": policy["score"],
                 "sentiment": policy["sentiment"],
-                "intent": jev_raw.get("intent") if entity_found else None,
+                "intent": normalize_intent(jev_raw.get("intent")) if isinstance(jev_raw, dict) else None,
                 "positive_percent": policy["pos"],
                 "negative_percent": policy["neg"],
                 "neutral_percent": policy["neu"],
@@ -2268,7 +2268,7 @@ class OllamaSentimentAnalyzer:
                                     (max(entity_probabilities, key=entity_probabilities.get)
                                      if entity_probabilities else None),
                 "entity_confidence": jev_raw.get("entity_confidence"),
-                "intent": jev_raw.get("intent") if route_info.get("entity_found") else None
+                "intent": normalize_intent(jev_raw.get("intent")) if isinstance(jev_raw, dict) else None
             }
 
         if getattr(self._thread_local, "defer_deepseek", False):
@@ -2320,7 +2320,7 @@ class OllamaSentimentAnalyzer:
             "post_id": post_id,
             "ai_sentiment": policy["score"],
             "sentiment": policy["sentiment"],
-            "intent": (ds_result.get("intent") or jev_intent) if ds_entity_found else None,
+            "intent": normalize_intent(ds_result.get("intent")) or jev_intent,
             "positive_percent": policy["pos"],
             "negative_percent": policy["neg"],
             "neutral_percent": policy["neu"],
@@ -2947,7 +2947,7 @@ class SentimentAPI:
                             "val": res["ai_sentiment"],
                             "ai_sentiment": res["ai_sentiment"],
                             "sentiment": res.get("sentiment"),
-                            "intent": normalize_intent(res.get("intent")) if res.get("entity_found", True) else None,
+                            "intent": normalize_intent(res.get("intent")),
                             "positive_percent": res.get("positive_percent", 0),
                             "negative_percent": res.get("negative_percent", 0),
                             "neutral_percent": res.get("neutral_percent", 100),
