@@ -815,9 +815,9 @@ def build_jev_state_prompt(resolved_context):
 
 
 def build_deepseek_user_prompt(resolved_context, jev_signal=None, include_jev_signal=None):
+    max_chars = parse_bounded_int("DEEPSEEK_TEXT_MAX_CHARS", 3000, min_val=1200, max_val=8000)
     scope = resolved_context.get("analysis_scope")
     if scope in ("keyword", "overall"):
-        max_chars = parse_bounded_int("DEEPSEEK_TEXT_MAX_CHARS", 3000, min_val=3000, max_val=8000)
         full_text = resolved_context.get("clean_text") or resolved_context.get("capped_text") or ""
         keywords = resolved_context.get("keywords") or []
         first_match = next((k for k in keywords if _find_term_index(full_text, k) >= 0), "")
@@ -851,22 +851,26 @@ def build_deepseek_user_prompt(resolved_context, jev_signal=None, include_jev_si
             lines.insert(max(1, len(lines) - 1), hint)
         return "\n".join(lines)
     if not HYBRID_PROMPT_V2:
-        lines = _compact_context_lines(resolved_context)
+        text = resolved_context.get("capped_text") or resolved_context.get("clean_text") or ""
+        keywords = resolved_context.get("keywords") or []
+        first_match = next((k for k in keywords if _find_term_index(text, k) >= 0), "")
+        target = resolved_context.get("actual_target") or ""
+        excerpt = cap_text(text, max_chars=max_chars, keyword=first_match, target=target)
+        lines = _compact_context_lines(resolved_context, text_override=excerpt)
         if isinstance(jev_signal, dict):
             lines.append(f"Jev={jev_signal.get('probabilities')}; confidence={jev_signal.get('confidence')}; "
                          f"conflicts={jev_signal.get('conflict_reasons') or []}")
         return "\n".join(lines)
 
-    max_chars = parse_bounded_int("DEEPSEEK_TEXT_MAX_CHARS", 3000, min_val=3000, max_val=8000)
     full_text = resolved_context.get("clean_text") or resolved_context.get("capped_text") or ""
+    text = resolved_context.get("capped_text") or full_text
     if max_chars > 3000 and len(full_text) > 3000:
-        keywords = resolved_context.get("keywords") or []
-        target = resolved_context.get("sentiment_target", resolved_context.get("actual_target")) or ""
-        text_override = cap_text(full_text, max_chars=max_chars,
-                                 keyword=str(keywords[0]) if keywords else "", target=target)
-    else:
-        text_override = None
-    lines = _compact_context_lines(resolved_context, text_override=text_override)
+        text = full_text
+    keywords = resolved_context.get("keywords") or []
+    first_match = next((k for k in keywords if _find_term_index(text, k) >= 0), "")
+    target = resolved_context.get("sentiment_target", resolved_context.get("actual_target")) or ""
+    excerpt = cap_text(text, max_chars=max_chars, keyword=first_match, target=target)
+    lines = _compact_context_lines(resolved_context, text_override=excerpt)
     if include_jev_signal is None:
         include_jev_signal = os.environ.get("DEEPSEEK_INCLUDE_JEV_SIGNAL", "true").lower() in ("true", "1", "yes")
     if include_jev_signal and isinstance(jev_signal, dict):

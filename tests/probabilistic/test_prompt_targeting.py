@@ -238,6 +238,38 @@ class PromptTargetingTests(unittest.TestCase):
         self.assertNotIn("Jev=", longer_prompt)
         self.assertGreater(len(longer_prompt), len(short_prompt))
 
+    def test_deepseek_text_cap_applies_to_every_prompt_route(self):
+        long_text = "ต้น" * 500 + " BLCP " + "กลาง" * 500 + " ค่าไฟ " + "ท้าย" * 500
+        short_text = "BLCP ค่าไฟแพง"
+        for scope, prompt_v2 in (("keyword", True), ("overall", True),
+                                 (None, True), (None, False)):
+            for original in (short_text, long_text):
+                with self.subTest(scope=scope, prompt_v2=prompt_v2, length=len(original)):
+                    context = {
+                        "analysis_scope": scope,
+                        "actual_target": "BLCP",
+                        "sentiment_target": "BLCP",
+                        "project_name": "BLCP",
+                        "keywords": ["ค่าไฟ"],
+                        "source_info": "Publisher=official page",
+                        "clean_text": original,
+                        "capped_text": module.cap_text(original, max_chars=1800,
+                                                       keyword="ค่าไฟ", target="BLCP"),
+                    }
+                    with patch.object(module, "HYBRID_PROMPT_V2", prompt_v2), \
+                         patch.dict(os.environ, {"DEEPSEEK_TEXT_MAX_CHARS": "1200"}):
+                        prompt = module.build_deepseek_user_prompt(context)
+                    excerpt = prompt.split("Text=", 1)[1].split("\n", 1)[0]
+                    self.assertLessEqual(len(excerpt), 1200)
+                    self.assertIn("ค่าไฟ", excerpt)
+                    if scope != "overall":
+                        self.assertIn("BLCP", excerpt)
+                    if original == short_text:
+                        self.assertEqual(excerpt, short_text)
+                    else:
+                        self.assertTrue(excerpt.startswith("ต้น" * 50))
+                        self.assertTrue(excerpt.endswith("ท้าย" * 50))
+
     def test_default_prompt_stays_on_existing_route_until_canary(self):
         context = {"actual_target": "BLCP (หัวข้อ/คีย์เวิร์ด: ค่าไฟ)", "project_name": "BLCP",
                    "keywords": ["ค่าไฟ"], "source_info": "Source Link=https://example.org/post",
