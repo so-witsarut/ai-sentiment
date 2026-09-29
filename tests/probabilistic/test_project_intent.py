@@ -237,7 +237,7 @@ class ProjectIntentTests(unittest.TestCase):
         sent = {str(row["match_post_id"]): row for row in bulk.call_args.args[0]}
         self.assertEqual(sent["1"]["intent"], "enquiry")
         self.assertEqual(sent["2"]["intent"], "complaint")
-        self.assertNotIn("intent", sent["3"])
+        self.assertEqual(sent["3"]["intent"], "information")
 
 
 if __name__ == "__main__":

@@ -512,10 +512,11 @@ class TestHybridRouting(unittest.TestCase):
                 # Permitted fields
                 expected_keys = {
                     "match_post_id", "id", "post_id", "sentiment", "sentiment_score",
-                    "sentiment_status", "sentiment_reason", "ai_reason", "sentiment_scores"
+                    "sentiment_status", "sentiment_reason", "ai_reason", "sentiment_scores", "intent"
                 }
                 self.assertEqual(set(item.keys()), expected_keys)
                 self.assertEqual(item["match_post_id"], 2001)
+                self.assertEqual(item["intent"], "information")
                 self.assertEqual(item["sentiment_scores"]["positive"], 85)
                 self.assertEqual(item["sentiment_scores"]["negative"], 5)
                 self.assertEqual(item["sentiment_scores"]["neutral"], 10)

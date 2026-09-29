@@ -36,6 +36,24 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 BE_API_TOKEN = os.environ.get("BE_API_TOKEN", "")
 BE_API_BASE_URL = os.environ.get("BE_API_BASE_URL", "https://api.blueeye.io/api/v1")
 
+
+def provider_enabled(name):
+    """Read provider switches at call time so disabled providers cannot send requests."""
+    return os.environ.get(f"ENABLE_{name.upper()}", "true").strip().lower() in ("true", "1", "yes")
+
+
+DEFAULT_VALIDATION_MODELS = (
+    "gemma4:31b-cloud,api:gemini-3.1-flash-lite,api:gemini-3.5-flash-lite,"
+    "api:gemini-2.5-flash,api:gemini-2.5-flash-lite,api:gemini-3-flash,"
+    "api:gemini-3.5-flash"
+)
+
+
+def validation_models():
+    return [model.strip() for model in
+            os.environ.get("VALIDATION_MODELS", DEFAULT_VALIDATION_MODELS).split(",")
+            if model.strip()]
+
 # Reconfigure stdout for UTF-8 output on Windows
 try:
     if hasattr(sys.stdout, 'reconfigure') and sys.stdout.encoding != 'utf-8':
@@ -1206,6 +1224,10 @@ class OllamaSentimentAnalyzer:
         self.MAX_IN_FLIGHT = MAX_IN_FLIGHT
         self.DEEPSEEK_MAX_CONCURRENCY = DEEPSEEK_MAX_CONCURRENCY
         self.deepseek_semaphore = threading.BoundedSemaphore(self.DEEPSEEK_MAX_CONCURRENCY)
+        self.provider_semaphores = {
+            "gemini": threading.BoundedSemaphore(parse_bounded_int("GEMINI_MAX_CONCURRENCY", 1)),
+            "ollama": threading.BoundedSemaphore(parse_bounded_int("OLLAMA_MAX_CONCURRENCY", 1)),
+        }
         self._thread_local = threading.local()
 
     def get_session(self) -> requests.Session:
@@ -1224,6 +1246,10 @@ class OllamaSentimentAnalyzer:
     @session.setter
     def session(self, s):
         self._thread_local.session = s
+
+    def _post_provider(self, provider, url, **kwargs):
+        with self.provider_semaphores[provider]:
+            return self.session.post(url, **kwargs)
 
     def _record_provider_attempt(self, route, model, retry=False, response_data=None, provider_hint=""):
         metrics = getattr(self._thread_local, "usage_metrics", None)
@@ -1244,6 +1270,8 @@ class OllamaSentimentAnalyzer:
             self._thread_local.usage_metrics = previous
 
     def _call_gemini_api(self, model_name, system_instruction, user_prompt, max_retries=3, max_tokens=None):
+        if not provider_enabled("gemini"):
+            return None
         api_key = GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY", "")
         if not api_key:
             return None
@@ -1254,8 +1282,17 @@ class OllamaSentimentAnalyzer:
             gen_config["maxOutputTokens"] = max_tokens
 
         is_gemma = "gemma" in model_name.lower()
-        if is_gemma:
-            # Gemma models on Google AI Studio API do not support native system_instruction
+        is_gemma4 = model_name.lower().startswith("gemma-4-")
+        if is_gemma4:
+            gen_config["responseMimeType"] = "application/json"
+            gen_config["thinkingConfig"] = {"thinkingLevel": "minimal"}
+            payload = {
+                "system_instruction": {"parts": [{"text": system_instruction}]},
+                "contents": [{"parts": [{"text": user_prompt}]}],
+                "generationConfig": gen_config
+            }
+        elif is_gemma:
+            # Older Gemma models may require instructions in the user prompt.
             combined_prompt = f"{system_instruction}\n\n{user_prompt}"
             payload = {
                 "contents": [{"parts": [{"text": combined_prompt}]}],
@@ -1272,7 +1309,7 @@ class OllamaSentimentAnalyzer:
         
         for attempt in range(max_retries):
             try:
-                response = self.session.post(url, json=payload, timeout=api_timeout)
+                response = self._post_provider("gemini", url, json=payload, timeout=api_timeout)
                 # Fallback for models that reject system_instruction or responseMimeType with 400 Bad Request
                 if response.status_code == 400 and not is_gemma:
                     fallback_config = {"temperature": 0.0}
@@ -1282,7 +1319,7 @@ class OllamaSentimentAnalyzer:
                         "contents": [{"parts": [{"text": f"{system_instruction}\n\n{user_prompt}"}]}],
                         "generationConfig": fallback_config
                     }
-                    response = self.session.post(url, json=fallback_payload, timeout=api_timeout)
+                    response = self._post_provider("gemini", url, json=fallback_payload, timeout=api_timeout)
 
                 if response.status_code == 200:
                     res_data = response.json()
@@ -1342,6 +1379,8 @@ class OllamaSentimentAnalyzer:
         return None
 
     def _call_openrouter_api(self, model_name, system_instruction, user_prompt, max_retries=2, max_tokens=None):
+        if not provider_enabled("openrouter"):
+            return None
         api_key = OPENROUTER_API_KEY or os.environ.get("OPENROUTER_API_KEY", "")
         if not api_key:
             return None
@@ -1435,6 +1474,8 @@ class OllamaSentimentAnalyzer:
         return None
 
     def _call_ollama_generic(self, model_name, system_instruction, user_prompt):
+        if not provider_enabled("ollama"):
+            return None
         deep_timeout = int(os.environ.get("OLLAMA_DEEP_TIMEOUT", 30))
         payload_generate = {
             "model": model_name,
@@ -1445,7 +1486,7 @@ class OllamaSentimentAnalyzer:
             "options": {"temperature": 0.0, "seed": 42}
         }
         try:
-            response = self.session.post(self.base_url, json=payload_generate, timeout=deep_timeout)
+            response = self._post_provider("ollama", self.base_url, json=payload_generate, timeout=deep_timeout)
             if response.status_code == 200:
                 result_text = response.json().get("response", "{}")
                 parsed = self._parse_json_result(result_text)
@@ -1467,7 +1508,7 @@ class OllamaSentimentAnalyzer:
             "options": {"temperature": 0.0, "seed": 42}
         }
         try:
-            response = self.session.post(self.chat_url, json=payload_chat, timeout=deep_timeout)
+            response = self._post_provider("ollama", self.chat_url, json=payload_chat, timeout=deep_timeout)
             if response.status_code == 200:
                 result_text = response.json().get("message", {}).get("content", "{}")
                 return self._parse_json_result(result_text)
@@ -1699,6 +1740,8 @@ class OllamaSentimentAnalyzer:
 
     def _triage_post(self, post_id, content, actual_target=""):
         """PASS 1: conservative relevance + sentiment triage."""
+        if not provider_enabled("ollama"):
+            return True
         if not content or not str(content).strip():
             return False
 
@@ -1723,7 +1766,7 @@ class OllamaSentimentAnalyzer:
                         "num_ctx": 512, "num_batch": 256, "flash_attn": True}
         }
         try:
-            response = self.session.post(self.base_url, json=payload, timeout=self.triage_timeout)
+            response = self._post_provider("ollama", self.base_url, json=payload, timeout=self.triage_timeout)
             if response.status_code == 200:
                 return self._parse_triage_result(response.json().get("response", "{}"))
             print(f"  -> Triage HTTP Error [{post_id}]: {response.status_code}")
@@ -1781,23 +1824,10 @@ class OllamaSentimentAnalyzer:
             f"Source Info={source_info}\n"
             f"Text={expanded_content}"
         )
-        env_models = os.environ.get("VALIDATION_MODELS")
-        if env_models:
-            validation_models = [m.strip() for m in env_models.split(",") if m.strip()]
-        else:
-            validation_models = [
-                "openrouter:google/gemma-4-26b-a4b-it:free",
-                "openrouter:deepseek/deepseek-v4-flash-0731",
-                "gemma4:31b-cloud",
-                "api:gemma-4-26b-a4b-it",
-                "api:gemma-4-31b-it",
-                "api:gemini-3.1-flash-lite",
-                "api:gemini-2.5-flash",
-                "api:gemini-3.5-flash-lite",
-            ]
+        models = validation_models()
         openrouter_retries = int(os.environ.get("OPENROUTER_MAX_RETRIES", 2))
         gemini_retries = int(os.environ.get("GEMINI_MAX_RETRIES", 1))
-        for val_model in validation_models:
+        for val_model in models:
             if val_model.startswith("openrouter:"):
                 actual_model = val_model.replace("openrouter:", "", 1)
                 res = self._call_openrouter_api(actual_model, deep_system, deep_prompt, max_retries=openrouter_retries)
@@ -1831,19 +1861,14 @@ class OllamaSentimentAnalyzer:
         user_prompt_lines.append(f"Text={expanded_content}")
         user_prompt = "\n".join(user_prompt_lines)
 
-        env_models = os.environ.get("PROBABILISTIC_MODELS") or os.environ.get("VALIDATION_MODELS")
-        if env_models:
-            validation_models = [m.strip() for m in env_models.split(",") if m.strip()]
-        else:
-            validation_models = [
-                "openrouter:deepseek/deepseek-v4-flash-0731",
-                "api:gemini-2.5-flash",
-            ]
+        env_models = os.environ.get("PROBABILISTIC_MODELS")
+        models = ([m.strip() for m in env_models.split(",") if m.strip()]
+                  if env_models else validation_models())
 
         openrouter_retries = int(os.environ.get("OPENROUTER_MAX_RETRIES", 2))
         gemini_retries = int(os.environ.get("GEMINI_MAX_RETRIES", 2))
 
-        for val_model in validation_models:
+        for val_model in models:
             if val_model.startswith("openrouter:"):
                 actual_model = val_model.replace("openrouter:", "", 1)
                 res = self._call_openrouter_api(actual_model, PROBABILISTIC_SYSTEM_PROMPT, user_prompt, max_retries=openrouter_retries, max_tokens=500)
@@ -1903,6 +1928,8 @@ class OllamaSentimentAnalyzer:
         2. entity_relevance (choice: relevant, unrelated, uncertain) when a target exists
         3. intent (choice: complaint, information, recommendation, enquiry)
         """
+        if not provider_enabled("openrouter"):
+            return None, ""
         api_key = OPENROUTER_API_KEY or os.environ.get("OPENROUTER_API_KEY", "")
         if not api_key:
             return None, ""
@@ -2038,9 +2065,11 @@ class OllamaSentimentAnalyzer:
         DeepSeek deep reasoning fallback for low-confidence or conflicted posts.
         Bounded by DEEPSEEK_MAX_CONCURRENCY semaphore.
         """
+        if not provider_enabled("openrouter"):
+            return self._call_gemini_strict_fallback(resolved_context)
         api_key = OPENROUTER_API_KEY or os.environ.get("OPENROUTER_API_KEY", "")
         if not api_key:
-            return None, ""
+            return self._call_gemini_strict_fallback(resolved_context)
 
         url = "https://openrouter.ai/api/v1/chat/completions"
         headers = {
@@ -2126,58 +2155,38 @@ class OllamaSentimentAnalyzer:
         return self._call_gemini_strict_fallback(resolved_context, deadline)
 
     def _call_gemini_strict_fallback(self, resolved_context: Dict[str, Any], deadline: Optional[float] = None) -> Tuple[Optional[Dict[str, Any]], str]:
-        """Optional provider fallback to Gemini when DeepSeek is exhausted."""
-        gemini_key = GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY", "")
-        if not gemini_key:
-            return None, ""
-        env_models = os.environ.get("VALIDATION_MODELS") or ""
-        gemini_model = next((m.strip()[4:] for m in env_models.split(",") if m.strip().startswith("api:") and m.strip()[4:]), "")
-        if not gemini_model:
-            return None, ""
-
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}"
+        """Try enabled validation providers in their configured order."""
         user_prompt = build_deepseek_user_prompt(resolved_context)
-        payload = {
-            "system_instruction": {"parts": [{"text": (OVERALL_SYSTEM_PROMPT if resolved_context.get("analysis_scope") == "overall"
-                                                      else KEYWORD_SYSTEM_PROMPT if resolved_context.get("analysis_scope") == "keyword"
-                                                      else HYBRID_SYSTEM_PROMPT if HYBRID_PROMPT_V2 else PROBABILISTIC_SYSTEM_PROMPT)}]},
-            "contents": [{"parts": [{"text": user_prompt}]}],
-            "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json", "maxOutputTokens": 400}
-        }
-        session = self.get_session()
-        try:
-            remaining = (deadline - time.monotonic()) if deadline is not None else 30.0
-            if remaining <= 0:
-                return None, ""
-            if not self.deepseek_semaphore.acquire(timeout=remaining):
-                return None, ""
-            try:
-                remaining = (deadline - time.monotonic()) if deadline is not None else 30.0
-                if remaining <= 0:
-                    return None, ""
-                resp = session.post(url, json=payload, timeout=min(parse_bounded_int("GEMINI_API_TIMEOUT", 30, min_val=1, max_val=300), remaining))
-            finally:
-                self.deepseek_semaphore.release()
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                except (ValueError, TypeError):
-                    self._record_provider_attempt("deepseek", gemini_model, provider_hint="google-ai")
-                    return None, ""
-                self._record_provider_attempt("deepseek", gemini_model, response_data=data, provider_hint="google-ai")
-                candidates = data.get("candidates") if isinstance(data, dict) else None
-                if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict):
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    txt = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
-                    parsed = self._extract_json_from_text(txt)
-                    validated = validate_deepseek_response(parsed)
-                    if validated:
-                        return validated, gemini_model
+        system_prompt = (OVERALL_SYSTEM_PROMPT if resolved_context.get("analysis_scope") == "overall"
+                         else KEYWORD_SYSTEM_PROMPT if resolved_context.get("analysis_scope") == "keyword"
+                         else HYBRID_SYSTEM_PROMPT if HYBRID_PROMPT_V2 else PROBABILISTIC_SYSTEM_PROMPT)
+        for configured_model in validation_models():
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            if configured_model.startswith("api:"):
+                if not provider_enabled("gemini"):
+                    continue
+                model = configured_model[4:]
+                result = self._call_gemini_api(model, system_prompt, user_prompt,
+                                               max_retries=1, max_tokens=400)
+                provider = "google-ai"
+            elif configured_model.startswith("openrouter:"):
+                if not provider_enabled("openrouter"):
+                    continue
+                model = configured_model[len("openrouter:"):]
+                result = self._call_openrouter_api(model, system_prompt, user_prompt,
+                                                   max_retries=1, max_tokens=400)
+                provider = "openrouter"
             else:
-                self._record_provider_attempt("deepseek", gemini_model, provider_hint="google-ai")
-        except Exception:
-            self._record_provider_attempt("deepseek", gemini_model, provider_hint="google-ai")
-            pass
+                if not provider_enabled("ollama"):
+                    continue
+                model = configured_model
+                result = self._call_ollama_generic(model, system_prompt, user_prompt)
+                provider = "ollama"
+            self._record_provider_attempt("deepseek", model, provider_hint=provider)
+            validated = validate_deepseek_response(result)
+            if validated:
+                return validated, model
         return None, ""
 
     def _hybrid_analyze_post(self, resolved_context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2689,6 +2698,10 @@ class AnalysisResultCache:
             "deepseek_include_jev_signal": os.environ.get("DEEPSEEK_INCLUDE_JEV_SIGNAL", "true"),
             "openrouter_providers": os.environ.get("OPENROUTER_PROVIDERS", "OpenInference,Relace"),
             "openrouter_allow_fallbacks": os.environ.get("OPENROUTER_ALLOW_FALLBACKS", "true"),
+            "provider_switches": {name: provider_enabled(name)
+                                  for name in ("openrouter", "ollama", "gemini")},
+            "validation_models": validation_models(),
+            "probabilistic_models": os.environ.get("PROBABILISTIC_MODELS", ""),
             "post": {field: post.get(field) for field in fields},
         }
         serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
@@ -3016,9 +3029,8 @@ class SentimentAPI:
                             "model": model_used
                         }
                     })
-                    intent = ollama_map[match_post_id].get("intent")
-                    if intent:
-                        api_results[-1]["intent"] = intent
+                    intent = ollama_map[match_post_id].get("intent") or "information"
+                    api_results[-1]["intent"] = intent
                     
                     keywords = post_for_ai.get("keywords", [])
                     keyword_str = ", ".join(keywords) if keywords else "None"
@@ -3026,8 +3038,7 @@ class SentimentAPI:
                     p_name = post_for_ai.get("project_name", "")
                     p_desc = post_for_ai.get("project_desc", "")
 
-                    intent_label = ollama_map[match_post_id].get("intent") or "-"
-                    print(f"  [{idx:02d}] {icon} 🆔 {match_post_id[:15]:<15} | {sentiment_str.upper():<8} | intent={intent_label}")
+                    print(f"  [{idx:02d}] {icon} 🆔 {match_post_id[:15]:<15} | {sentiment_str.upper():<8} | intent={intent}")
                     if p_name:
                         desc_info = f" ({p_desc})" if p_desc else ""
                         print(f"       🏢 Project: {p_name}{desc_info}")

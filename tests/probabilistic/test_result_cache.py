@@ -81,7 +81,7 @@ class TestResultCache(unittest.TestCase):
         self.assertEqual([row["match_post_id"] for row in sent], ["a", "b"])
         self.assertTrue(all(row["sentiment"] == "neutral" for row in sent))
         self.assertTrue(all(row["sentiment_scores"]["neutral"] == 100 for row in sent))
-        self.assertTrue(all("intent" not in row for row in sent))
+        self.assertTrue(all(row["intent"] == "information" for row in sent))
         api.result_cache.db.close()
 
         second_analyzer = Mock()
