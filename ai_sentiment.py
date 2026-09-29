@@ -18,7 +18,7 @@ import requests
 import threading
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 from typing import Any, Optional, Dict, List, Tuple, Union
 
@@ -53,6 +53,76 @@ def validation_models():
     return [model.strip() for model in
             os.environ.get("VALIDATION_MODELS", DEFAULT_VALIDATION_MODELS).split(",")
             if model.strip()]
+
+
+def _schedule_minute(name, default):
+    value = os.environ.get(name, default).strip()
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+        raise ValueError(f"Configuration error: {name} must be HH:MM (00:00–23:59)")
+    hour, minute = map(int, value.split(":"))
+    return hour * 60 + minute
+
+
+PROVIDER_SCHEDULE_ENABLED = os.environ.get("PROVIDER_SCHEDULE_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+OPENROUTER_SCHEDULE_START = _schedule_minute("OPENROUTER_SCHEDULE_START", "08:00")
+OPENROUTER_SCHEDULE_END = _schedule_minute("OPENROUTER_SCHEDULE_END", "22:00")
+if PROVIDER_SCHEDULE_ENABLED and OPENROUTER_SCHEDULE_START == OPENROUTER_SCHEDULE_END:
+    raise ValueError("Configuration error: OpenRouter schedule start and end must differ")
+THAI_TIMEZONE = timezone(timedelta(hours=7))
+
+
+def current_provider_profile(now=None):
+    """Choose once per post using Thailand time, independent of the PC timezone."""
+    if not PROVIDER_SCHEDULE_ENABLED:
+        return "off"
+    now = now or datetime.now(THAI_TIMEZONE)
+    local = now.astimezone(THAI_TIMEZONE)
+    minute = local.hour * 60 + local.minute
+    start, end = OPENROUTER_SCHEDULE_START, OPENROUTER_SCHEDULE_END
+    daytime = start <= minute < end if start < end else minute >= start or minute < end
+    return "daytime" if daytime else "overnight"
+
+
+def _model_provider(model):
+    if model.startswith("api:"):
+        return "gemini"
+    if model.startswith("openrouter:"):
+        return "openrouter"
+    return "ollama"
+
+
+def ordered_validation_models(profile="off", providers=None, models=None):
+    """Keep model order within each provider while choosing the scheduled provider order."""
+    configured = list(validation_models() if models is None else models)
+    order = {"daytime": ("openrouter", "gemini", "ollama"),
+             "overnight": ("gemini", "ollama", "openrouter")}.get(profile)
+    if providers is not None:
+        configured = [model for model in configured if _model_provider(model) in providers]
+    if order is None:
+        return configured
+    return [model for provider in order for model in configured if _model_provider(model) == provider]
+
+
+def scheduled_legacy_models(profile, models=None):
+    configured = list(validation_models() if models is None else models)
+    if profile != "off":
+        primary = f"openrouter:{DEEPSEEK_MODEL}"
+        if primary not in configured:
+            configured.insert(0, primary)
+    return ordered_validation_models(profile, models=configured)
+
+
+def inference_provider(model):
+    if model.startswith("rule:"):
+        return "rule"
+    if model in (JEV_MODEL, DEEPSEEK_MODEL):
+        return "openrouter"
+    for configured in validation_models():
+        if configured.split(":", 1)[-1] == model and configured.startswith(("api:", "openrouter:")):
+            return _model_provider(configured)
+        if configured == model:
+            return "ollama"
+    return "unknown"
 
 # Reconfigure stdout for UTF-8 output on Windows
 try:
@@ -239,12 +309,12 @@ class _BatchUsageMetrics:
         self._lock = threading.Lock()
         self._providers = {}
 
-    def record(self, route, model, provider, retry, response_data=None):
+    def record(self, route, model, provider, retry, response_data=None, profile="off"):
         usage = _extract_provider_usage(response_data)
-        key = (str(route), str(model or "unknown"), str(provider or "unknown"))
+        key = (str(route), str(model or "unknown"), str(provider or "unknown"), str(profile))
         with self._lock:
             row = self._providers.setdefault(key, {
-                "route": key[0], "model": key[1], "provider": key[2],
+                "route": key[0], "model": key[1], "provider": key[2], "profile": key[3],
                 "requests": 0, "retries": 0, "input_tokens": 0,
                 "output_tokens": 0, "cached_tokens": 0, "cost": 0.0,
                 "cache_discount": 0.0
@@ -260,7 +330,7 @@ class _BatchUsageMetrics:
     def summary(self, results):
         with self._lock:
             providers = [dict(row) for row in self._providers.values()]
-        providers.sort(key=lambda row: (row["route"], row["model"], row["provider"]))
+        providers.sort(key=lambda row: (row["profile"], row["route"], row["model"], row["provider"]))
         routes = {"jev": 0, "deepseek": 0, "rule": 0}
         escalated_posts = 0
         low_cost_accepted = 0
@@ -299,7 +369,7 @@ def _log_cost_telemetry(telemetry):
           f"cost=${telemetry.get('cost', 0.0):.6f} cache_discount=${telemetry.get('cache_discount', 0.0):.6f}")
     for row in telemetry.get("providers", []):
         print("     ↳ "
-              f"{row['route']} model={row['model']} provider={row['provider']} requests={row['requests']} "
+              f"profile={row['profile']} {row['route']} model={row['model']} provider={row['provider']} requests={row['requests']} "
               f"input={row['input_tokens']} output={row['output_tokens']} "
               f"cached={row['cached_tokens']} retries={row['retries']} cost=${row['cost']:.6f}")
 
@@ -1259,15 +1329,20 @@ class OllamaSentimentAnalyzer:
         if isinstance(response_data, dict):
             provider = response_data.get("provider") or response_data.get("provider_name") or provider
             model = response_data.get("model") or model
-        metrics.record(route, model, provider, retry, response_data)
+        profile = getattr(self._thread_local, "provider_profile", "off")
+        metrics.record(route, model, provider, retry, response_data, profile=profile)
 
     def _run_with_usage_metrics(self, metrics, func, *args):
         previous = getattr(self._thread_local, "usage_metrics", None)
+        previous_profile = getattr(self._thread_local, "provider_profile", "off")
+        context = args[0] if args and isinstance(args[0], dict) else {}
         self._thread_local.usage_metrics = metrics
+        self._thread_local.provider_profile = context.get("_provider_profile", "off")
         try:
             return func(*args)
         finally:
             self._thread_local.usage_metrics = previous
+            self._thread_local.provider_profile = previous_profile
 
     def _call_gemini_api(self, model_name, system_instruction, user_prompt, max_retries=3, max_tokens=None):
         if not provider_enabled("gemini"):
@@ -1308,10 +1383,13 @@ class OllamaSentimentAnalyzer:
         api_timeout = int(os.environ.get("GEMINI_API_TIMEOUT", 30))
         
         for attempt in range(max_retries):
+            recorded = False
             try:
                 response = self._post_provider("gemini", url, json=payload, timeout=api_timeout)
                 # Fallback for models that reject system_instruction or responseMimeType with 400 Bad Request
                 if response.status_code == 400 and not is_gemma:
+                    self._record_provider_attempt("deepseek", model_name, attempt > 0,
+                                                  provider_hint="google-ai")
                     fallback_config = {"temperature": 0.0}
                     if max_tokens:
                         fallback_config["maxOutputTokens"] = max_tokens
@@ -1323,9 +1401,12 @@ class OllamaSentimentAnalyzer:
 
                 if response.status_code == 200:
                     res_data = response.json()
+                    self._record_provider_attempt("deepseek", model_name, attempt > 0,
+                                                  res_data, "google-ai")
+                    recorded = True
                     candidates = res_data.get("candidates") or []
                     if not candidates:
-                        print(f"  -> Gemini API Empty Candidates [{model_name}]: {res_data}")
+                        print(f"  -> Gemini API Empty Candidates [{model_name}]")
                         continue
                     candidate = candidates[0] if isinstance(candidates[0], dict) else {}
                     content = candidate.get("content") or {}
@@ -1353,7 +1434,10 @@ class OllamaSentimentAnalyzer:
                             time.sleep(2)
                         continue
                     return parsed_res
-                elif response.status_code == 404:
+                self._record_provider_attempt("deepseek", model_name, attempt > 0,
+                                              provider_hint="google-ai")
+                recorded = True
+                if response.status_code == 404:
                     print(f"  -> Gemini API Model Not Found [{model_name}]: 404 (ข้ามโมเดลนี้ทันที)")
                     break
                 elif response.status_code == 429:
@@ -1369,11 +1453,14 @@ class OllamaSentimentAnalyzer:
                         time.sleep(retry_after)
                         continue
                 else:
-                    print(f"  -> Gemini API Error [{model_name}]: {response.status_code} - {response.text[:200]}")
+                    print(f"  -> Gemini API Error [{model_name}]: HTTP {response.status_code} - {response.text[:200].replace(api_key, '[redacted]')}")
                     if attempt < max_retries - 1:
                         time.sleep(2)
             except Exception as e:
-                print(f"  -> Gemini API Exception [{model_name}]: {e}")
+                if not recorded:
+                    self._record_provider_attempt("deepseek", model_name, attempt > 0,
+                                                  provider_hint="google-ai")
+                print(f"  -> Gemini API Exception [{model_name}]: {type(e).__name__}")
                 if attempt < max_retries - 1:
                     time.sleep(2)
         return None
@@ -1419,13 +1506,17 @@ class OllamaSentimentAnalyzer:
         api_timeout = int(os.environ.get("OPENROUTER_API_TIMEOUT", 45))
 
         for attempt in range(max_retries):
+            recorded = False
             try:
                 response = self.session.post(url, headers=headers, json=payload, timeout=api_timeout)
                 if response.status_code == 200:
                     res_data = response.json()
+                    self._record_provider_attempt("deepseek", model_name, attempt > 0,
+                                                  res_data, "openrouter")
+                    recorded = True
                     choices = res_data.get("choices") or []
                     if not choices:
-                        print(f"  -> OpenRouter API Empty Choices [{model_name}]: {res_data}")
+                        print(f"  -> OpenRouter API Empty Choices [{model_name}]")
                         continue
                     message = choices[0].get("message") or {}
                     result_text = message.get("content") or ""
@@ -1445,8 +1536,11 @@ class OllamaSentimentAnalyzer:
                             time.sleep(2)
                         continue
                     return parsed_res
-                elif response.status_code in (401, 403):
-                    print(f"  -> OpenRouter Auth Error [{model_name}]: {response.status_code} - {response.text[:200]}")
+                self._record_provider_attempt("deepseek", model_name, attempt > 0,
+                                              provider_hint="openrouter")
+                recorded = True
+                if response.status_code in (401, 403):
+                    print(f"  -> OpenRouter Auth Error [{model_name}]: HTTP {response.status_code} - {response.text[:200].replace(api_key, '[redacted]')}")
                     break
                 elif response.status_code == 404:
                     print(f"  -> OpenRouter Model Not Found [{model_name}]: 404")
@@ -1464,11 +1558,14 @@ class OllamaSentimentAnalyzer:
                         time.sleep(retry_after)
                         continue
                 else:
-                    print(f"  -> OpenRouter API Error [{model_name}]: {response.status_code} - {response.text[:200]}")
+                    print(f"  -> OpenRouter API Error [{model_name}]: HTTP {response.status_code} - {response.text[:200].replace(api_key, '[redacted]')}")
                     if attempt < max_retries - 1:
                         time.sleep(2)
             except Exception as e:
-                print(f"  -> OpenRouter API Exception [{model_name}]: {e}")
+                if not recorded:
+                    self._record_provider_attempt("deepseek", model_name, attempt > 0,
+                                                  provider_hint="openrouter")
+                print(f"  -> OpenRouter API Exception [{model_name}]: {type(e).__name__}")
                 if attempt < max_retries - 1:
                     time.sleep(2)
         return None
@@ -1777,7 +1874,7 @@ class OllamaSentimentAnalyzer:
     # -----------------------------------------------------------------
     # PASS 2: Deep Analysis (Gemma API)
     # -----------------------------------------------------------------
-    def _deep_analyze_post(self, post_id, actual_target, source_info, expanded_content):
+    def _deep_analyze_post(self, post_id, actual_target, source_info, expanded_content, provider_profile="off"):
         """PASS 2: Deep Target-specific sentiment distribution."""
         # Static instruction for Prefix Caching (100% identical across all requests)
         deep_system = (
@@ -1824,7 +1921,7 @@ class OllamaSentimentAnalyzer:
             f"Source Info={source_info}\n"
             f"Text={expanded_content}"
         )
-        models = validation_models()
+        models = scheduled_legacy_models(provider_profile)
         openrouter_retries = int(os.environ.get("OPENROUTER_MAX_RETRIES", 2))
         gemini_retries = int(os.environ.get("GEMINI_MAX_RETRIES", 1))
         for val_model in models:
@@ -1850,7 +1947,7 @@ class OllamaSentimentAnalyzer:
                 return res
         return None
 
-    def _probabilistic_analyze_post(self, post_id, actual_target, source_info, expanded_content, project_name="", project_desc=""):
+    def _probabilistic_analyze_post(self, post_id, actual_target, source_info, expanded_content, project_name="", project_desc="", provider_profile="off"):
         """Single-Pass Direct Probabilistic Inference (Zero String Tax + System 1 Engine)."""
         user_prompt_lines = [f"Target Entity={actual_target}"]
         if project_name:
@@ -1862,8 +1959,9 @@ class OllamaSentimentAnalyzer:
         user_prompt = "\n".join(user_prompt_lines)
 
         env_models = os.environ.get("PROBABILISTIC_MODELS")
-        models = ([m.strip() for m in env_models.split(",") if m.strip()]
-                  if env_models else validation_models())
+        models = scheduled_legacy_models(
+            provider_profile,
+            [m.strip() for m in env_models.split(",") if m.strip()] if env_models else None)
 
         openrouter_retries = int(os.environ.get("OPENROUTER_MAX_RETRIES", 2))
         gemini_retries = int(os.environ.get("GEMINI_MAX_RETRIES", 2))
@@ -2065,11 +2163,23 @@ class OllamaSentimentAnalyzer:
         DeepSeek deep reasoning fallback for low-confidence or conflicted posts.
         Bounded by DEEPSEEK_MAX_CONCURRENCY semaphore.
         """
-        if not provider_enabled("openrouter"):
+        profile = resolved_context.get("_provider_profile", "off")
+        if profile == "overnight":
+            first_result = self._call_gemini_strict_fallback(
+                resolved_context, providers=("gemini", "ollama"))
+            if first_result[0] is not None:
+                return first_result
+
+        def after_openrouter():
+            if profile == "overnight":
+                return self._call_gemini_strict_fallback(resolved_context, providers=("openrouter",))
             return self._call_gemini_strict_fallback(resolved_context)
+
+        if not provider_enabled("openrouter"):
+            return after_openrouter()
         api_key = OPENROUTER_API_KEY or os.environ.get("OPENROUTER_API_KEY", "")
         if not api_key:
-            return self._call_gemini_strict_fallback(resolved_context)
+            return after_openrouter()
 
         url = "https://openrouter.ai/api/v1/chat/completions"
         headers = {
@@ -2109,14 +2219,14 @@ class OllamaSentimentAnalyzer:
         for attempt in range(1 + DEEPSEEK_MAX_RETRIES):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return None, ""
+                return after_openrouter()
             try:
                 if not self.deepseek_semaphore.acquire(timeout=remaining):
-                    return None, ""
+                    return after_openrouter()
                 try:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        return None, ""
+                        break
                     response = session.post(url, headers=headers, json=payload, timeout=min(DEEPSEEK_API_TIMEOUT, remaining))
                 finally:
                     self.deepseek_semaphore.release()
@@ -2131,36 +2241,38 @@ class OllamaSentimentAnalyzer:
                     res_data = response.json()
                 except (ValueError, TypeError):
                     self._record_provider_attempt("deepseek", DEEPSEEK_MODEL, attempt > 0, provider_hint=provider_hint)
-                    return None, ""
+                    return after_openrouter()
                 self._record_provider_attempt("deepseek", DEEPSEEK_MODEL, attempt > 0, res_data, provider_hint)
                 if not isinstance(res_data, dict):
-                    return None, ""
+                    return after_openrouter()
                 choices = res_data.get("choices")
                 if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-                    return None, ""
+                    return after_openrouter()
                 msg = choices[0].get("message")
                 if not isinstance(msg, dict):
-                    return None, ""
+                    return after_openrouter()
                 parsed = self._extract_json_from_text(msg.get("content"))
                 validated = validate_deepseek_response(parsed)
-                return (validated, DEEPSEEK_MODEL) if validated else (None, "")
+                return (validated, DEEPSEEK_MODEL) if validated else after_openrouter()
             self._record_provider_attempt("deepseek", DEEPSEEK_MODEL, attempt > 0, provider_hint=provider_hint)
             if response.status_code in (408, 409, 425, 429) or response.status_code >= 500:
                 if attempt < DEEPSEEK_MAX_RETRIES and _retry_within_deadline(attempt, deadline, response):
                     continue
                 break
             print(f"  ❌ [DeepSeek Error] HTTP {response.status_code} - Non-retryable")
-            return None, ""
+            return after_openrouter()
 
-        return self._call_gemini_strict_fallback(resolved_context, deadline)
+        return after_openrouter()
 
-    def _call_gemini_strict_fallback(self, resolved_context: Dict[str, Any], deadline: Optional[float] = None) -> Tuple[Optional[Dict[str, Any]], str]:
+    def _call_gemini_strict_fallback(self, resolved_context: Dict[str, Any], deadline: Optional[float] = None,
+                                     providers=None) -> Tuple[Optional[Dict[str, Any]], str]:
         """Try enabled validation providers in their configured order."""
         user_prompt = build_deepseek_user_prompt(resolved_context)
         system_prompt = (OVERALL_SYSTEM_PROMPT if resolved_context.get("analysis_scope") == "overall"
                          else KEYWORD_SYSTEM_PROMPT if resolved_context.get("analysis_scope") == "keyword"
                          else HYBRID_SYSTEM_PROMPT if HYBRID_PROMPT_V2 else PROBABILISTIC_SYSTEM_PROMPT)
-        for configured_model in validation_models():
+        profile = resolved_context.get("_provider_profile", "off")
+        for configured_model in ordered_validation_models(profile, providers=providers):
             if deadline is not None and time.monotonic() >= deadline:
                 break
             if configured_model.startswith("api:"):
@@ -2183,7 +2295,7 @@ class OllamaSentimentAnalyzer:
                 model = configured_model
                 result = self._call_ollama_generic(model, system_prompt, user_prompt)
                 provider = "ollama"
-            self._record_provider_attempt("deepseek", model, provider_hint=provider)
+                self._record_provider_attempt("deepseek", model, provider_hint=provider)
             validated = validate_deepseek_response(result)
             if validated:
                 return validated, model
@@ -2220,7 +2332,7 @@ class OllamaSentimentAnalyzer:
         jev_raw = None
         jev_model_used = ""
 
-        if not is_placeholder or overall_scope:
+        if resolved_context.get("_provider_profile") != "overnight" and (not is_placeholder or overall_scope):
             state_prompt = build_jev_state_prompt(resolved_context)
             if overall_scope:
                 jev_raw, jev_model_used = self._call_typesafe_jev(
@@ -2356,6 +2468,7 @@ class OllamaSentimentAnalyzer:
             "post_id": str(post_id),
             "ai_sentiment": 0,
             "sentiment": "neutral",
+            "intent": "information",
             "positive_percent": 0,
             "negative_percent": 0,
             "neutral_percent": 100,
@@ -2380,6 +2493,7 @@ class OllamaSentimentAnalyzer:
     # Main Pipeline: Hybrid (Jev + DeepSeek) or Legacy
     # -----------------------------------------------------------------
     def _analyze_single_post(self, post, company_name=""):
+        provider_profile = post.get("_provider_profile") or current_provider_profile()
         raw_id = post.get("match_post_id") or post.get("id") or post.get("post_id") or post.get("msg_id", "")
         post_id = str(raw_id)
         raw_id = None
@@ -2431,6 +2545,7 @@ class OllamaSentimentAnalyzer:
             first_keyword = target_keywords[0] if target_keywords else ""
             return self._hybrid_analyze_post({
                 "post_id": post_id,
+                "_provider_profile": provider_profile,
                 "analysis_scope": "overall" if overall_scope else "keyword",
                 "actual_target": analysis_target,
                 "sentiment_target": analysis_target,
@@ -2506,6 +2621,7 @@ class OllamaSentimentAnalyzer:
 
         resolved_context = {
             "post_id": post_id,
+            "_provider_profile": provider_profile,
             "actual_target": actual_target,
             "sentiment_target": sentiment_target,
             "project_name": project_name,
@@ -2523,6 +2639,16 @@ class OllamaSentimentAnalyzer:
         # --- LEGACY MODES (IF ENABLE_JEV_HYBRID=False) ---
         expanded_content = get_keyword_context(clean_raw_text, str(first_keyword), window=300) if first_keyword else clean_raw_text
         content = get_keyword_context(clean_raw_text, str(first_keyword), window=150) if first_keyword else clean_raw_text
+
+        if provider_profile != "off":
+            if ENABLE_PROBABILISTIC_MODE:
+                return self._probabilistic_analyze_post(
+                    post_id, actual_target, source_info, expanded_content,
+                    project_name=project_name, project_desc=project_desc,
+                    provider_profile=provider_profile)
+            return self._deep_analyze_post(
+                post_id, actual_target, source_info, expanded_content,
+                provider_profile=provider_profile)
 
         if ENABLE_PROBABILISTIC_MODE:
             if BYPASS_LOCAL_TRIAGE:
@@ -2600,7 +2726,7 @@ class OllamaSentimentAnalyzer:
                 duplicate_count += 1
                 continue
             seen_ids.add(pid)
-            unique_posts.append(post)
+            unique_posts.append({**post, "_provider_profile": post.get("_provider_profile") or current_provider_profile()})
 
         if duplicate_count > 0:
             print(f"  ⚠️ [Deduplication] พบโพสต์ซ้ำ {duplicate_count} รายการใน Batch (ประมวลผล {len(unique_posts)} โพสต์)")
@@ -2700,6 +2826,7 @@ class AnalysisResultCache:
             "openrouter_allow_fallbacks": os.environ.get("OPENROUTER_ALLOW_FALLBACKS", "true"),
             "provider_switches": {name: provider_enabled(name)
                                   for name in ("openrouter", "ollama", "gemini")},
+            "provider_profile": post.get("_provider_profile") or current_provider_profile(),
             "validation_models": validation_models(),
             "probabilistic_models": os.environ.get("PROBABILISTIC_MODELS", ""),
             "post": {field: post.get(field) for field in fields},
@@ -2728,13 +2855,8 @@ class SentimentAPI:
         }
         self.last_pending_count = 0
         self.last_fetch_error = False
+        # The production worker analyzes pending posts without persisting results locally.
         self.result_cache = result_cache
-        if (self.result_cache is None and isinstance(self.ollama, OllamaSentimentAnalyzer)
-                and os.environ.get("SENTIMENT_CACHE_ENABLED", "true").lower() in ("true", "1", "yes")):
-            try:
-                self.result_cache = AnalysisResultCache()
-            except (OSError, sqlite3.Error) as exc:
-                print(f"  [Cache] Disabled: {exc}")
 
     @staticmethod
     def _cacheable_result(result):
@@ -2744,7 +2866,7 @@ class SentimentAPI:
             return False
         model = str(result.get("model") or "").lower()
         if model == "rule:provider_failure":
-            return result["sentiment"] == "neutral" and result["ai_sentiment"] == 0
+            return False
         return result.get("route") in ("jev", "deepseek") or ("jev" in model or "deepseek" in model)
 
     @staticmethod
@@ -2761,6 +2883,8 @@ class SentimentAPI:
         cached_count = 0
         try:
             for post in posts:
+                if not post.get("_provider_profile"):
+                    post["_provider_profile"] = current_provider_profile()
                 key = cache.key(post)
                 cached = cache.get(key)
                 if self._cacheable_result(cached):
@@ -2785,11 +2909,13 @@ class SentimentAPI:
                 row = OllamaSentimentAnalyzer._neutral_error_result(
                     self._analysis_id(first), first.get("project_name", ""))
             results.append(row)
-            if self._cacheable_result(row):
-                try:
-                    cache.put(key, row)
-                except (OSError, sqlite3.Error, ValueError) as exc:
-                    print(f"  [Cache] Write failed: {exc}")
+            cacheable = self._cacheable_result(row)
+            if cacheable or row.get("model") == "rule:provider_failure":
+                if cacheable:
+                    try:
+                        cache.put(key, row)
+                    except (OSError, sqlite3.Error, ValueError) as exc:
+                        print(f"  [Cache] Write failed: {exc}")
                 for duplicate in group[1:]:
                     results.append({**row, "post_id": self._analysis_id(duplicate)})
                     shared_count += 1
@@ -2812,45 +2938,127 @@ class SentimentAPI:
                   f"AI analyzed {len(representatives) + len(retry_individually)} rows")
         return results
 
-    def fetch_pending(self, date_from, date_to, retries=3, delay=2):
-        self.last_fetch_error = False
-        url = f"{BE_API_BASE_URL}/internal/sentiment/pending?date_from={date_from}&date_to={date_to}"
-        print(f"\n🌐 [Flow 1: REST API] กำลังดึงข้อมูลผ่าน REST API ({url})...")
-        for attempt in range(1, retries + 1):
+    @staticmethod
+    def _unpack_posts_page(payload):
+        """Return rows and pagination fields from supported REST response envelopes."""
+        if isinstance(payload, list):
+            return payload, {}
+        if not isinstance(payload, dict):
+            raise ValueError("Expected a list or object from the posts API")
+
+        metadata = {}
+        for container in (payload, payload.get("data")):
+            if not isinstance(container, dict):
+                continue
+            metadata.update({key: container[key] for key in
+                             ("has_next", "hasNext", "next_page", "nextPage",
+                              "total_pages", "totalPages", "last_page", "total",
+                              "page_size", "per_page")
+                             if key in container})
+            for key in ("pagination", "meta"):
+                if isinstance(container.get(key), dict):
+                    metadata.update(container[key])
+
+        for container in (payload, payload.get("data")):
+            if isinstance(container, list):
+                return container, metadata
+            if isinstance(container, dict):
+                for key in ("posts", "results", "items", "data"):
+                    if isinstance(container.get(key), list):
+                        return container[key], metadata
+        raise ValueError("No posts list found in the posts API response")
+
+    @staticmethod
+    def _next_posts_page(metadata, page, count, page_size):
+        for key in ("has_next", "hasNext"):
+            if key in metadata:
+                value = metadata[key]
+                if isinstance(value, bool):
+                    return page + 1 if value else None
+                if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+                    return page + 1 if value.strip().lower() == "true" else None
+        for key in ("next_page", "nextPage"):
+            if key in metadata:
+                if not metadata[key]:
+                    return None
+                try:
+                    next_page = int(metadata[key])
+                except (TypeError, ValueError):
+                    return page + 1
+                return next_page if next_page > page else None
+        for key in ("total_pages", "totalPages", "last_page"):
+            if key in metadata:
+                try:
+                    return page + 1 if page < int(metadata[key]) else None
+                except (TypeError, ValueError):
+                    break
+        if "total" in metadata:
             try:
-                response = requests.get(url, headers=self.headers, timeout=60)
-                if response.status_code == 200:
-                    data = response.json()
-                    if isinstance(data, list):
-                        self.last_pending_count = len(data)
-                        return data
-                    elif isinstance(data, dict) and "data" in data:
-                        posts = data["data"] if isinstance(data["data"], list) else []
-                        self.last_pending_count = len(posts)
-                        return posts
-                    elif isinstance(data, dict) and "results" in data:
-                        posts = data["results"] if isinstance(data["results"], list) else []
-                        self.last_pending_count = len(posts)
-                        return posts
-                    elif isinstance(data, dict) and "posts" in data:
-                        posts = data["posts"] if isinstance(data["posts"], list) else []
-                        self.last_pending_count = len(posts)
-                        return posts
-                    else:
-                        print("⚠️ API คืนค่ามาในรูปแบบที่ไม่คาดคิด (ไม่มีฟิลด์ list/data/results/posts)")
-                        self.last_pending_count = 0
-                        return []
-                else:
-                    print(f"❌ API Fetch Error (attempt {attempt}/{retries}) {response.status_code}: {response.text}")
-                    if attempt < retries:
-                        time.sleep(delay)
-            except Exception as e:
-                print(f"❌ Exception in fetch_pending (attempt {attempt}/{retries}): {e}")
+                actual_page_size = int(metadata.get("page_size") or metadata.get("per_page") or page_size)
+                return page + 1 if page * actual_page_size < int(metadata["total"]) else None
+            except (TypeError, ValueError):
+                pass
+        return page + 1 if count >= page_size else None
+
+    def fetch_pending(self, date_from, date_to, retries=3, delay=2):
+        """Read every page from the posts endpoint before analyzing a batch."""
+        self.last_fetch_error = False
+        self.last_pending_count = 0
+        url = f"{BE_API_BASE_URL.rstrip('/')}/internal/sentiment/posts"
+        page_size = 500
+        page = 1
+        all_posts = []
+        seen_pages = set()
+
+        while True:
+            params = {"date_from": date_from, "date_to": date_to,
+                      "page_size": page_size, "page": page}
+            response = None
+            for attempt in range(1, retries + 1):
+                try:
+                    response = requests.get(url, params=params, headers=self.headers, timeout=60)
+                    if response.status_code == 200:
+                        break
+                    print(f"[REST API] Posts fetch failed: page={page}, "
+                          f"attempt={attempt}/{retries}, HTTP {response.status_code}")
+                except requests.RequestException as exc:
+                    print(f"[REST API] Posts fetch failed: page={page}, "
+                          f"attempt={attempt}/{retries}, {type(exc).__name__}")
                 if attempt < retries:
                     time.sleep(delay)
-        self.last_fetch_error = True
-        self.last_pending_count = 0
-        return []
+            else:
+                self.last_fetch_error = True
+                return []
+
+            try:
+                posts, metadata = self._unpack_posts_page(response.json())
+            except (ValueError, TypeError) as exc:
+                print(f"[REST API] Invalid posts response on page {page}: {exc}")
+                self.last_fetch_error = True
+                return []
+            if not all(isinstance(post, dict) for post in posts):
+                print(f"[REST API] Invalid post rows on page {page}")
+                self.last_fetch_error = True
+                return []
+
+            identifiers = tuple(self._analysis_id(post) for post in posts)
+            if identifiers and all(identifiers) and identifiers in seen_pages:
+                print(f"[REST API] Repeated posts page {page}; stopping pagination")
+                self.last_fetch_error = True
+                return []
+            if identifiers and all(identifiers):
+                seen_pages.add(identifiers)
+            all_posts.extend(posts)
+            next_page = self._next_posts_page(metadata, page, len(posts), page_size)
+            if next_page is None or not posts:
+                pending = [post for post in all_posts
+                           if str(post.get("sentiment_status") or "0").strip() not in ("1", "2")]
+                skipped = len(all_posts) - len(pending)
+                if skipped:
+                    print(f"[REST API] Skipped {skipped} posts with sentiment_status 1 or 2")
+                self.last_pending_count = len(pending)
+                return pending
+            page = next_page
 
     def bulk_update(self, results, retries=3, delay=2):
         if not results:
@@ -2948,33 +3156,63 @@ class SentimentAPI:
                 clean_short_content = get_keyword_context(text, keyword, window=150)
                 
                 modified_post = post.copy()
+                modified_post["_provider_profile"] = current_provider_profile()
                 modified_post["content"] = clean_short_content
                 modified_post["full_text"] = text
                 modified_post["keywords"] = keywords
                 modified_post["_analysis_scope"] = "keyword"
                 posts_for_ai.append(modified_post)
 
-            ollama_results = self._analyze_with_cache(posts_for_ai)
-            
+            try:
+                ollama_results = self._analyze_with_cache(posts_for_ai)
+            except Exception as exc:
+                print(f"  [Analysis Error] {type(exc).__name__}; using neutral defaults for this batch")
+                ollama_results = []
+
             ollama_map = {}
+
+            def add_analysis_result(res):
+                if not isinstance(res, dict) or not res.get("post_id"):
+                    return
+                try:
+                    score = res["ai_sentiment"]
+                    percentages = [res.get("positive_percent", 0),
+                                   res.get("negative_percent", 0),
+                                   res.get("neutral_percent", 100),
+                                   res.get("irony_score", 0)]
+                    if (not isinstance(score, (int, float)) or not math.isfinite(score)
+                            or any(not isinstance(value, (int, float)) or not math.isfinite(value)
+                                   or value < 0 or value > 100 for value in percentages)):
+                        return
+                except (KeyError, TypeError, ValueError):
+                    return
+                ollama_map[str(res["post_id"])] = {
+                    "val": score,
+                    "sentiment": res.get("sentiment") if res.get("sentiment") in ("positive", "neutral", "negative") else None,
+                    "intent": normalize_intent(res.get("intent")),
+                    "positive_percent": percentages[0],
+                    "negative_percent": percentages[1],
+                    "neutral_percent": percentages[2],
+                    "irony_score": percentages[3],
+                    "reason": str(res.get("reason") or ""),
+                    "model": str(res.get("model") or "unknown")
+                }
+
             if isinstance(ollama_results, list):
                 for res in ollama_results:
-                    if "post_id" in res and "ai_sentiment" in res:
-                        ollama_map[str(res["post_id"])] = {
-                            "val": res["ai_sentiment"],
-                            "ai_sentiment": res["ai_sentiment"],
-                            "sentiment": res.get("sentiment"),
-                            "intent": normalize_intent(res.get("intent")),
-                            "positive_percent": res.get("positive_percent", 0),
-                            "negative_percent": res.get("negative_percent", 0),
-                            "neutral_percent": res.get("neutral_percent", 100),
-                            "irony_score": res.get("irony_score", 0),
-                            "reason": res.get("reason", ""),
-                            "model": res.get("model", "unknown")
-                        }
+                    add_analysis_result(res)
+
+            default_count = 0
+            for post_for_ai in posts_for_ai:
+                post_id = self._analysis_id(post_for_ai)
+                if post_id and post_id not in ollama_map:
+                    add_analysis_result(OllamaSentimentAnalyzer._neutral_error_result(
+                        post_id, post_for_ai.get("project_name", "")))
+                    default_count += 1
+            if default_count:
+                print(f"  [Analysis Default] {default_count} posts used neutral/information after missing or invalid results")
 
             api_results = []
-            unresolved_count = 0
             for idx, post_for_ai in enumerate(posts_for_ai, 1):
                 raw_id = post_for_ai.get("match_post_id") or post_for_ai.get("id") or post_for_ai.get("post_id") or post_for_ai.get("msg_id", "")
                 match_post_id = str(raw_id)
@@ -2986,9 +3224,6 @@ class SentimentAPI:
                     ai_content = ai_content[:120] + "..."
 
                 if match_post_id in ollama_map:
-                    if ollama_map[match_post_id]["model"] == "rule:unresolved_target":
-                        unresolved_count += 1
-                        continue  # No target to classify against.
                     raw_val = ollama_map[match_post_id]["val"]
                     ai_reason = ollama_map[match_post_id]["reason"]
                     pos_score = ollama_map[match_post_id]["positive_percent"]
@@ -3045,13 +3280,11 @@ class SentimentAPI:
                     print(f"       🔑 Keyword: {keyword_str}")
                     print(f"       🔗 Source: {feed_link}")
                     print(f"       📄 Content: {ai_content}")
-                    print(f"       📊 Distribution: POS {pos_score}% | NEG {neg_score}% | NEU {neu_score}% | Irony={irony_score}% | Legacy={raw_val} | Model={model_used}")
+                    print(f"       📊 Distribution: POS {pos_score}% | NEG {neg_score}% | NEU {neu_score}% | Irony={irony_score}% | Legacy={raw_val} | Model={model_used} | Provider={inference_provider(model_used)} | Profile={post_for_ai.get('_provider_profile', 'off')}")
                     if ai_reason:
                         print(f"       💡 Reason: {ai_reason}")
                     print(f"  {'-'*90}")
                         
-            if unresolved_count:
-                print(f"  ⚠️ [REST API] Skipped {unresolved_count} posts without a resolved target; they remain pending.")
             if save_db:
                 updated_count = self.bulk_update(api_results)
                 total_updated += updated_count
@@ -3074,10 +3307,33 @@ class SentimentAPI:
 sentiment = SentimentAPI
 
 
-def parse_run_mode(argv=None):
+def parse_cli_args(argv=None):
     parser = argparse.ArgumentParser(description="Run sentiment analysis through the REST API")
     parser.add_argument("--mode", choices=("rest",), default="rest")
-    return parser.parse_args(argv).mode
+    parser.add_argument("--from-date", dest="date_from", metavar="YYYY-MM-DD",
+                        help="First date to analyze; use together with --to-date for one run")
+    parser.add_argument("--to-date", dest="date_to", metavar="YYYY-MM-DD",
+                        help="Last date to analyze; use together with --from-date for one run")
+    args = parser.parse_args(argv)
+    if bool(args.date_from) != bool(args.date_to):
+        parser.error("--from-date and --to-date must be specified together")
+    for flag, value in (("--from-date", args.date_from), ("--to-date", args.date_to)):
+        if value is None:
+            continue
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            parser.error(f"{flag} must be YYYY-MM-DD")
+        try:
+            validate_date_str(value)
+        except ValueError as exc:
+            parser.error(str(exc))
+    if args.date_from and args.date_from > args.date_to:
+        parser.error("--from-date cannot be after --to-date")
+    return args
+
+
+def parse_run_mode(argv=None):
+    """Keep the existing mode-only helper for callers importing this module."""
+    return parse_cli_args(argv).mode
 
 
 def create_apps_for_mode(mode, analyzer):
@@ -3089,17 +3345,16 @@ def create_apps_for_mode(mode, analyzer):
 def run_main_loop(app_api, save_db, sleep_seconds):
     while True:
         start_time = time.time()
-        
-        yesterday = str(datetime.now() - timedelta(days=1))[:10]
-        now       = str(datetime.now())[:10]
+        now = datetime.now(THAI_TIMEZONE)
+        today = now.date().isoformat()
 
-        print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🚀 เริ่มการดึงข้อมูลและวิเคราะห์รอบใหม่...")
-        print(f"📅 ช่วงเวลาที่วิเคราะห์: {yesterday} ถึง {now}")
+        print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] 🚀 เริ่มการดึงข้อมูลและวิเคราะห์รอบใหม่...")
+        print(f"📅 ช่วงเวลาที่วิเคราะห์: {today} ถึง {today} (เวลาไทย)")
         print("-" * 75)
 
         total_posts = 0
         try:
-            total_posts = app_api.run(yesterday, now, save_db=save_db)
+            total_posts = app_api.run(today, today, save_db=save_db)
         except Exception as e:
             print(f"❌ เกิดข้อผิดพลาดในระบบ REST API: {e}")
 
@@ -3125,7 +3380,7 @@ def run_main_loop(app_api, save_db, sleep_seconds):
 
 
 if __name__ == "__main__":
-    parse_run_mode()
+    cli_args = parse_cli_args()
     SAVE_DB = os.environ.get("SAVE_DB", "false").lower() in ("true", "1", "yes")
     SLEEP_SECONDS = max(0, int(os.environ.get("RUN_INTERVAL_SECONDS", "5")))
 
@@ -3141,4 +3396,8 @@ if __name__ == "__main__":
         print("=" * 75)
         print("🧪 MOCK MODE: การบันทึกจริงถูกปิดอยู่ ระบบจะแสดงผลก่อนบันทึกเท่านั้น")
 
-    run_main_loop(app_api, SAVE_DB, SLEEP_SECONDS)
+    if cli_args.date_from:
+        print(f"📅 ช่วงเวลาที่วิเคราะห์: {cli_args.date_from} ถึง {cli_args.date_to} (หนึ่งรอบ)")
+        app_api.run(cli_args.date_from, cli_args.date_to, save_db=SAVE_DB)
+    else:
+        run_main_loop(app_api, SAVE_DB, SLEEP_SECONDS)

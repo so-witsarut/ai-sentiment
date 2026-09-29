@@ -67,7 +67,33 @@ class TestResultCache(unittest.TestCase):
         self.assertEqual(len(analyzer.analyze_post_sentiments.call_args.args[0]), 3)
         api.result_cache.db.close()
 
-    def test_provider_failure_neutral_is_submitted_and_reused_after_rest_failure(self):
+    def test_daytime_and_overnight_use_separate_cache_entries(self):
+        analyzer = Mock()
+        analyzer.analyze_post_sentiments.side_effect = lambda posts: {"data": [decision(p) for p in posts]}
+        api = module.SentimentAPI(analyzer=analyzer, result_cache=module.AnalysisResultCache(self.path))
+        day = {**self.posts[0], "_provider_profile": "daytime"}
+        night = {**self.posts[0], "_provider_profile": "overnight"}
+        with redirect_stdout(io.StringIO()):
+            api._analyze_with_cache([day])
+            api._analyze_with_cache([night])
+            api._analyze_with_cache([day])
+        self.assertEqual(analyzer.analyze_post_sentiments.call_count, 2)
+        self.assertNotEqual(api.result_cache.key(day), api.result_cache.key(night))
+        api.result_cache.db.close()
+
+    def test_historical_cached_provider_failure_is_ignored(self):
+        analyzer = Mock()
+        analyzer.analyze_post_sentiments.side_effect = lambda posts: {"data": [decision(p) for p in posts]}
+        api = module.SentimentAPI(analyzer=analyzer, result_cache=module.AnalysisResultCache(self.path))
+        post = self.posts[0]
+        api.result_cache.put(api.result_cache.key(post), decision(post, model="rule:provider_failure"))
+        with redirect_stdout(io.StringIO()):
+            result = api._analyze_with_cache([post])
+        self.assertEqual(result[0]["model"], "jev")
+        analyzer.analyze_post_sentiments.assert_called_once()
+        api.result_cache.db.close()
+
+    def test_provider_failure_neutral_is_submitted_but_retried_after_rest_failure(self):
         analyzer = Mock()
         analyzer.analyze_post_sentiments.side_effect = lambda posts: {
             "data": [decision(p, model="rule:provider_failure") for p in posts]}
@@ -82,16 +108,19 @@ class TestResultCache(unittest.TestCase):
         self.assertTrue(all(row["sentiment"] == "neutral" for row in sent))
         self.assertTrue(all(row["sentiment_scores"]["neutral"] == 100 for row in sent))
         self.assertTrue(all(row["intent"] == "information" for row in sent))
+        self.assertIsNone(api.result_cache.get(api.result_cache.key(self.posts[0])))
         api.result_cache.db.close()
 
         second_analyzer = Mock()
+        second_analyzer.analyze_post_sentiments.side_effect = lambda posts: {
+            "data": [decision(p, model="rule:provider_failure") for p in posts]}
         second_api = module.SentimentAPI(
             analyzer=second_analyzer, result_cache=module.AnalysisResultCache(self.path))
         with patch.object(second_api, "fetch_pending", return_value=self.posts), \
              patch.object(second_api, "bulk_update", return_value=2) as update, \
              redirect_stdout(io.StringIO()):
             self.assertEqual(second_api.run("2026-09-25", "2026-09-25", save_db=True), 2)
-        second_analyzer.analyze_post_sentiments.assert_not_called()
+        self.assertEqual(second_analyzer.analyze_post_sentiments.call_count, 1)
         self.assertEqual([row["match_post_id"] for row in update.call_args.args[0]], ["a", "b"])
         second_api.result_cache.db.close()
 
