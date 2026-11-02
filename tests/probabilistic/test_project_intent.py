@@ -196,7 +196,7 @@ class ProjectIntentTests(unittest.TestCase):
         self.assertIn("self-praise are neutral", module.KEYWORD_SYSTEM_PROMPT)
         self.assertIn("independent person's opinion", module.KEYWORD_SYSTEM_PROMPT)
         self.assertIn("Publisher and URL are context", module.KEYWORD_SYSTEM_PROMPT)
-        self.assertIn("pure praise", module.KEYWORD_SYSTEM_PROMPT)
+        self.assertIn("pure praise", module.KEYWORD_SYSTEM_PROMPT.lower())
 
     def test_deepseek_intent_wins_and_jev_intent_fills_missing_value(self):
         context = {"post_id": "p3", "actual_target": "BLCP", "sentiment_target": "BLCP",

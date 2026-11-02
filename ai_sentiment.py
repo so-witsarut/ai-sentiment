@@ -43,9 +43,8 @@ def provider_enabled(name):
 
 
 DEFAULT_VALIDATION_MODELS = (
-    "gemma4:31b-cloud,api:gemini-3.1-flash-lite,api:gemini-3.5-flash-lite,"
-    "api:gemini-2.5-flash,api:gemini-2.5-flash-lite,api:gemini-3-flash,"
-    "api:gemini-3.5-flash"
+    "gemma4:31b-cloud,api:gemma-4-31b-it,api:gemini-3.1-flash-lite,"
+    "api:gemini-3.5-flash-lite,api:gemma-4-26b-a4b-it"
 )
 
 
@@ -64,7 +63,7 @@ def _schedule_minute(name, default):
 
 
 PROVIDER_SCHEDULE_ENABLED = os.environ.get("PROVIDER_SCHEDULE_ENABLED", "false").strip().lower() in ("true", "1", "yes")
-OPENROUTER_SCHEDULE_START = _schedule_minute("OPENROUTER_SCHEDULE_START", "08:00")
+OPENROUTER_SCHEDULE_START = _schedule_minute("OPENROUTER_SCHEDULE_START", "10:00")
 OPENROUTER_SCHEDULE_END = _schedule_minute("OPENROUTER_SCHEDULE_END", "22:00")
 if PROVIDER_SCHEDULE_ENABLED and OPENROUTER_SCHEDULE_START == OPENROUTER_SCHEDULE_END:
     raise ValueError("Configuration error: OpenRouter schedule start and end must differ")
@@ -142,6 +141,40 @@ def _find_term_index(text, term):
                           text, flags=re.IGNORECASE)
         return match.start() if match else -1
     return text.casefold().find(term.casefold())
+
+
+def normalize_keywords(value):
+    """Normalize API keyword lists and comma-separated strings in stable order."""
+    if isinstance(value, str):
+        value = value.split(",")
+    if not isinstance(value, (list, tuple)):
+        return []
+    keywords, seen = [], set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        item = item.strip()
+        if item and item.casefold() not in seen:
+            seen.add(item.casefold())
+            keywords.append(item)
+    return keywords
+
+
+def post_keywords(post):
+    for field in ("keywords", "keyword_name", "keyword"):
+        keywords = normalize_keywords(post.get(field))
+        if keywords:
+            return keywords
+    return []
+
+
+def post_text(post):
+    """Prefer the original text over an API-supplied preview."""
+    for field in ("full_text", "content", "text", "message", "feedcontent"):
+        value = post.get(field)
+        if value is not None and str(value).strip() and str(value).strip().lower() != "none":
+            return str(value)
+    return ""
 
 
 def get_keyword_context(text, keyword, window=150, max_fallback_length=400):
@@ -240,6 +273,130 @@ JEV_CASCADE_TIMEOUT = min(120.0, JEV_API_TIMEOUT * (1 + JEV_MAX_RETRIES) + 10.0)
 DEEPSEEK_CASCADE_TIMEOUT = min(180.0, DEEPSEEK_API_TIMEOUT * (1 + DEEPSEEK_MAX_RETRIES) + 15.0)
 
 
+class GeminiRequestTooLarge(ValueError):
+    """A request cannot fit in the configured one-minute input-token budget."""
+
+
+class GeminiRateLimited(RuntimeError):
+    """A request exceeds the allowed wait time or the model is in active cooldown."""
+
+
+class GeminiRateLimiter:
+    """Process-wide rolling RPM/input-TPM reservations, shared by all threads."""
+
+    # Project limits supplied in AI Studio, not universal provider defaults.
+    DEFAULT_LIMITS = {
+        "gemma-4-31b-it": {"rpm": 30, "tpm": 16000},
+        "gemini-3.1-flash-lite": {"rpm": 15, "tpm": 250000},
+        "gemini-3.5-flash-lite": {"rpm": 15, "tpm": 250000},
+        "gemma-4-26b-a4b-it": {"rpm": 30, "tpm": 16000},
+    }
+
+    def __init__(self):
+        self.limits = {model: dict(limits) for model, limits in self.DEFAULT_LIMITS.items()}
+        try:
+            overrides = json.loads(os.environ.get("GEMINI_RATE_LIMITS", "{}"))
+            if not isinstance(overrides, dict):
+                raise ValueError()
+            for model, limits in overrides.items():
+                if not model or not isinstance(limits, dict) or set(limits) != {"rpm", "tpm"}:
+                    raise ValueError()
+                if any(type(value) is not int or value <= 0 for value in limits.values()):
+                    raise ValueError()
+                self.limits[model] = dict(limits)
+        except (ValueError, TypeError):
+            raise ValueError('Configuration error: GEMINI_RATE_LIMITS must be a JSON object '
+                             'mapping model names to positive integer rpm and tpm') from None
+        self.default_rpm = parse_bounded_int("GEMINI_DEFAULT_RPM", 5, max_val=1000000)
+        self.default_tpm = parse_bounded_int("GEMINI_DEFAULT_TPM", 16000, max_val=1000000000)
+        self.percent = parse_bounded_int("GEMINI_RATE_LIMIT_PERCENT", 90, max_val=100)
+        self.max_wait = parse_bounded_int("GEMINI_MAX_WAIT_SECONDS", 15, min_val=1, max_val=300)
+        self._lock = threading.Lock()
+        self._history = {}
+        self._blocked_until = {}
+
+    @staticmethod
+    def estimate_input_tokens(payload):
+        # Text-only requests: one token per UTF-8 byte plus message overhead.
+        # Deliberately conservative for Thai; never use English chars/4 here.
+        messages = list(payload.get("contents", []))
+        system = payload.get("system_instruction")
+        if system:
+            messages.append(system)
+        return 32 + sum(16 + sum(len(part.get("text", "").encode("utf-8"))
+                                 for part in message.get("parts", [])) for message in messages)
+
+    def is_blocked(self, model):
+        with self._lock:
+            remaining = self._blocked_until.get(model, 0) - time.monotonic()
+            return remaining if remaining > self.max_wait else 0.0
+
+    def reserve(self, model, tokens):
+        """Return (ticket, wait_seconds); caller must reserve immediately before HTTP."""
+        limits = self.limits.get(model, {"rpm": self.default_rpm, "tpm": self.default_tpm})
+        rpm = max(1, limits["rpm"] * self.percent // 100)
+        tpm = max(1, limits["tpm"] * self.percent // 100)
+        if tokens > tpm:
+            raise GeminiRequestTooLarge(f"estimated input {tokens} tokens exceeds {tpm} TPM budget")
+        with self._lock:
+            now = time.monotonic()
+            cooldown = max(0.0, self._blocked_until.get(model, 0) - now)
+            if cooldown > self.max_wait:
+                raise GeminiRateLimited(f"{model} in cooldown ({cooldown:.1f}s remaining, exceeds {self.max_wait}s limit)")
+            # In-flight reservations never expire, even when HTTP takes over a minute.
+            history = self._history[model] = [entry for entry in self._history.get(model, [])
+                                             if entry[2] or entry[0] + 60 > now]
+            if cooldown or len(history) >= rpm or sum(entry[1] for entry in history) + tokens > tpm:
+                expiries = [entry[0] + 60 - now for entry in history if not entry[2]]
+                delay = min(expiries) if expiries else 0.1
+                wait_sec = max(cooldown, delay, 0.01)
+                if wait_sec > self.max_wait:
+                    raise GeminiRateLimited(f"{model} throttle delay {wait_sec:.1f}s exceeds {self.max_wait}s limit")
+                return None, wait_sec
+            ticket = [now, tokens, True]
+            history.append(ticket)
+            return ticket, 0.0
+
+    def finish(self, ticket, response=None):
+        actual_tokens = None
+        if response is not None:
+            try:
+                actual_tokens = response.json().get("usageMetadata", {}).get("promptTokenCount")
+            except (ValueError, AttributeError, TypeError):
+                pass
+        with self._lock:
+            # Retain for 60s after completion as a conservative allowance for server timing.
+            ticket[0] = time.monotonic()
+            if type(actual_tokens) is int and actual_tokens >= 0:
+                ticket[1] = actual_tokens
+            ticket[2] = False
+
+    def cooldown(self, model, seconds):
+        with self._lock:
+            self._blocked_until[model] = max(self._blocked_until.get(model, 0),
+                                             time.monotonic() + seconds)
+
+
+GEMINI_RATE_LIMITER = GeminiRateLimiter()
+
+
+def _gemini_retry_delay(response):
+    """Honor Google's numeric Retry-After / RetryInfo, with a 60s fallback."""
+    delays = []
+    try:
+        delays.append(float(response.headers.get("Retry-After")))
+    except (TypeError, ValueError):
+        pass
+    try:
+        for detail in response.json().get("error", {}).get("details", []):
+            if detail.get("@type", "").endswith("google.rpc.RetryInfo"):
+                delays.append(float(detail.get("retryDelay", "").removesuffix("s")))
+    except (AttributeError, TypeError, ValueError):
+        pass
+    valid = [delay for delay in delays if math.isfinite(delay) and delay > 0]
+    return max(valid) if valid else 60.0
+
+
 def _retry_within_deadline(attempt: int, deadline: float, response=None) -> bool:
     """Wait for a retry without extending the provider cascade deadline."""
     retry_after = response.headers.get("Retry-After") if response is not None else None
@@ -309,12 +466,14 @@ class _BatchUsageMetrics:
         self._lock = threading.Lock()
         self._providers = {}
 
-    def record(self, route, model, provider, retry, response_data=None, profile="off"):
+    def record(self, route, model, provider, retry, response_data=None, profile="off", provider_family=None):
         usage = _extract_provider_usage(response_data)
+        family = provider_family or {"google-ai": "gemini", "gemini": "gemini", "ollama": "ollama"}.get(provider, "openrouter")
         key = (str(route), str(model or "unknown"), str(provider or "unknown"), str(profile))
         with self._lock:
             row = self._providers.setdefault(key, {
                 "route": key[0], "model": key[1], "provider": key[2], "profile": key[3],
+                "provider_family": family,
                 "requests": 0, "retries": 0, "input_tokens": 0,
                 "output_tokens": 0, "cached_tokens": 0, "cost": 0.0,
                 "cache_discount": 0.0
@@ -332,6 +491,11 @@ class _BatchUsageMetrics:
             providers = [dict(row) for row in self._providers.values()]
         providers.sort(key=lambda row: (row["profile"], row["route"], row["model"], row["provider"]))
         routes = {"jev": 0, "deepseek": 0, "rule": 0}
+        profiles = {}
+        for row in providers:
+            counts = profiles.setdefault(row["profile"], {
+                "requests": {"openrouter": 0, "gemini": 0, "ollama": 0}, "provider_failures": 0})
+            counts["requests"][row["provider_family"]] += row["requests"]
         escalated_posts = 0
         low_cost_accepted = 0
         for result in results:
@@ -342,12 +506,17 @@ class _BatchUsageMetrics:
                 escalated_posts += 1
             if isinstance(result, dict) and result.get("low_cost_accepted"):
                 low_cost_accepted += 1
+            if isinstance(result, dict) and result.get("model") == "rule:provider_failure":
+                counts = profiles.setdefault(result.get("_provider_profile", "off"), {
+                    "requests": {"openrouter": 0, "gemini": 0, "ollama": 0}, "provider_failures": 0})
+                counts["provider_failures"] += 1
         return {
             "routes": routes,
             "escalated_posts": escalated_posts,
             "escalation_rate_percent": round(100 * escalated_posts / len(results), 2) if results else 0.0,
             "low_cost_accepted": low_cost_accepted,
             "providers": providers,
+            "profiles": profiles,
             "input_tokens": sum(row["input_tokens"] for row in providers),
             "output_tokens": sum(row["output_tokens"] for row in providers),
             "cached_tokens": sum(row["cached_tokens"] for row in providers),
@@ -372,19 +541,41 @@ def _log_cost_telemetry(telemetry):
               f"profile={row['profile']} {row['route']} model={row['model']} provider={row['provider']} requests={row['requests']} "
               f"input={row['input_tokens']} output={row['output_tokens']} "
               f"cached={row['cached_tokens']} retries={row['retries']} cost=${row['cost']:.6f}")
+    for profile, counts in sorted(telemetry.get("profiles", {}).items()):
+        requests_by_provider = counts["requests"]
+        print(f"     ↳ profile={profile} requests: OpenRouter={requests_by_provider['openrouter']} "
+              f"Gemini={requests_by_provider['gemini']} Ollama={requests_by_provider['ollama']} "
+              f"provider_failure={counts['provider_failures']}")
 
+
+INTENT_INSTRUCTIONS = (
+    "Always classify the main purpose of the whole post, even if Target is unrelated: "
+    "complaint, information, recommendation, or enquiry. "
+    "Pure praise is information; suggestions to improve and recommendations to others are recommendation. "
+    "A rhetorical question expressing a grievance is complaint. "
+)
+INTENT_CRITERIA = {
+    "complaint": "The main purpose is to criticize, blame, or complain.",
+    "information": "The main purpose is to report facts, news, promotion, or pure praise.",
+    "recommendation": "The main purpose is to suggest an improvement or recommend something to other people.",
+    "enquiry": "The main purpose is to ask for information.",
+}
+AMBIGUITY_INSTRUCTIONS = (
+    "Interpret sarcasm by intended meaning: clear praise is positive and clear criticism is negative. "
+    "For mixed evaluations, allocate positive and negative probabilities according to the evidence. "
+    "AMBIGUOUS_OR_IRONY is unresolved meaning or tone; uncertainty alone is not negative. "
+)
 
 PROBABILISTIC_SYSTEM_PROMPT = (
     "Classify Thai social text toward the specified target. Return JSON only; never explain.\n"
     "POSITIVE=praise/satisfaction/recommendation; NEUTRAL=facts/news/questions/PR or unrelated sentiment; "
-    "NEGATIVE=complaint/criticism/damage; AMBIGUOUS_OR_IRONY=sarcasm/mixed or unclear tone.\n"
+    "NEGATIVE=complaint/criticism/damage; "
+    + AMBIGUITY_INSTRUCTIONS + "\n"
     "Use semantic evidence about the target. Four probabilities must be finite, 0..1, and sum to 1.00.\n"
     "entity_found is true only when the text directly refers to the target. "
     "Publisher and URL are context, not proof of relevance or official ownership. "
     "Official target PR and self-praise are neutral unless an independent opinion is clearly quoted. "
-    "Choose the main intent toward target: complaint, information, recommendation, or enquiry. "
-    "Pure praise is information; recommendation includes improvement suggestions and recommending target to others. "
-    "Omit intent when target is unrelated.\n"
+    + INTENT_INSTRUCTIONS + "\n"
     "{\n"
     '  "probabilities": {\n'
     '    "POSITIVE": <float 0.00-1.00>,\n'
@@ -393,7 +584,7 @@ PROBABILISTIC_SYSTEM_PROMPT = (
     '    "AMBIGUOUS_OR_IRONY": <float 0.00-1.00>\n'
     "  },\n"
     '  "entity_found": <boolean>,\n'
-    '  "intent": <one of complaint, information, recommendation, enquiry when related>\n'
+    '  "intent": <one of complaint, information, recommendation, enquiry>\n'
     "}"
 )
 
@@ -408,12 +599,10 @@ HYBRID_SYSTEM_PROMPT = (
     "\"intent\":string}. "
     "Probabilities must be finite, between 0 and 1, and sum to 1. "
     "POSITIVE=praise; NEGATIVE=criticism; NEUTRAL=facts/no target sentiment; "
-    "AMBIGUOUS_OR_IRONY=sarcasm or mixed/unclear sentiment. "
+    + AMBIGUITY_INSTRUCTIONS +
     "Official Target announcements and self-praise are neutral unless an independent opinion is clearly quoted. "
     "Publisher and URL alone do not prove relevance or official ownership. "
-    "Always return intent as one of complaint, information, recommendation, enquiry (even if Target is unrelated). "
-    "Classify the main purpose of the post; pure praise is information. "
-    "Recommendation includes suggestions to improve or recommending to others."
+    + INTENT_INSTRUCTIONS
 )
 
 KEYWORD_SYSTEM_PROMPT = (
@@ -432,12 +621,9 @@ KEYWORD_SYSTEM_PROMPT = (
     "NEGATIVE=explicit complaint or criticism attributable to Target; hardship, crime news, or bad events merely mentioning Target are neutral; "
     "NEUTRAL=factual news, job ads, PR, ads, sales slogans, calls to buy, and the seller's own praise, even with words like 'love' or 'great'; "
     "for example 'Love X? Shop today' is an ad, not a consumer endorsement; "
-    "AMBIGUOUS_OR_IRONY=sarcasm or mixed/unclear sentiment. "
+    + AMBIGUITY_INSTRUCTIONS +
     "Official Target posts and self-praise are neutral unless they clearly quote an independent person's opinion. "
-    "For intent, always classify the main purpose of the post as complaint, information, recommendation, or enquiry (even if Target is unrelated): "
-    "complaint=grievance, information=facts or pure praise, "
-    "recommendation=suggestion to improve or recommend to others, enquiry=request for information. "
-    "A rhetorical question in a grievance is complaint. "
+    + INTENT_INSTRUCTIONS +
     "A preliminary Jev judgment may be included as a hint. Check the text independently, "
     "confirm the hint only when supported by the text, and correct it when the text disagrees. "
     "Do not mention Jev or the hint in the output."
@@ -451,10 +637,9 @@ OVERALL_SYSTEM_PROMPT = (
     "Probabilities must be finite, between 0 and 1, and sum to 1. "
     "POSITIVE=overall praise or satisfaction; NEGATIVE=overall complaint or criticism; "
     "NEUTRAL=facts, news, PR, ads, or questions without a clear opinion; "
-    "AMBIGUOUS_OR_IRONY=sarcasm or mixed/unclear sentiment. "
+    + AMBIGUITY_INSTRUCTIONS +
     "Official self-praise and sales slogans are neutral unless an independent opinion is clearly quoted. "
-    "Intent is the main purpose of the post: complaint, information, recommendation, or enquiry. "
-    "Pure praise is information; recommendation includes suggestions and advice to others. "
+    + INTENT_INSTRUCTIONS +
     "A Jev preliminary judgment is only a hint; verify it against the text."
 )
 
@@ -576,10 +761,11 @@ def resolve_policy(probabilities, entity_found=True):
     """
     Code Owns Policy: Convert continuous probability vector into discrete
     sentiment scores (-100, 0, 100) and integer distribution percentages (0-100%).
-    Conservative brand monitoring allocates high irony/sarcasm toward negative.
+    Unresolved meaning contributes to neutral, never automatically to negative.
     """
     if not entity_found or not probabilities:
-        return {"sentiment": "neutral", "score": 0, "pos": 0, "neg": 0, "neu": 100, "irony_score": 0}
+        return {"sentiment": "neutral", "score": 0, "pos": 0, "neg": 0, "neu": 100,
+                "irony_score": 0, "is_ambiguous": False}
 
     clean_probs = {str(k).strip().lower(): v for k, v in probabilities.items()}
 
@@ -611,24 +797,22 @@ def resolve_policy(probabilities, entity_found=True):
         neu /= p_total
         irony /= p_total
 
-    # Conservative brand monitoring: allocate high irony/sarcasm to negative
-    effective_neg = neg + (irony * 0.7)
+    effective_neg = neg
     effective_pos = pos
+    effective_neu = neu + irony
+    is_ambiguous = irony > 0 and irony >= max(pos, neg, neu)
 
-    if effective_pos > effective_neg and effective_pos > neu:
+    if effective_pos > effective_neg and effective_pos > effective_neu:
         sentiment = "positive"
         score = 100
-    elif effective_neg > effective_pos and effective_neg > neu:
-        sentiment = "negative"
-        score = -100
-    elif effective_pos == effective_neg and effective_pos > neu:
+    elif effective_neg > effective_pos and effective_neg > effective_neu:
         sentiment = "negative"
         score = -100
     else:
         sentiment = "neutral"
         score = 0
 
-    total = effective_pos + effective_neg + neu
+    total = effective_pos + effective_neg + effective_neu
     if total <= 0:
         pos_pct, neg_pct, neu_pct = 0, 0, 100
     else:
@@ -646,7 +830,8 @@ def resolve_policy(probabilities, entity_found=True):
         "pos": pos_pct,
         "neg": neg_pct,
         "neu": neu_pct,
-        "irony_score": irony_pct
+        "irony_score": irony_pct,
+        "is_ambiguous": is_ambiguous
     }
 
 
@@ -681,13 +866,12 @@ def generate_synthetic_reason(target, pos, neg, neu, irony, entity_found=True):
     if not entity_found:
         return f"ไม่พบการกล่าวถึงหรือความคิดเห็นต่อ {target_name} โดยตรง"
 
-    if irony >= 0.30:
-        if neg > pos:
-            return f"พบการใช้ภาษาประชดประชันหรือเสียดสี โดยมีแนวโน้มเชิงลบต่อ {target_name}"
-        elif pos > neg:
-            return f"พบการใช้ภาษาเสียดสีหรือสำนวนกึ่งเล่นกึ่งจริง โดยรวมมีความชื่นชม {target_name}"
-        else:
-            return f"ข้อความมีความประชดประชันหรือกำกวม ไม่สามารถระบุเจตนาที่ชัดเจนต่อ {target_name} ได้"
+    if irony > 0 and irony >= max(pos, neg, neu):
+        return f"ข้อความมีความกำกวม ไม่สามารถระบุเจตนาที่ชัดเจนต่อ {target_name} จึงสรุปเป็นกลาง"
+    if neu + irony >= max(pos, neg) and irony > 0:
+        return f"ข้อความยังไม่มีความคิดเห็นที่ชัดเจนเพียงพอต่อ {target_name} จึงสรุปเป็นกลาง"
+    if pos == neg and pos > neu:
+        return f"ข้อความมีความคิดเห็นเชิงบวกและเชิงลบต่อ {target_name} ในระดับใกล้เคียงกัน จึงสรุปเป็นกลาง"
 
     if pos >= 0.70:
         return f"ผู้ใช้งานแสดงความชื่นชม ประทับใจ หรือให้คะแนนเชิงบวกต่อ {target_name} อย่างชัดเจน"
@@ -722,7 +906,9 @@ def is_placeholder_target(target) -> bool:
     return s in ("", "the target entity", "target entity", "unknown", "none", "null", "เป้าหมายที่ระบุ")
 
 
-def _overall_reason(sentiment):
+def _overall_reason(sentiment, is_ambiguous=False):
+    if is_ambiguous:
+        return "น้ำเสียงของโพสต์โดยรวมมีความกำกวม จึงสรุปเป็นกลาง"
     labels = {"positive": "เชิงบวก", "negative": "เชิงลบ", "neutral": "เป็นกลาง"}
     return f"วิเคราะห์น้ำเสียงของโพสต์โดยรวมเป็น{labels.get(sentiment, 'เป็นกลาง')}"
 
@@ -745,8 +931,9 @@ def sanitize_target(target: str, max_chars: int = 100) -> str:
     return cleaned
 
 
-def cap_text(text: str, max_chars: int = 8000, keyword: str = "", target: str = "") -> str:
-    """Keep the target/keyword neighborhoods and post edges within a hard character cap."""
+def cap_text(text: str, max_chars: int = 8000, keyword: str = "", target: str = "",
+             keywords=None) -> str:
+    """Allocate context fairly to matched terms without truncating later windows."""
     text = text or ""
     if max_chars <= 0:
         return ""
@@ -756,32 +943,72 @@ def cap_text(text: str, max_chars: int = 8000, keyword: str = "", target: str = 
         return text[:max_chars]
 
     separator = " ... "
-    intervals = []
-    for term, width in ((target, max_chars // 3), (keyword, max_chars // 4)):
-        if not term:
-            continue
-        index = _find_term_index(text, term)
-        if index < 0:
-            continue
-        width = max(len(term), width)
-        start = max(0, index - (width - len(term)) // 2)
-        end = min(len(text), start + width)
-        intervals.append((max(0, end - width), end))
+    terms = normalize_keywords([target, keyword] + normalize_keywords(keywords))
+    matches = []
+    for term in terms:
+        pattern = re.escape(term)
+        if term.isascii() and term[0].isalnum() and term[-1].isalnum():
+            pattern = r"(?<![A-Za-z0-9])" + pattern + r"(?![A-Za-z0-9])"
+        # Bound repeated occurrences; keep at least the first match of every term.
+        spans = []
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            spans.append(match.span())
+            if len(spans) >= max(1, max_chars // 100):
+                break
+        if spans:
+            matches.append(spans)
 
-    if not intervals:
+    if not matches:
         head = (max_chars - len(separator)) // 2
         return text[:head] + separator + text[-(max_chars - len(separator) - head):]
 
-    edge_width = max(1, max_chars // 5)
-    intervals.extend(((0, edge_width), (len(text) - edge_width, len(text))))
-    merged = []
-    for start, end in sorted(intervals):
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    def render(intervals):
+        merged = []
+        for start, end in sorted(intervals):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return separator.join(text[start:end] for start, end in merged)
+
+    anchors = []
+    for spans in matches:
+        span = spans[0]
+        if len(render(anchors + [span])) <= max_chars:
+            anchors.append(span)
+    if not anchors:
+        return text[:max_chars]
+
+    # Reserve edges only after preserving one occurrence per matched term.
+    spare = max_chars - len(render(anchors))
+    edge_width = min(max_chars // 5, max(0, (spare - 2 * len(separator)) // 2))
+    edges = [(0, edge_width), (len(text) - edge_width, len(text))] if edge_width else []
+    # Add repeats in rounds so one frequent keyword cannot crowd out other terms.
+    repeat_limit = max(len(anchors), (max_chars - 2 * edge_width) // 305)
+    for occurrence in range(1, max(len(spans) for spans in matches)):
+        for spans in matches:
+            if len(anchors) >= repeat_limit:
+                break
+            if occurrence < len(spans):
+                span = spans[occurrence]
+                if span not in anchors and len(render(anchors + [span] + edges)) <= max_chars:
+                    anchors.append(span)
+        if len(anchors) >= repeat_limit:
+            break
+
+    def with_context(radius):
+        return render([(max(0, start - radius), min(len(text), end + radius))
+                       for start, end in anchors] + edges)
+
+    # Expand all windows equally; rendering includes separators in the hard cap.
+    low, high = 0, max_chars
+    while low < high:
+        radius = (low + high + 1) // 2
+        if len(with_context(radius)) <= max_chars:
+            low = radius
         else:
-            merged.append((start, end))
-    excerpt = separator.join(text[start:end] for start, end in merged)
-    return excerpt[:max_chars]
+            high = radius - 1
+    return with_context(low)
 
 
 def _legacy_cap_text(text: str, max_chars: int = 8000, keyword: str = "") -> str:
@@ -907,10 +1134,9 @@ def build_deepseek_user_prompt(resolved_context, jev_signal=None, include_jev_si
     scope = resolved_context.get("analysis_scope")
     if scope in ("keyword", "overall"):
         full_text = resolved_context.get("clean_text") or resolved_context.get("capped_text") or ""
-        keywords = resolved_context.get("keywords") or []
-        first_match = next((k for k in keywords if _find_term_index(full_text, k) >= 0), "")
+        keywords = normalize_keywords(resolved_context.get("keywords"))
         target = resolved_context.get("sentiment_target") if scope == "keyword" else ""
-        excerpt = cap_text(full_text, max_chars=max_chars, keyword=first_match, target=target)
+        excerpt = cap_text(full_text, max_chars=max_chars, keywords=keywords, target=target)
         lines = _compact_context_lines(resolved_context, text_override=excerpt)
         if include_jev_signal is None:
             include_jev_signal = os.environ.get("DEEPSEEK_INCLUDE_JEV_SIGNAL", "true").lower() in ("true", "1", "yes")
@@ -939,11 +1165,10 @@ def build_deepseek_user_prompt(resolved_context, jev_signal=None, include_jev_si
             lines.insert(max(1, len(lines) - 1), hint)
         return "\n".join(lines)
     if not HYBRID_PROMPT_V2:
-        text = resolved_context.get("capped_text") or resolved_context.get("clean_text") or ""
-        keywords = resolved_context.get("keywords") or []
-        first_match = next((k for k in keywords if _find_term_index(text, k) >= 0), "")
+        text = resolved_context.get("clean_text") or resolved_context.get("capped_text") or ""
+        keywords = normalize_keywords(resolved_context.get("keywords"))
         target = resolved_context.get("actual_target") or ""
-        excerpt = cap_text(text, max_chars=max_chars, keyword=first_match, target=target)
+        excerpt = cap_text(text, max_chars=max_chars, keywords=keywords, target=target)
         lines = _compact_context_lines(resolved_context, text_override=excerpt)
         if isinstance(jev_signal, dict):
             lines.append(f"Jev={jev_signal.get('probabilities')}; confidence={jev_signal.get('confidence')}; "
@@ -951,13 +1176,9 @@ def build_deepseek_user_prompt(resolved_context, jev_signal=None, include_jev_si
         return "\n".join(lines)
 
     full_text = resolved_context.get("clean_text") or resolved_context.get("capped_text") or ""
-    text = resolved_context.get("capped_text") or full_text
-    if max_chars > 3000 and len(full_text) > 3000:
-        text = full_text
-    keywords = resolved_context.get("keywords") or []
-    first_match = next((k for k in keywords if _find_term_index(text, k) >= 0), "")
+    keywords = normalize_keywords(resolved_context.get("keywords"))
     target = resolved_context.get("sentiment_target", resolved_context.get("actual_target")) or ""
-    excerpt = cap_text(text, max_chars=max_chars, keyword=first_match, target=target)
+    excerpt = cap_text(full_text, max_chars=max_chars, keywords=keywords, target=target)
     lines = _compact_context_lines(resolved_context, text_override=excerpt)
     if include_jev_signal is None:
         include_jev_signal = os.environ.get("DEEPSEEK_INCLUDE_JEV_SIGNAL", "true").lower() in ("true", "1", "yes")
@@ -1232,6 +1453,9 @@ def route_sentiment(jev_data: Optional[Dict[str, Any]], actual_target: str) -> D
     if is_placeholder_target(actual_target):
         conflict_reasons.append("generic_placeholder_target")
 
+    if entity_decision == "relevant" and irony > 0 and irony >= max(pos, neu, neg):
+        conflict_reasons.append("unresolved_sentiment")
+
     accept_jev = (routing_confidence >= JEV_ACCEPTANCE_THRESHOLD) and (len(conflict_reasons) == 0)
 
     # When a confidently unrelated Jev result passes the gate, entity_found=False
@@ -1259,7 +1483,7 @@ def _accept_jev_in_low_cost_mode(jev_data, route_info):
     if AI_COST_MODE != "low" or not jev_data or not route_info.get("probabilities"):
         return False
     conflicts = set(route_info.get("conflict_reasons") or [])
-    if "generic_placeholder_target" in conflicts or "entity_uncertain" in conflicts:
+    if conflicts.intersection(("generic_placeholder_target", "entity_uncertain", "unresolved_sentiment")):
         return False
 
     entity_probs = jev_data["entity_probabilities"]
@@ -1318,8 +1542,35 @@ class OllamaSentimentAnalyzer:
         self._thread_local.session = s
 
     def _post_provider(self, provider, url, **kwargs):
-        with self.provider_semaphores[provider]:
-            return self.session.post(url, **kwargs)
+        enabled = os.environ.get("GEMINI_RATE_LIMIT_ENABLED", "true").strip().lower() in ("true", "1", "yes")
+        if provider != "gemini" or not enabled:
+            with self.provider_semaphores[provider]:
+                return self.session.post(url, **kwargs)
+        model = urlsplit(url).path.rsplit("/", 1)[-1].split(":", 1)[0]
+        tokens = GEMINI_RATE_LIMITER.estimate_input_tokens(kwargs.get("json", {}))
+        logged_wait = False
+        start_wait = time.monotonic()
+        while True:
+            with self.provider_semaphores[provider]:
+                ticket, delay = GEMINI_RATE_LIMITER.reserve(model, tokens)
+                if ticket is not None:
+                    response = None
+                    try:
+                        response = self.session.post(url, **kwargs)
+                        if response.status_code == 429:
+                            GEMINI_RATE_LIMITER.cooldown(model, _gemini_retry_delay(response))
+                        return response
+                    finally:
+                        GEMINI_RATE_LIMITER.finish(ticket, response)
+            elapsed = time.monotonic() - start_wait
+            if delay > GEMINI_RATE_LIMITER.max_wait or (elapsed + delay) > GEMINI_RATE_LIMITER.max_wait:
+                raise GeminiRateLimited(
+                    f"{model} cumulative wait {elapsed + delay:.1f}s exceeds limit of {GEMINI_RATE_LIMITER.max_wait}s")
+            # Release the HTTP slot while waiting so other models can proceed.
+            if not logged_wait:
+                print(f"  -> Gemini RPM/TPM throttle [{model}]: waiting {delay:.1f}s")
+                logged_wait = True
+            time.sleep(delay)
 
     def _record_provider_attempt(self, route, model, retry=False, response_data=None, provider_hint=""):
         metrics = getattr(self._thread_local, "usage_metrics", None)
@@ -1330,7 +1581,8 @@ class OllamaSentimentAnalyzer:
             provider = response_data.get("provider") or response_data.get("provider_name") or provider
             model = response_data.get("model") or model
         profile = getattr(self._thread_local, "provider_profile", "off")
-        metrics.record(route, model, provider, retry, response_data, profile=profile)
+        family = {"google-ai": "gemini", "gemini": "gemini", "ollama": "ollama"}.get(provider_hint, "openrouter")
+        metrics.record(route, model, provider, retry, response_data, profile=profile, provider_family=family)
 
     def _run_with_usage_metrics(self, metrics, func, *args):
         previous = getattr(self._thread_local, "usage_metrics", None)
@@ -1349,6 +1601,11 @@ class OllamaSentimentAnalyzer:
             return None
         api_key = GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY", "")
         if not api_key:
+            return None
+
+        remaining_cooldown = GEMINI_RATE_LIMITER.is_blocked(model_name)
+        if remaining_cooldown:
+            print(f"  -> Gemini Rate Limit skip [{model_name}]: Model in cooldown ({remaining_cooldown:.1f}s remaining)")
             return None
         
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
@@ -1441,14 +1698,11 @@ class OllamaSentimentAnalyzer:
                     print(f"  -> Gemini API Model Not Found [{model_name}]: 404 (ข้ามโมเดลนี้ทันที)")
                     break
                 elif response.status_code == 429:
-                    retry_after = 3
-                    try:
-                        ra_hdr = response.headers.get("Retry-After")
-                        if ra_hdr:
-                            retry_after = max(int(float(ra_hdr)), 2)
-                    except Exception:
-                        pass
-                    print(f"  -> Gemini API Rate Limited (429) [{model_name}] (attempt {attempt + 1}/{max_retries}): รอ {retry_after}s...")
+                    retry_after = _gemini_retry_delay(response)
+                    print(f"  -> Gemini API Rate Limited (429) [{model_name}] (attempt {attempt + 1}/{max_retries}): รอ {retry_after:.1f}s...")
+                    if retry_after > GEMINI_RATE_LIMITER.max_wait:
+                        print(f"  -> Gemini Rate Limit skip [{model_name}]: Cooldown {retry_after:.1f}s exceeds {GEMINI_RATE_LIMITER.max_wait}s limit, skipping retries")
+                        break
                     if attempt < max_retries - 1:
                         time.sleep(retry_after)
                         continue
@@ -1456,6 +1710,12 @@ class OllamaSentimentAnalyzer:
                     print(f"  -> Gemini API Error [{model_name}]: HTTP {response.status_code} - {response.text[:200].replace(api_key, '[redacted]')}")
                     if attempt < max_retries - 1:
                         time.sleep(2)
+            except GeminiRequestTooLarge as e:
+                print(f"  -> Gemini TPM skip [{model_name}]: {e}")
+                return None
+            except GeminiRateLimited as e:
+                print(f"  -> Gemini Rate Limit skip [{model_name}]: {e}")
+                return None
             except Exception as e:
                 if not recorded:
                     self._record_provider_attempt("deepseek", model_name, attempt > 0,
@@ -1582,16 +1842,24 @@ class OllamaSentimentAnalyzer:
             "format": "json",
             "options": {"temperature": 0.0, "seed": 42}
         }
+        recorded = False
         try:
             response = self._post_provider("ollama", self.base_url, json=payload_generate, timeout=deep_timeout)
             if response.status_code == 200:
-                result_text = response.json().get("response", "{}")
+                data = response.json()
+                self._record_provider_attempt("deepseek", model_name, response_data=data, provider_hint="ollama")
+                recorded = True
+                result_text = data.get("response", "{}")
                 parsed = self._parse_json_result(result_text)
                 if parsed:
                     return parsed
             else:
+                self._record_provider_attempt("deepseek", model_name, provider_hint="ollama")
+                recorded = True
                 print(f"  -> Ollama Deep Model [{model_name}] error {response.status_code}: {response.text[:150]}")
         except Exception as e:
+            if not recorded:
+                self._record_provider_attempt("deepseek", model_name, provider_hint="ollama")
             print(f"  -> Ollama Deep Model [{model_name}] exception: {e}")
             
         payload_chat = {
@@ -1604,14 +1872,22 @@ class OllamaSentimentAnalyzer:
             "format": "json",
             "options": {"temperature": 0.0, "seed": 42}
         }
+        recorded = False
         try:
             response = self._post_provider("ollama", self.chat_url, json=payload_chat, timeout=deep_timeout)
             if response.status_code == 200:
-                result_text = response.json().get("message", {}).get("content", "{}")
+                data = response.json()
+                self._record_provider_attempt("deepseek", model_name, True, data, "ollama")
+                recorded = True
+                result_text = data.get("message", {}).get("content", "{}")
                 return self._parse_json_result(result_text)
             else:
+                self._record_provider_attempt("deepseek", model_name, True, provider_hint="ollama")
+                recorded = True
                 print(f"  -> Ollama Chat Model [{model_name}] error {response.status_code}: {response.text[:150]}")
         except Exception as e:
+            if not recorded:
+                self._record_provider_attempt("deepseek", model_name, True, provider_hint="ollama")
             print(f"  -> Ollama Chat Model [{model_name}] exception: {e}")
         return None
 
@@ -1905,15 +2181,15 @@ class OllamaSentimentAnalyzer:
             "7. PERCENTAGES: positive_percent + negative_percent + neutral_percent MUST equal exactly 100. "
             "Use multiples of 5: 0,5,10,15,...,100.\n"
             "8. Never assign Target sentiment from an emotion that is directed at another entity.\n\n"
-            "9. Always classify the main intent of the post as complaint, information, recommendation, or enquiry (even if Target is unrelated). "
-            "Pure praise is information; suggestions to improve and recommendations to others are recommendation. "
+            "Interpret sarcasm by intended meaning, and treat unresolved meaning as neutral.\n\n"
+            "9. " + INTENT_INSTRUCTIONS +
             "Publisher and URL alone do not prove relevance or official ownership.\n\n"
             "For reason, explain concisely in natural Thai and mention the Target-related context. No rule numbers.\n"
             'Return ONLY valid JSON with exactly these keys:\n'
             'Examples:\n'
             '{"entity_found":true,"intent":"information","reason":"ผู้ใช้ชื่นชมบริการ แต่บ่นเรื่องราคาเล็กน้อย","positive_percent":60,"negative_percent":15,"neutral_percent":25}\n'
-            '{"entity_found":true,"reason":"เป็นข่าวรายงานข้อเท็จจริง มีโทนเชิงบวกเล็กน้อย","positive_percent":15,"negative_percent":0,"neutral_percent":85}\n'
-            '{"entity_found":true,"reason":"ผู้ใช้แสดงความไม่พอใจอย่างมาก","positive_percent":0,"negative_percent":80,"neutral_percent":20}'
+            '{"entity_found":true,"intent":"information","reason":"เป็นข่าวรายงานข้อเท็จจริง มีโทนเชิงบวกเล็กน้อย","positive_percent":15,"negative_percent":0,"neutral_percent":85}\n'
+            '{"entity_found":true,"intent":"complaint","reason":"ผู้ใช้แสดงความไม่พอใจอย่างมาก","positive_percent":0,"negative_percent":80,"neutral_percent":20}'
         )
         # Dynamic content placed in user prompt at the end to maximize prefix caching
         deep_prompt = (
@@ -2000,6 +2276,7 @@ class OllamaSentimentAnalyzer:
                         "negative_percent": policy["neg"],
                         "neutral_percent": policy["neu"],
                         "irony_score": policy.get("irony_score", 0),
+                        "is_ambiguous": policy["is_ambiguous"],
                         "reason": synthetic_reason,
                         "entity_found": entity_found,
                         "model": actual_model,
@@ -2019,7 +2296,8 @@ class OllamaSentimentAnalyzer:
         return parsed if isinstance(parsed, dict) else None
 
     def _call_typesafe_jev(self, state_prompt: str, actual_target: str, keyword_scope: bool = False,
-                           overall_scope: bool = False) -> Tuple[Optional[Dict[str, Any]], str]:
+                           overall_scope: bool = False,
+                           max_attempts: Optional[int] = None) -> Tuple[Optional[Dict[str, Any]], str]:
         """
         Invoke TypeSafe Jev via OpenRouter Decisions API with typed questions:
         1. sentiment (choice: positive, neutral, negative, irony)
@@ -2051,7 +2329,8 @@ class OllamaSentimentAnalyzer:
                                      "Classify sentiment toward the named Target project only. Keywords only selected the excerpt. A general topic mention without a clear connection to Target is neutral. Official Target news, PR and seller self-praise are neutral; a clearly attributed independent opinion about Target still counts. Publisher and URL alone do not prove Target relevance or official ownership."
                                      if keyword_scope else
                                      "Classify sentiment toward Target only; unrelated topic sentiment is neutral."
-                                     if HYBRID_PROMPT_V2 else f"Classify sentiment toward '{actual_target}'."),
+                                     if HYBRID_PROMPT_V2 else f"Classify sentiment toward '{actual_target}'.")
+                                    + " " + AMBIGUITY_INSTRUCTIONS,
                     "criteria": {
                         "positive": ("Praise, satisfaction, or support expressed in the post."
                                      if overall_scope else
@@ -2065,7 +2344,7 @@ class OllamaSentimentAnalyzer:
                                      if overall_scope else
                                      "Complaint, blame, or criticism explicitly directed at Target, including an attributed quote; a venue named only as a location does not inherit criticism of others."
                                      if keyword_scope else "Criticism, complaint, defect, boycott, damage, or frustration."),
-                        "irony": "Sarcasm, mockery, cynical humor, satire, or backhanded praise."
+                        "irony": "Unresolved meaning or tone; use positive or negative when the intended sentiment of sarcasm is clear."
                     }
                 },
                 "entity_relevance": {
@@ -2085,19 +2364,8 @@ class OllamaSentimentAnalyzer:
                 },
                 "intent": {
                     "type": "choice",
-                    "instructions": ("Classify the main purpose of the whole post. A rhetorical question inside a grievance is a complaint. Pure praise is information."
-                                     if overall_scope else
-                                     "Classify the main purpose of the post. A rhetorical question inside a grievance is a complaint. Pure praise is information. Always classify intent even if Target is unrelated."),
-                    "criteria": {
-                        "complaint": ("The main purpose is to criticize, blame, or complain."
-                                      if overall_scope else "The main purpose is to criticize, blame, or complain about Target."),
-                        "information": ("The main purpose is to report facts, news, promotion, or pure praise."
-                                        if overall_scope else "The main purpose is to report facts, news, promotion, or pure praise about Target."),
-                        "recommendation": ("The main purpose is to suggest an improvement or recommend something to other people."
-                                           if overall_scope else "The main purpose is to suggest an improvement to Target or recommend Target to other people."),
-                        "enquiry": ("The main purpose is to ask for information."
-                                    if overall_scope else "The main purpose is to ask for information about Target.")
-                    }
+                    "instructions": INTENT_INSTRUCTIONS,
+                    "criteria": dict(INTENT_CRITERIA)
                 }
             }
         }
@@ -2106,16 +2374,17 @@ class OllamaSentimentAnalyzer:
             del payload["questions"]["entity_relevance"]
 
         candidates = [JEV_MODEL]
-        for m in JEV_FALLBACK_MODELS:
+        for m in ([] if max_attempts is not None else JEV_FALLBACK_MODELS):
             if m and m not in candidates:
                 candidates.append(m)
 
         session = self.get_session()
         deadline = time.monotonic() + JEV_CASCADE_TIMEOUT
+        retries = max_attempts - 1 if max_attempts is not None else JEV_MAX_RETRIES
 
         for cand_model in candidates:
             payload["model"] = cand_model
-            for attempt in range(1 + JEV_MAX_RETRIES):
+            for attempt in range(1 + retries):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None, ""
@@ -2126,12 +2395,16 @@ class OllamaSentimentAnalyzer:
                             resp_json = response.json()
                         except Exception:
                             self._record_provider_attempt("jev", cand_model, attempt > 0, provider_hint="openrouter")
+                            if max_attempts is not None and attempt < retries and _retry_within_deadline(attempt, deadline):
+                                continue
                             return None, cand_model
                         self._record_provider_attempt("jev", cand_model, attempt > 0, resp_json, "openrouter")
                         validated = validate_jev_response(resp_json, overall_scope=overall_scope)
                         if validated:
                             return validated, cand_model
                         else:
+                            if max_attempts is not None and attempt < retries and _retry_within_deadline(attempt, deadline):
+                                continue
                             return None, cand_model
                     self._record_provider_attempt("jev", cand_model, attempt > 0, provider_hint="openrouter")
                     if response.status_code in (401, 403):
@@ -2144,7 +2417,7 @@ class OllamaSentimentAnalyzer:
                         print(f"  ⚠️ [Jev 400 Bad Request] {cand_model} -> Non-retryable")
                         break
                     elif response.status_code in (408, 409, 425, 429) or response.status_code >= 500:
-                        if attempt < JEV_MAX_RETRIES and _retry_within_deadline(attempt, deadline, response):
+                        if attempt < retries and _retry_within_deadline(attempt, deadline, response):
                             continue
                         else:
                             break
@@ -2152,7 +2425,7 @@ class OllamaSentimentAnalyzer:
                         break
                 except requests.exceptions.RequestException:
                     self._record_provider_attempt("jev", cand_model, attempt > 0, provider_hint="openrouter")
-                    if attempt < JEV_MAX_RETRIES and _retry_within_deadline(attempt, deadline):
+                    if attempt < retries and _retry_within_deadline(attempt, deadline):
                         continue
                     else:
                         break
@@ -2173,6 +2446,8 @@ class OllamaSentimentAnalyzer:
         def after_openrouter():
             if profile == "overnight":
                 return self._call_gemini_strict_fallback(resolved_context, providers=("openrouter",))
+            if profile == "daytime":
+                return self._call_gemini_strict_fallback(resolved_context, providers=("gemini", "ollama"))
             return self._call_gemini_strict_fallback(resolved_context)
 
         if not provider_enabled("openrouter"):
@@ -2281,21 +2556,17 @@ class OllamaSentimentAnalyzer:
                 model = configured_model[4:]
                 result = self._call_gemini_api(model, system_prompt, user_prompt,
                                                max_retries=1, max_tokens=400)
-                provider = "google-ai"
             elif configured_model.startswith("openrouter:"):
                 if not provider_enabled("openrouter"):
                     continue
                 model = configured_model[len("openrouter:"):]
                 result = self._call_openrouter_api(model, system_prompt, user_prompt,
                                                    max_retries=1, max_tokens=400)
-                provider = "openrouter"
             else:
                 if not provider_enabled("ollama"):
                     continue
                 model = configured_model
                 result = self._call_ollama_generic(model, system_prompt, user_prompt)
-                provider = "ollama"
-                self._record_provider_attempt("deepseek", model, provider_hint=provider)
             validated = validate_deepseek_response(result)
             if validated:
                 return validated, model
@@ -2320,13 +2591,12 @@ class OllamaSentimentAnalyzer:
         if is_placeholder and not overall_scope:
             text = resolved_context.get("clean_text") or resolved_context.get("capped_text") or ""
             keywords = resolved_context.get("keywords") or []
-            first_keyword = next((k for k in keywords if _find_term_index(text, k) >= 0), "")
             return self._hybrid_analyze_post({
                 **resolved_context,
                 "analysis_scope": "overall",
                 "actual_target": OVERALL_POST_LABEL,
                 "sentiment_target": OVERALL_POST_LABEL,
-                "capped_text": cap_text(text, max_chars=JEV_TEXT_MAX_CHARS, keyword=first_keyword)
+                "capped_text": cap_text(text, max_chars=JEV_TEXT_MAX_CHARS, keywords=keywords)
             })
 
         jev_raw = None
@@ -2334,13 +2604,15 @@ class OllamaSentimentAnalyzer:
 
         if resolved_context.get("_provider_profile") != "overnight" and (not is_placeholder or overall_scope):
             state_prompt = build_jev_state_prompt(resolved_context)
+            jev_options = {"max_attempts": 2} if resolved_context.get("_provider_profile") == "daytime" else {}
             if overall_scope:
                 jev_raw, jev_model_used = self._call_typesafe_jev(
-                    state_prompt, sentiment_target, overall_scope=True)
+                    state_prompt, sentiment_target, overall_scope=True, **jev_options)
             elif keyword_scope:
-                jev_raw, jev_model_used = self._call_typesafe_jev(state_prompt, sentiment_target, keyword_scope=True)
+                jev_raw, jev_model_used = self._call_typesafe_jev(
+                    state_prompt, sentiment_target, keyword_scope=True, **jev_options)
             else:
-                jev_raw, jev_model_used = self._call_typesafe_jev(state_prompt, sentiment_target)
+                jev_raw, jev_model_used = self._call_typesafe_jev(state_prompt, sentiment_target, **jev_options)
 
         route_info = route_sentiment(jev_raw, sentiment_target)
 
@@ -2355,7 +2627,7 @@ class OllamaSentimentAnalyzer:
                 sanitized_tgt, probs["POSITIVE"], probs["NEGATIVE"], probs["NEUTRAL"],
                 probs["AMBIGUOUS_OR_IRONY"], entity_found=entity_found)
             if overall_scope:
-                reason = _overall_reason(policy["sentiment"])
+                reason = _overall_reason(policy["sentiment"], policy["is_ambiguous"])
             return {
                 "post_id": post_id,
                 "ai_sentiment": policy["score"],
@@ -2365,6 +2637,7 @@ class OllamaSentimentAnalyzer:
                 "negative_percent": policy["neg"],
                 "neutral_percent": policy["neu"],
                 "irony_score": policy["irony_score"],
+                "is_ambiguous": policy["is_ambiguous"],
                 "confidence": round(route_info["routing_confidence"], 4),
                 "reason": reason,
                 "entity_found": entity_found,
@@ -2437,7 +2710,7 @@ class OllamaSentimentAnalyzer:
             sanitized_tgt, ds_probs["POSITIVE"], ds_probs["NEGATIVE"], ds_probs["NEUTRAL"],
             ds_probs["AMBIGUOUS_OR_IRONY"], entity_found=ds_entity_found)
         if resolved_context.get("analysis_scope") == "overall":
-            reason = _overall_reason(policy["sentiment"])
+            reason = _overall_reason(policy["sentiment"], policy["is_ambiguous"])
 
         ds_confidence = round(max(ds_probs.values()), 4)
 
@@ -2450,6 +2723,7 @@ class OllamaSentimentAnalyzer:
             "negative_percent": policy["neg"],
             "neutral_percent": policy["neu"],
             "irony_score": policy["irony_score"],
+            "is_ambiguous": policy["is_ambiguous"],
             "confidence": ds_confidence,
             "reason": reason,
             "entity_found": ds_entity_found,
@@ -2508,7 +2782,7 @@ class OllamaSentimentAnalyzer:
         if not post_id:
             return None
 
-        full_text = post.get("full_text") or post.get("content") or post.get("text") or post.get("message") or post.get("feedcontent") or ""
+        full_text = post_text(post)
         clean_raw_text = re.sub(r"<[^>]+>", " ", str(full_text)) if full_text else ""
         clean_raw_text = re.sub(r"&[a-zA-Z0-9#]+;", " ", clean_raw_text)
         clean_raw_text = re.sub(r"\s+", " ", clean_raw_text).strip()
@@ -2532,17 +2806,13 @@ class OllamaSentimentAnalyzer:
             }
 
         if post.get("_analysis_scope") == "keyword":
-            raw_keywords = post.get("keywords") or []
-            if isinstance(raw_keywords, str):
-                raw_keywords = raw_keywords.split(",")
-            keywords = [str(value).strip() for value in raw_keywords if str(value).strip()]
+            keywords = post_keywords(post)
             matched_keywords = [value for value in keywords if _find_term_index(clean_raw_text, value) >= 0]
             target_keywords = matched_keywords or keywords
             project_name = str(post.get("project_name") or "").strip()
             # A retrieval keyword is not an entity to assess sentiment toward.
             overall_scope = is_placeholder_target(project_name)
             analysis_target = OVERALL_POST_LABEL if overall_scope else project_name
-            first_keyword = target_keywords[0] if target_keywords else ""
             return self._hybrid_analyze_post({
                 "post_id": post_id,
                 "_provider_profile": provider_profile,
@@ -2555,19 +2825,10 @@ class OllamaSentimentAnalyzer:
                 "source_info": _source_context(post),
                 "clean_text": clean_raw_text,
                 "capped_text": cap_text(clean_raw_text, max_chars=JEV_TEXT_MAX_CHARS,
-                                        keyword=first_keyword, target="" if overall_scope else project_name)
+                                        keywords=target_keywords, target="" if overall_scope else project_name)
             })
 
-        raw_kw = post.get("keywords") or post.get("keyword_name") or post.get("keyword")
-        if isinstance(raw_kw, str):
-            keywords = [k.strip() for k in raw_kw.split(",") if k.strip()]
-        elif isinstance(raw_kw, (list, tuple)):
-            keywords = [str(k).strip() for k in raw_kw if str(k).strip()]
-        else:
-            keywords = []
-        kw_name = post.get("keyword_name", "")
-        if not keywords and kw_name:
-            keywords = [k.strip() for k in str(kw_name).split(",") if k.strip()]
+        keywords = post_keywords(post)
 
         project_id = post.get("project_id")
         project_name = post.get("project_name", "")
@@ -2613,11 +2874,9 @@ class OllamaSentimentAnalyzer:
                               keywords, resolved_proj, post.get("tracking_kind", ""))
             if HYBRID_PROMPT_V2 else actual_target
         )
-        first_keyword = keywords[0] if keywords else ""
-        capped_text = (cap_text(clean_raw_text, max_chars=JEV_TEXT_MAX_CHARS,
-                               keyword=first_keyword, target=sentiment_target)
-                       if HYBRID_PROMPT_V2 else _legacy_cap_text(clean_raw_text, max_chars=8000,
-                                                                   keyword=first_keyword))
+        capped_text = cap_text(clean_raw_text,
+                               max_chars=JEV_TEXT_MAX_CHARS if HYBRID_PROMPT_V2 else 8000,
+                               keywords=keywords, target=sentiment_target)
 
         resolved_context = {
             "post_id": post_id,
@@ -2637,8 +2896,8 @@ class OllamaSentimentAnalyzer:
             return self._hybrid_analyze_post(resolved_context)
 
         # --- LEGACY MODES (IF ENABLE_JEV_HYBRID=False) ---
-        expanded_content = get_keyword_context(clean_raw_text, str(first_keyword), window=300) if first_keyword else clean_raw_text
-        content = get_keyword_context(clean_raw_text, str(first_keyword), window=150) if first_keyword else clean_raw_text
+        expanded_content = cap_text(clean_raw_text, max_chars=600, keywords=keywords, target=sentiment_target) if keywords else clean_raw_text
+        content = cap_text(clean_raw_text, max_chars=400, keywords=keywords, target=sentiment_target) if keywords else clean_raw_text
 
         if provider_profile != "off":
             if ENABLE_PROBABILISTIC_MODE:
@@ -2768,6 +3027,7 @@ class OllamaSentimentAnalyzer:
                             )
                             active_futures[slow_future] = p
                         elif res is not None:
+                            res["_provider_profile"] = p["_provider_profile"]
                             results.append(res)
                     except Exception as e:
                         failed_id = str(p.get("match_post_id") or p.get("post_id", ""))[:15]
@@ -2775,7 +3035,9 @@ class OllamaSentimentAnalyzer:
                         raw_id = next((p[key] for key in ("match_post_id", "id", "post_id", "msg_id")
                                        if p.get(key) is not None and str(p[key]).strip()), None)
                         if raw_id is not None:
-                            results.append(self._neutral_error_result(str(raw_id).strip(), p.get("project_name", "")))
+                            failure = self._neutral_error_result(str(raw_id).strip(), p.get("project_name", ""))
+                            failure["_provider_profile"] = p["_provider_profile"]
+                            results.append(failure)
 
                 fill_fast_window()
 
@@ -3000,8 +3262,13 @@ class SentimentAPI:
                 pass
         return page + 1 if count >= page_size else None
 
-    def fetch_pending(self, date_from, date_to, retries=3, delay=2):
-        """Read every page from the posts endpoint before analyzing a batch."""
+    def fetch_pending(self, date_from, date_to, retries=3, delay=2, on_page=None, save_db=False):
+        """Read pages; optionally process each page before requesting the next one.
+
+        After a successful live write, revisit the same offset. Pending-only APIs
+        can shift unseen rows into that page when completed rows disappear.
+        The list-returning form remains available for read-only callers.
+        """
         self.last_fetch_error = False
         self.last_pending_count = 0
         url = f"{BE_API_BASE_URL.rstrip('/')}/internal/sentiment/posts"
@@ -3009,12 +3276,23 @@ class SentimentAPI:
         page = 1
         all_posts = []
         seen_pages = set()
+        seen_ids = set()
+        previous_page = None
+        fetched_count = 0
+        started = time.perf_counter()
+        pending_count = 0
+        print(f"[REST API] กำลังดึงโพสต์ช่วง {date_from} ถึง {date_to} "
+              f"หน้าละ {page_size} รายการ; "
+              f"{'วิเคราะห์ทีละหน้าทันที' if on_page is not None else 'รวบรวมข้อมูลทุกหน้า'}", flush=True)
 
         while True:
             params = {"date_from": date_from, "date_to": date_to,
                       "page_size": page_size, "page": page}
             response = None
             for attempt in range(1, retries + 1):
+                request_started = time.perf_counter()
+                print(f"[REST API] กำลังขอหน้า {page}, ครั้งที่ {attempt}/{retries} "
+                      f"(timeout 60 วินาที)", flush=True)
                 try:
                     response = requests.get(url, params=params, headers=self.headers, timeout=60)
                     if response.status_code == 200:
@@ -3042,22 +3320,46 @@ class SentimentAPI:
                 return []
 
             identifiers = tuple(self._analysis_id(post) for post in posts)
-            if identifiers and all(identifiers) and identifiers in seen_pages:
+            fingerprint = hashlib.sha256(json.dumps(identifiers).encode("utf-8")).hexdigest()
+            revisiting_same_page = on_page is not None and previous_page == page
+            if identifiers and all(identifiers) and fingerprint in seen_pages and not revisiting_same_page:
                 print(f"[REST API] Repeated posts page {page}; stopping pagination")
                 self.last_fetch_error = True
                 return []
             if identifiers and all(identifiers):
-                seen_pages.add(identifiers)
-            all_posts.extend(posts)
+                seen_pages.add(fingerprint)
+            previous_page = page
+            fetched_count += len(posts)
+            pending = [post for post in posts
+                       if str(post.get("sentiment_status") or "0").strip() not in ("1", "2")]
+            if on_page is not None:
+                # Each post is attempted only once per run, including failed REST writes.
+                pending = [post for post in pending
+                           if self._analysis_id(post) and self._analysis_id(post) not in seen_ids]
+                unique_pending = []
+                for post in pending:
+                    identifier = self._analysis_id(post)
+                    if identifier not in seen_ids:
+                        seen_ids.add(identifier)
+                        unique_pending.append(post)
+                pending = unique_pending
+            else:
+                all_posts.extend(pending)
+            pending_count += len(pending)
+            self.last_pending_count = pending_count
             next_page = self._next_posts_page(metadata, page, len(posts), page_size)
+            print(f"[REST API] ได้หน้า {page}: {len(posts)} รายการ "
+                  f"ใน {time.perf_counter() - request_started:.1f}s | "
+                  f"อ่านรวม {fetched_count} รายการ, ใหม่ที่รอวิเคราะห์ในหน้านี้ {len(pending)} | "
+                  f"เวลารวม {time.perf_counter() - started:.1f}s", flush=True)
+            if on_page is not None and pending:
+                updated = on_page(pending)
+                if save_db and updated > 0:
+                    print(f"[REST API] บันทึกแล้ว; ตรวจหน้า {page} อีกครั้ง "
+                          "เพื่อรับรายการที่เลื่อนเข้ามา โดยไม่วิเคราะห์ ID เดิมซ้ำ", flush=True)
+                    continue
             if next_page is None or not posts:
-                pending = [post for post in all_posts
-                           if str(post.get("sentiment_status") or "0").strip() not in ("1", "2")]
-                skipped = len(all_posts) - len(pending)
-                if skipped:
-                    print(f"[REST API] Skipped {skipped} posts with sentiment_status 1 or 2")
-                self.last_pending_count = len(pending)
-                return pending
+                return all_posts
             page = next_page
 
     def bulk_update(self, results, retries=3, delay=2):
@@ -3120,14 +3422,31 @@ class SentimentAPI:
         date_to = validate_date_str(date_to)
         if date_from > date_to:
             raise ValueError(f"date_from ({date_from}) cannot be after date_to ({date_to})")
-        pending_posts = self.fetch_pending(date_from, date_to)
-        
-        if not pending_posts:
-            print("⏩ [REST API] ไม่มีข้อมูลใหม่ให้วิเคราะห์ (0 โพสต์)")
-            return 0
+        total_updated = 0
+        processed_count = 0
 
+        def process_page(posts):
+            nonlocal total_updated, processed_count
+            updated = self._process_pending_posts(posts, save_db)
+            total_updated += updated
+            processed_count += len(posts)
+            return updated
+
+        remaining = self.fetch_pending(date_from, date_to, on_page=process_page, save_db=save_db)
+        # Preserve compatibility with list-returning overrides of fetch_pending.
+        if remaining:
+            process_page(remaining)
+        if self.last_fetch_error:
+            print(f"[REST API] หยุดดึงข้อมูลเพราะ API มีปัญหา; "
+                  f"ประมวลผลแล้ว {processed_count} รายการ, บันทึก/จำลอง {total_updated} รายการ", flush=True)
+        elif not processed_count:
+            print("⏩ [REST API] ไม่มีข้อมูลใหม่ให้วิเคราะห์ (0 โพสต์)")
+        return total_updated
+
+    def _process_pending_posts(self, pending_posts, save_db):
+        """Analyze and save one fetched page in bounded batches."""
         total = len(pending_posts)
-        print(f"📦 [REST API] พบข้อความที่ต้องวิเคราะห์ทั้งหมด: {total} โพสต์")
+        print(f"📦 [REST API] เริ่มวิเคราะห์ข้อมูลจากหน้านี้: {total} โพสต์", flush=True)
 
         BATCH_SIZE = parse_bounded_int("BATCH_SIZE", 100, min_val=1, max_val=1000)
         total_updated = 0
@@ -3140,20 +3459,13 @@ class SentimentAPI:
 
             posts_for_ai = []
             for post in batch:
-                content = post.get("content") or post.get("full_text") or post.get("text") or post.get("message") or post.get("feedcontent") or ""
-                raw_content = "" if content is None or str(content).strip().lower() == "none" else str(content)
+                raw_content = post_text(post)
                 text = re.sub(r"<[^>]+>", "", raw_content)
                 text = re.sub(r"\s+", " ", text).strip()
                 
-                raw_kw = post.get("keywords") or post.get("keyword_name") or post.get("keyword")
-                if isinstance(raw_kw, str):
-                    keywords = [k.strip() for k in raw_kw.split(",") if k.strip()]
-                elif isinstance(raw_kw, (list, tuple)):
-                    keywords = [str(k).strip() for k in raw_kw if str(k).strip()]
-                else:
-                    keywords = []
-                keyword = keywords[0] if keywords else ""
-                clean_short_content = get_keyword_context(text, keyword, window=150)
+                keywords = post_keywords(post)
+                clean_short_content = cap_text(text, max_chars=400, keywords=keywords,
+                                              target=str(post.get("project_name") or ""))
                 
                 modified_post = post.copy()
                 modified_post["_provider_profile"] = current_provider_profile()

@@ -16,7 +16,7 @@ with patch.object(socket.socket, "connect", side_effect=AssertionError("network 
 
 
 class TestEntrypointModes(unittest.TestCase):
-    def test_rest_does_not_persist_unresolved_target_as_neutral(self):
+    def test_rest_persists_provider_failure_as_neutral(self):
         posts = [
             {"match_post_id": "unknown", "project_id": "missing", "content": "keyword", "keywords": ["keyword"]},
             {"match_post_id": "known", "project_id": "known", "content": "brand", "keywords": ["brand"]},
@@ -24,19 +24,22 @@ class TestEntrypointModes(unittest.TestCase):
         analyzer = Mock()
         analyzer.analyze_post_sentiments.return_value = {"data": [
             {"post_id": "unknown", "ai_sentiment": 0, "sentiment": "neutral",
-             "neutral_percent": 100, "model": "rule:unresolved_target"},
+             "neutral_percent": 100, "model": "rule:provider_failure"},
             {"post_id": "known", "ai_sentiment": 100, "sentiment": "positive",
              "positive_percent": 90, "neutral_percent": 10, "model": "jev"},
         ]}
         api = sentiment_module.SentimentAPI(analyzer=analyzer)
         with patch.object(api, "fetch_pending", return_value=posts), \
-                patch.object(api, "bulk_update", return_value=1) as update, \
+                patch.object(api, "bulk_update", return_value=2) as update, \
                 patch.object(sentiment_module, "GLOBAL_PROJECT_RESOLVER", None), \
                 redirect_stdout(io.StringIO()):
             updated = api.run("2026-09-23", "2026-09-24", save_db=True)
-        self.assertEqual(updated, 1)
+        self.assertEqual(updated, 2)
         sent = update.call_args.args[0]
-        self.assertEqual([item["match_post_id"] for item in sent], ["known"])
+        self.assertEqual([item["match_post_id"] for item in sent], ["unknown", "known"])
+        self.assertEqual(sent[0]["sentiment"], "neutral")
+        self.assertEqual(sent[0]["sentiment_status"], "1")
+        self.assertEqual(sent[0]["sentiment_scores"]["model"], "rule:provider_failure")
 
     def test_mode_argument_defaults_to_rest_and_rejects_db_modes(self):
         self.assertEqual(sentiment_module.parse_run_mode([]), "rest")

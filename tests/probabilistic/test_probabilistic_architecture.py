@@ -125,15 +125,14 @@ class TestProbabilisticArchitecture(unittest.TestCase):
             self.assertEqual(policy["score"], -100)
             self.assertEqual(policy["pos"] + policy["neg"] + policy["neu"], 100)
 
-    def test_resolve_policy_irony_conservative_negative(self):
-        """Verify irony weight shifts toward negative in conservative brand monitoring"""
+    def test_resolve_policy_unresolved_meaning_is_neutral(self):
+        """Unresolved meaning must not manufacture negative sentiment."""
         for mod in self.modules:
-            # Sarcastic text: pos 0.30, neg 0.20, neu 0.10, irony 0.40
-            # effective_neg = 0.20 + (0.40 * 0.7) = 0.48 > effective_pos 0.30 -> negative!
             probs = {"POSITIVE": 0.30, "NEUTRAL": 0.10, "NEGATIVE": 0.20, "AMBIGUOUS_OR_IRONY": 0.40}
             policy = mod.resolve_policy(probs, entity_found=True)
-            self.assertEqual(policy["sentiment"], "negative")
-            self.assertEqual(policy["score"], -100)
+            self.assertEqual(policy["sentiment"], "neutral")
+            self.assertEqual(policy["score"], 0)
+            self.assertTrue(policy["is_ambiguous"])
             self.assertEqual(policy["irony_score"], 40)
             self.assertEqual(policy["pos"] + policy["neg"] + policy["neu"], 100)
 
@@ -164,10 +163,11 @@ class TestProbabilisticArchitecture(unittest.TestCase):
             r_notfound = mod.generate_synthetic_reason("SCB", 0.8, 0.1, 0.1, 0.0, entity_found=False)
             self.assertIn("ไม่พบการกล่าวถึงหรือความคิดเห็นต่อ SCB โดยตรง", r_notfound)
 
-            # 2. Irony with negative lean
+            # 2. Unresolved meaning with insufficient negative evidence
             r_irony_neg = mod.generate_synthetic_reason("SCB", 0.1, 0.3, 0.2, 0.4, entity_found=True)
-            self.assertIn("ประชดประชัน", r_irony_neg)
-            self.assertIn("เชิงลบ", r_irony_neg)
+            self.assertIn("กำกวม", r_irony_neg)
+            self.assertIn("เป็นกลาง", r_irony_neg)
+            self.assertNotIn("เชิงลบ", r_irony_neg)
 
             # 3. Strong positive
             r_pos = mod.generate_synthetic_reason("SCB", 0.85, 0.05, 0.10, 0.0, entity_found=True)

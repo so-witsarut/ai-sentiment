@@ -72,6 +72,7 @@ class ProviderConcurrencyTests(unittest.TestCase):
         env = patch.dict(os.environ, {
             "ENABLE_GEMINI": "true", "ENABLE_OLLAMA": "true", "ENABLE_OPENROUTER": "true",
             "GEMINI_MAX_CONCURRENCY": "1", "OLLAMA_MAX_CONCURRENCY": "1",
+            "GEMINI_RATE_LIMIT_ENABLED": "false",  # These tests isolate HTTP concurrency.
         })
         env.start()
         self.addCleanup(env.stop)

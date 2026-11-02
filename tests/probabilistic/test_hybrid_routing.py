@@ -157,8 +157,8 @@ class TestHybridRouting(unittest.TestCase):
     # -------------------------------------------------------------------------
     # 3. High-Confidence Ironic Jev Accepted
     # -------------------------------------------------------------------------
-    def test_high_confidence_ironic_jev_accepted(self):
-        """High confidence irony without conflicts is accepted and conservative policy applies"""
+    def test_high_confidence_ambiguous_jev_escalates(self):
+        """A confident unresolved choice still needs the fallback model."""
         for mod in self.modules:
             jev_data = {
                 "sentiment_probabilities": {"positive": 0.05, "neutral": 0.10, "negative": 0.10, "irony": 0.75},
@@ -169,14 +169,15 @@ class TestHybridRouting(unittest.TestCase):
                 "entity_choice": "relevant"
             }
             route = mod.route_sentiment(jev_data, actual_target="SCB")
-            self.assertTrue(route["accept_jev"])
-            self.assertEqual(route["conflict_reasons"], [])
+            self.assertFalse(route["accept_jev"])
+            self.assertEqual(route["conflict_reasons"], ["unresolved_sentiment"])
 
-            # Policy converts heavy irony into conservative negative sentiment
+            # Unresolved meaning contributes to neutral instead of negative.
             probs = {"POSITIVE": 0.05, "NEUTRAL": 0.10, "NEGATIVE": 0.10, "AMBIGUOUS_OR_IRONY": 0.75}
             policy = mod.resolve_policy(probs, entity_found=True)
-            self.assertEqual(policy["sentiment"], "negative")
-            self.assertEqual(policy["score"], -100)
+            self.assertEqual(policy["sentiment"], "neutral")
+            self.assertEqual(policy["score"], 0)
+            self.assertTrue(policy["is_ambiguous"])
             self.assertEqual(policy["irony_score"], 75)
             self.assertEqual(policy["pos"] + policy["neg"] + policy["neu"], 100)
 
