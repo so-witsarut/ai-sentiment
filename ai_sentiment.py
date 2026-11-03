@@ -630,13 +630,14 @@ KEYWORD_SYSTEM_PROMPT = (
 )
 
 OVERALL_SYSTEM_PROMPT = (
-    "Assess the overall sentiment and main intent of the whole Thai social post. "
-    "There is no named target; keywords only selected the excerpt and are not the subject. "
+    "Assess the overall public sentiment and main intent of the whole Thai social post regarding the discussed topic and keywords. "
+    "There is no individual brand target; evaluate the sentiment of the post's message and topic. "
     "Return JSON only: {\"probabilities\":{\"POSITIVE\":number,\"NEUTRAL\":number,"
     "\"NEGATIVE\":number,\"AMBIGUOUS_OR_IRONY\":number},\"entity_found\":true,\"intent\":string}. "
     "Probabilities must be finite, between 0 and 1, and sum to 1. "
-    "POSITIVE=overall praise or satisfaction; NEGATIVE=overall complaint or criticism; "
-    "NEUTRAL=facts, news, PR, ads, or questions without a clear opinion; "
+    "POSITIVE=overall praise, satisfaction, positive development, good experience; "
+    "NEGATIVE=overall complaint, criticism, hardship, price hike, bad news, problem, dissatisfaction; "
+    "NEUTRAL=plain factual info without negative or positive impact, general questions; "
     + AMBIGUITY_INSTRUCTIONS +
     "Official self-praise and sales slogans are neutral unless an independent opinion is clearly quoted. "
     + INTENT_INSTRUCTIONS +
@@ -1080,6 +1081,9 @@ def _compact_context_lines(resolved_context, text_override=None):
     if resolved_context.get("analysis_scope") == "overall":
         text = text_override if text_override is not None else resolved_context.get("capped_text") or ""
         lines = ["Scope=overall post sentiment and intent"]
+        keywords = [str(k).strip() for k in (resolved_context.get("keywords") or []) if str(k).strip()]
+        if keywords:
+            lines.append(f"Keywords={', '.join(keywords)}")
         source = resolved_context.get("source_info") or ""
         if source:
             lines.append(str(source))
@@ -2805,13 +2809,13 @@ class OllamaSentimentAnalyzer:
                 "conflict_reasons": []
             }
 
-        if post.get("_analysis_scope") == "keyword":
+        if post.get("_analysis_scope") in ("keyword", "overall"):
             keywords = post_keywords(post)
             matched_keywords = [value for value in keywords if _find_term_index(clean_raw_text, value) >= 0]
             target_keywords = matched_keywords or keywords
             project_name = str(post.get("project_name") or "").strip()
-            # A retrieval keyword is not an entity to assess sentiment toward.
-            overall_scope = is_placeholder_target(project_name)
+            force_overall = os.environ.get("FORCE_OVERALL_SENTIMENT", "false").strip().lower() in ("true", "1", "yes")
+            overall_scope = force_overall or post.get("_analysis_scope") == "overall" or is_placeholder_target(project_name)
             analysis_target = OVERALL_POST_LABEL if overall_scope else project_name
             return self._hybrid_analyze_post({
                 "post_id": post_id,
@@ -3464,15 +3468,16 @@ class SentimentAPI:
                 text = re.sub(r"\s+", " ", text).strip()
                 
                 keywords = post_keywords(post)
-                clean_short_content = cap_text(text, max_chars=400, keywords=keywords,
-                                              target=str(post.get("project_name") or ""))
+                force_overall = os.environ.get("FORCE_OVERALL_SENTIMENT", "false").strip().lower() in ("true", "1", "yes")
+                target_for_cap = "" if force_overall else str(post.get("project_name") or "")
+                clean_short_content = cap_text(text, max_chars=400, keywords=keywords, target=target_for_cap)
                 
                 modified_post = post.copy()
                 modified_post["_provider_profile"] = current_provider_profile()
                 modified_post["content"] = clean_short_content
                 modified_post["full_text"] = text
                 modified_post["keywords"] = keywords
-                modified_post["_analysis_scope"] = "keyword"
+                modified_post["_analysis_scope"] = "overall" if force_overall else "keyword"
                 posts_for_ai.append(modified_post)
 
             try:
