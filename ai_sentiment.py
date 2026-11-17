@@ -1504,6 +1504,18 @@ def _accept_jev_in_low_cost_mode(jev_data, route_info):
             not conflicts)
 
 
+def _ollama_think_setting(model_name):
+    """Resolve Ollama thinking mode from OLLAMA_THINK or auto-disable for DeepSeek-R1 JSON calls."""
+    raw = os.environ.get("OLLAMA_THINK", "").strip().lower()
+    if raw in ("true", "1", "yes"):
+        return True
+    if raw in ("false", "0", "no"):
+        return False
+    if raw in ("", "auto") and "deepseek-r1" in str(model_name or "").lower():
+        return False
+    return None
+
+
 # =============================================================================
 # Ollama & Gemini Sentiment Analyzer Engine (2-Pass Pipeline)
 # =============================================================================
@@ -1834,65 +1846,63 @@ class OllamaSentimentAnalyzer:
                     time.sleep(2)
         return None
 
+    def _post_ollama_payload(self, url, payload, timeout):
+        response = self._post_provider("ollama", url, json=payload, timeout=timeout)
+        if (response.status_code == 400 and "think" in payload
+                and "thinking" in str(getattr(response, "text", "") or "").lower()):
+            fallback_payload = {k: v for k, v in payload.items() if k != "think"}
+            response = self._post_provider("ollama", url, json=fallback_payload, timeout=timeout)
+        return response
+
     def _call_ollama_generic(self, model_name, system_instruction, user_prompt):
         if not provider_enabled("ollama"):
             return None
-        deep_timeout = int(os.environ.get("OLLAMA_DEEP_TIMEOUT", 30))
-        payload_generate = {
-            "model": model_name,
-            "system": system_instruction,
-            "prompt": user_prompt,
-            "stream": False,
-            "format": "json",
-            "options": {"temperature": 0.0, "seed": 42}
-        }
-        recorded = False
-        try:
-            response = self._post_provider("ollama", self.base_url, json=payload_generate, timeout=deep_timeout)
-            if response.status_code == 200:
-                data = response.json()
-                self._record_provider_attempt("deepseek", model_name, response_data=data, provider_hint="ollama")
-                recorded = True
-                result_text = data.get("response", "{}")
-                parsed = self._parse_json_result(result_text)
-                if parsed:
-                    return parsed
-            else:
-                self._record_provider_attempt("deepseek", model_name, provider_hint="ollama")
-                recorded = True
-                print(f"  -> Ollama Deep Model [{model_name}] error {response.status_code}: {response.text[:150]}")
-        except Exception as e:
-            if not recorded:
-                self._record_provider_attempt("deepseek", model_name, provider_hint="ollama")
-            print(f"  -> Ollama Deep Model [{model_name}] exception: {e}")
-            
-        payload_chat = {
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": system_instruction},
-                {"role": "user",   "content": user_prompt}
-            ],
-            "stream": False,
-            "format": "json",
-            "options": {"temperature": 0.0, "seed": 42}
-        }
-        recorded = False
-        try:
-            response = self._post_provider("ollama", self.chat_url, json=payload_chat, timeout=deep_timeout)
-            if response.status_code == 200:
-                data = response.json()
-                self._record_provider_attempt("deepseek", model_name, True, data, "ollama")
-                recorded = True
-                result_text = data.get("message", {}).get("content", "{}")
-                return self._parse_json_result(result_text)
-            else:
-                self._record_provider_attempt("deepseek", model_name, True, provider_hint="ollama")
-                recorded = True
-                print(f"  -> Ollama Chat Model [{model_name}] error {response.status_code}: {response.text[:150]}")
-        except Exception as e:
-            if not recorded:
-                self._record_provider_attempt("deepseek", model_name, True, provider_hint="ollama")
-            print(f"  -> Ollama Chat Model [{model_name}] exception: {e}")
+        deep_timeout = max(1, int(os.environ.get("OLLAMA_DEEP_TIMEOUT", 30)))
+        think_setting = _ollama_think_setting(model_name)
+        keep_alive = os.environ.get("OLLAMA_KEEP_ALIVE", "").strip()
+        options = {"temperature": 0.0, "seed": 42}
+        if os.environ.get("OLLAMA_NUM_CTX", "").strip():
+            options["num_ctx"] = parse_bounded_int("OLLAMA_NUM_CTX", 4096, min_val=512, max_val=131072)
+
+        def build_payload(**extra):
+            body = {"model": model_name, "stream": False, "format": "json", "options": dict(options), **extra}
+            if think_setting is not None:
+                body["think"] = think_setting
+            if keep_alive:
+                body["keep_alive"] = keep_alive
+            return body
+
+        attempts = (
+            ("Ollama Deep Model", self.base_url, False,
+             build_payload(system=system_instruction, prompt=user_prompt),
+             lambda data: data.get("response", "{}")),
+            ("Ollama Chat Model", self.chat_url, True,
+             build_payload(messages=[
+                 {"role": "system", "content": system_instruction},
+                 {"role": "user", "content": user_prompt}
+             ]),
+             lambda data: (data.get("message") or {}).get("content", "{}")),
+        )
+
+        for label, url, is_retry, payload, extract_text in attempts:
+            recorded = False
+            try:
+                response = self._post_ollama_payload(url, payload, deep_timeout)
+                if response.status_code == 200:
+                    data = response.json()
+                    self._record_provider_attempt("deepseek", model_name, is_retry, data, "ollama")
+                    recorded = True
+                    parsed = self._parse_json_result(extract_text(data))
+                    if parsed:
+                        return parsed
+                else:
+                    self._record_provider_attempt("deepseek", model_name, is_retry, provider_hint="ollama")
+                    recorded = True
+                    print(f"  -> {label} [{model_name}] error {response.status_code}: {response.text[:150]}")
+            except Exception as e:
+                if not recorded:
+                    self._record_provider_attempt("deepseek", model_name, is_retry, provider_hint="ollama")
+                print(f"  -> {label} [{model_name}] exception: {e}")
         return None
 
     def _normalize_distribution(self, positive=0, negative=0, neutral=100):

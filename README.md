@@ -66,6 +66,7 @@ cp .env.example .env
 | `BE_API_BASE_URL`, `BE_API_TOKEN` | ที่อยู่และ token ของ Blue Eye REST API; URL มีค่าเริ่มต้นในโค้ด |
 | `OPENROUTER_API_KEY`, `GEMINI_API_KEY` | API key ของ provider ที่เปิดใช้งาน |
 | `OLLAMA_HOST`, `OLLAMA_MODEL` | ที่อยู่ Ollama และโมเดลเริ่มต้น; `OLLAMA_HOST` เริ่มต้นที่ `http://localhost:11434` |
+| `OLLAMA_DEEP_TIMEOUT`, `OLLAMA_THINK`, `OLLAMA_KEEP_ALIVE` | timeout ต่อคำขอของ Ollama (เริ่มต้น 30 วินาที), คุมโหมด thinking (`auto` ปิดให้ DeepSeek-R1 อัตโนมัติ) และเวลาค้างโมเดลในหน่วยความจำ |
 | `ENABLE_OPENROUTER`, `ENABLE_GEMINI`, `ENABLE_OLLAMA` | `false` เพื่อข้าม provider นั้นทุกช่วงเวลา |
 | `VALIDATION_MODELS` | รายชื่อโมเดลสำรองคั่นด้วยจุลภาค: ชื่อธรรมดา = Ollama, `api:` = Gemini, `openrouter:` = OpenRouter |
 | `OPENROUTER_PROVIDERS`, `OPENROUTER_ALLOW_FALLBACKS` | เลือก endpoint ของ OpenRouter ตามลำดับ และกำหนดว่าจะให้ OpenRouter ใช้ endpoint อื่นต่อได้หรือไม่ |
@@ -87,6 +88,109 @@ Log `[AI Usage]` แสดงจำนวนคำขอ OpenRouter, Gemini, Oll
 
 `AI_COST_MODE=low` ให้ยอมรับผล Jev ได้มากขึ้นในบางกรณีเพื่อลดการเรียก DeepSeek; `standard` ใช้เกณฑ์ที่เข้มกว่า ค่าจำกัดความยาวข้อความและจำนวนครั้งที่ลองใหม่ของแต่ละ provider อยู่ใน `.env.example` โดย `JEV_MAX_RETRIES` และ `JEV_FALLBACK_MODELS` ใช้เมื่อปิดตารางเวลา ส่วนช่วงกลางวันใช้เพดาน 2 คำขอข้างต้น การจำกัด concurrency มีผลต่อ **หนึ่ง process** เท่านั้น
 
+### รูปแบบการตั้งค่า Provider ที่แนะนำ (Configuration Presets)
+
+สามารถสลับการตั้งค่าใน `.env` ระหว่างการรันเฉพาะ **Gemini** (ฟรี/ประหยัดค่าใช้จ่าย) หรือรันคู่กับ **OpenRouter** (เสถียรสูงสุดและรองรับงานหนัก) ได้ดังนี้:
+
+#### รูปแบบที่ 1: ใช้ GEMINI อย่างเดียว (Gemini-Only / ฟรี 100%)
+เหมาะสำหรับช่วงที่ไม่มีเครดิต OpenRouter โดยใช้ Google Gemini Free Tier ล้วน:
+- **`VALIDATION_MODELS`**: ให้ใช้โมเดล Flash ตัวเต็ม (`api:gemini-3.5-flash`, `api:gemini-3.6-flash`, `api:gemini-3.7-flash`) เนื่องจากโมเดลตระกูล `-lite` มีเพดาน Free Tier เพียง 500 requests/วัน
+- **`CONCURRENT_WORKERS=4`**: ปรับลด worker เพื่อไม่ให้คำขอเข้ามาแย่งคิวจนเกินโควตา 15 RPM
+- **`GEMINI_MAX_WAIT_SECONDS=60`**: ขยายเวลารอคิวเพื่อป้องกันไม่ให้คำขอตัดตกเป็น `rule:provider_failure`
+
+```env
+# 2. Provider switches
+ENABLE_OPENROUTER=false
+ENABLE_OLLAMA=false
+ENABLE_GEMINI=true
+
+# 3. Models and OpenRouter routing
+VALIDATION_MODELS=api:gemini-3.5-flash,api:gemini-3.6-flash,api:gemini-3.7-flash,api:gemma-4-26b-a4b-it
+
+# 4. Provider order by Thailand time (UTC+07:00)
+PROVIDER_SCHEDULE_ENABLED=false
+
+# 6. Concurrency per worker process
+CONCURRENT_WORKERS=4
+MAX_IN_FLIGHT=6
+BATCH_SIZE=10
+GEMINI_MAX_CONCURRENCY=2
+GEMINI_RATE_LIMIT_ENABLED=true
+GEMINI_RATE_LIMIT_PERCENT=90
+GEMINI_MAX_WAIT_SECONDS=60
+GEMINI_DEFAULT_RPM=15
+GEMINI_DEFAULT_TPM=250000
+GEMINI_RATE_LIMITS='{"gemini-3.5-flash":{"rpm":15,"tpm":250000},"gemini-3.6-flash":{"rpm":15,"tpm":250000},"gemini-3.7-flash":{"rpm":15,"tpm":250000},"gemma-4-26b-a4b-it":{"rpm":30,"tpm":16000}}'
+OLLAMA_MAX_CONCURRENCY=1
+```
+
+#### รูปแบบที่ 2: เปิดทั้ง OPENROUTER และ GEMINI (Hybrid / เสถียรสูงสุด)
+เหมาะสำหรับช่วงที่มีเครดิต OpenRouter โดยให้ระบบสลับการทำงานอัตโนมัติตามตารางเวลา หรือใช้ OpenRouter เป็นตาข่ายสำรองทันทีเมื่อ Gemini มีปัญหา:
+- ช่วงกลางวัน (10:00–21:59): OpenRouter วิ่งเป็นด่านแรกด้วยความเร็วสูง
+- ช่วงกลางคืน (22:00–09:59): Gemini วิ่งเป็นด่านแรกเพื่อประหยัดเครดิต
+- รองรับงานปริมาณมากด้วย `CONCURRENT_WORKERS=8` และ `DEEPSEEK_MAX_CONCURRENCY=6`
+
+```env
+# 2. Provider switches
+ENABLE_OPENROUTER=true
+ENABLE_OLLAMA=false
+ENABLE_GEMINI=true
+
+# 3. Models and OpenRouter routing
+VALIDATION_MODELS=api:gemini-3.5-flash,api:gemini-3.6-flash,openrouter:deepseek/deepseek-chat,api:gemma-4-26b-a4b-it
+
+# 4. Provider order by Thailand time (UTC+07:00)
+PROVIDER_SCHEDULE_ENABLED=true
+OPENROUTER_SCHEDULE_START=10:00
+OPENROUTER_SCHEDULE_END=22:00
+
+# 6. Concurrency per worker process
+CONCURRENT_WORKERS=8
+MAX_IN_FLIGHT=12
+BATCH_SIZE=15
+DEEPSEEK_MAX_CONCURRENCY=6
+GEMINI_MAX_CONCURRENCY=2
+GEMINI_RATE_LIMIT_ENABLED=true
+GEMINI_RATE_LIMIT_PERCENT=90
+GEMINI_MAX_WAIT_SECONDS=60
+GEMINI_DEFAULT_RPM=15
+GEMINI_DEFAULT_TPM=250000
+GEMINI_RATE_LIMITS='{"gemini-3.5-flash":{"rpm":15,"tpm":250000},"gemini-3.6-flash":{"rpm":15,"tpm":250000},"gemini-3.7-flash":{"rpm":15,"tpm":250000}}'
+OLLAMA_MAX_CONCURRENCY=1
+```
+
+#### รูปแบบที่ 3: วิเคราะห์ย้อนหลัง / ใช้ Ollama ภายในเครื่อง (`deepseek-r1:8b`)
+เหมาะสำหรับการวิเคราะห์ย้อนหลังปริมาณมากโดยไม่เสียค่า API หรือไม่ติดโควตา Free Tier:
+- **`VALIDATION_MODELS=deepseek-r1:8b`** และ **`OLLAMA_MODEL=deepseek-r1:8b`**: ชี้ไปที่โมเดล DeepSeek-R1 บนเครื่องโลคอล
+- **`OLLAMA_THINK=false`**: ปิดโหมด thinking ระหว่างสร้าง JSON เพื่อให้ตอบใน ~10–15 วินาทีต่อโพสต์แทนการรอ timeout (โปรแกรมปิดให้อัตโนมัติสำหรับ `deepseek-r1` หากไม่กำหนดค่า)
+- **`OLLAMA_DEEP_TIMEOUT=90`** และ **`OLLAMA_MAX_CONCURRENCY=1`**: เผื่อเวลาสำหรับข้อความยาว 1,200 ตัวอักษร และล็อกให้ประมวลผลทีละ 1 คำขอเพื่อไม่ให้ RAM/VRAM เต็ม
+- **`BATCH_SIZE=5`**: บันทึกผลเป็นระยะทุก ~1 นาที รันย้อนหลังได้ทันทีด้วย `.\run.bat --from-date YYYY-MM-DD --to-date YYYY-MM-DD`
+
+```env
+# 2. Provider switches
+ENABLE_OPENROUTER=false
+ENABLE_OLLAMA=true
+ENABLE_GEMINI=false
+
+# 3. Models and OpenRouter routing
+VALIDATION_MODELS=deepseek-r1:8b
+OLLAMA_MODEL=deepseek-r1:8b
+
+# 4. Provider order by Thailand time (UTC+07:00)
+PROVIDER_SCHEDULE_ENABLED=false
+
+# 5. Analysis and provider requests
+OLLAMA_DEEP_TIMEOUT=90
+OLLAMA_THINK=false
+OLLAMA_KEEP_ALIVE=15m
+
+# 6. Concurrency per worker process
+CONCURRENT_WORKERS=2
+MAX_IN_FLIGHT=4
+BATCH_SIZE=5
+OLLAMA_MAX_CONCURRENCY=1
+```
+
 ## วิธีรัน
 
 Gemini จำกัด RPM และ TPM แยกตามโมเดลด้วยหน้าต่างย้อนหลัง 60 วินาที และแชร์ตัวนับระหว่างทุก thread/analyzer ใน process เดียวกัน เมื่อโควตาไม่พอจะรอก่อนส่ง โดยไม่ยึดช่อง HTTP ของโมเดลอื่น นับทุกคำขอรวม retry และ fallback หลัง HTTP 400; เมื่อเจอ 429 จะพักโมเดลนั้นตาม `Retry-After` แบบตัวเลขหรือ `RetryInfo.retryDelay` หากไม่มีใช้ 60 วินาที แม้ไม่มีรอบ retry เหลือ
@@ -103,13 +207,35 @@ TPM นับเฉพาะ input ตาม [เอกสาร Gemini](https:/
 | Windows PowerShell | `.\.venv\Scripts\python.exe ai_sentiment.py` | ใช้ virtual environment ของโปรเจกต์ |
 | Windows PowerShell | `.\.venv\Scripts\python.exe ai_sentiment.py --mode rest` | ระบุ REST mode ชัดเจน; ให้ผลเหมือนคำสั่งก่อนหน้า |
 | Windows PowerShell | `.\run.bat` | ใช้ `.venv` และ `.env` ในโฟลเดอร์โปรเจกต์ |
+| Windows PowerShell | `.\run.bat --from-date 2026-09-28 --to-date 2026-09-29` | วิเคราะห์ช่วงวันที่นี้หนึ่งรอบผ่าน `run.bat` |
 | Windows PowerShell | `.\.venv\Scripts\python.exe ai_sentiment.py --from-date 2026-09-28 --to-date 2026-09-29` | วิเคราะห์ช่วงวันที่นี้หนึ่งรอบแล้วจบ |
+| Windows PowerShell | `.\run_sentiment_backfill.bat --from-date 2026-11-01 --to-date 2026-11-16 --save-db` | สคริปต์รันย้อนหลังเฉพาะ Ollama (`deepseek-r1:8b`) ตามกติกา `sentiment_worker.py` โดยไม่บันทึก `rule:provider_failure` |
 | Linux/macOS | `.venv/bin/python ai_sentiment.py` | ใช้ virtual environment ของโปรเจกต์ |
 | Linux/macOS | `.venv/bin/python ai_sentiment.py --from-date 2026-09-28 --to-date 2026-09-29` | วิเคราะห์ช่วงวันที่นี้หนึ่งรอบแล้วจบ |
 
 `--mode rest` เป็นโหมดเดียวที่รองรับและเป็นค่าเริ่มต้น หากไม่ระบุวันที่ worker จะรันต่อเนื่อง โดยส่ง `date_from` กับ `date_to` เป็น **วันปัจจุบันวันเดียวตามเวลาไทย UTC+07:00** ในแต่ละรอบ หากระบุวันที่ต้องใส่ทั้ง `--from-date` และ `--to-date` ในรูปแบบ `YYYY-MM-DD` และวันเริ่มต้องไม่หลังวันสิ้นสุด คำสั่งแบบระบุวันที่ใช้ค่า `SAVE_DB` จาก `.env` เช่นเดียวกับ worker ปกติ
 
 เริ่มตรวจการทำงานด้วย `SAVE_DB=false` ก่อน ค่า `false` **ยังดึงข้อมูลและเรียกโมเดลจริง** จึงอาจใช้เครดิตหรือมีค่าใช้จ่าย เพียงแต่ไม่ส่งผลไป `/internal/sentiment/results` เมื่อพร้อมบันทึกผล ให้ตั้ง `SAVE_DB=true` ใน `.env` และรีสตาร์ต worker
+
+## สคริปต์รันย้อนหลังเฉพาะ Ollama ตามกติกาหลัก (`sentiment_backfill.py`)
+
+สำหรับรันวิเคราะห์ย้อนหลังบนเครื่องที่มีการ์ดจอแยก (เช่น RTX 5060 Ti 8GB) ด้วย `deepseek-r1:8b` โดยเฉพาะ โดยอิงกติกา **Author's Own Voice** และโครงสร้างผลลัพธ์เดียวกับ `sentiment_worker.py` (`sentiment`, `sentiment_reason`, `sentiment_scores` พร้อม `multi_target`, `intent`, `intent_reason`, `incident`):
+
+- ใช้เฉพาะ Ollama เท่านั้น (ไม่อ่าน `ENABLE_OPENROUTER`, `ENABLE_GEMINI`, `VALIDATION_MODELS`)
+- **โหมดบันทึกจริง (`--save-db`)** ดึงคิวผ่าน `/internal/sentiment/pending?claim=true` เพื่อจอง lease แยกจาก `sentiment_worker.py` และ dedupe ตาม `post_id` ภายในชุด ส่วน `--dry-run` อ่านจาก `/internal/sentiment/posts` แบบ read-only
+- **ไม่มีการสร้างหรือบันทึก `rule:provider_failure`**: หาก Ollama ค้าง, timeout หรือตอบไม่ผ่าน validation หลังลองซ้ำ 3 รูปแบบ (`generate+json` → `generate+freeform` → `chat+json`) จะข้ามโพสต์นั้นไว้ในสถานะรอวิเคราะห์เดิม และบันทึก ID/สาเหตุลง `reports/sentiment_backfill_failures.jsonl`
+- มี Circuit Breaker หยุดทำงานอัตโนมัติ (ค่าเริ่มต้น 5 โพสต์ติดกัน) และบันทึก batch ที่สำเร็จก่อนหน้าเสมอ
+
+```powershell
+# ทดสอบ Dry-run ย้อนหลัง 7 วัน (จำกัดดู 5 โพสต์แรก)
+.\.venv\Scripts\python.exe sentiment_backfill.py --days 7 --dry-run --limit 5
+
+# รันจริงและบันทึกผลตามช่วงวันที่
+.\.venv\Scripts\python.exe sentiment_backfill.py --from-date 2026-11-01 --to-date 2026-11-16 --save-db
+
+# หรือใช้ตัวช่วยบน Windows (ส่งพารามิเตอร์หรือดับเบิลคลิกเพื่อกรอกวันที่)
+.\run_sentiment_backfill.bat --from-date 2026-11-01 --to-date 2026-11-16 --save-db
+```
 
 ## ผลลัพธ์เมื่อวิเคราะห์ไม่สำเร็จ
 

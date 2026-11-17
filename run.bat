@@ -10,5 +10,5 @@ if not exist ".env" (
     exit /b 1
 )
 echo Starting REST-only sentiment worker. Press Ctrl+C to stop.
-".venv\Scripts\python.exe" ai_sentiment.py
+".venv\Scripts\python.exe" ai_sentiment.py %*
 exit /b %errorlevel%
