@@ -55,11 +55,20 @@ class SentimentBackfillTests(unittest.TestCase):
             valid_item(sentiment_reason="English reason only long enough"),  # no Thai
             valid_item(sentiment_reason="รายงานเรื่องราวทั้งหมด 中文内容很多"),  # mostly/heavy Chinese leak
             valid_item(intent_reason="ผู้เขียนพูดถึงแบรนด์ลูกค้าในโพสต์นี้"),   # forbidden phrase
+            valid_item(sentiment_reason=GOOD_SR, intent_reason=GOOD_SR),        # identical reasons forbidden like sentiment_worker.py
+            valid_item(positive=False, neutral=True, negative=False, sentiment="neutral"),  # bool scores forbidden
             valid_item(incident="yes"),                           # non-bool incident
         ]
         for bad in bad_cases:
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 backfill.validate_verdict(bad, "deepseek-r1:8b")
+
+        with self.assertRaises(ValueError):
+            backfill.validate_verdict(
+                valid_item(sentiment_reason="โพสต์ตัวอย่างข้อความข่าวตลาดหุ้นวันนี้"),
+                "deepseek-r1:8b",
+                content="โพสต์ตัวอย่างข้อความข่าวตลาดหุ้นวันนี้",
+            )
 
         # Isolated stray CJK chars or one borrowed term inside a substantial Thai reason is tolerated
         for ok_reason in (
@@ -386,6 +395,35 @@ class SentimentBackfillTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         analyse_mock.assert_called_once()
         self.assertEqual(runner.total_escalated, 0)
+
+    def test_batch_rejects_reused_reason_for_distinct_content_but_allows_repost(self):
+        rest = backfill.BlueEyeRestClient(base_url="https://api.example/api/v1", token="tok")
+        ollama = backfill.OllamaWorkerClient(model="deepseek-r1:8b", retries=1)
+        runner = backfill.SentimentBackfillRunner(rest=rest, ollama=ollama, save_db=True)
+
+        p1 = {"match_post_id": "M1", "post_id": "P1", "content": "ข่าวตลาดหุ้นปิดบวก 10 จุด"}
+        p2_dup_content = {"match_post_id": "M2", "post_id": "P2", "content": "ข่าวตลาดหุ้นปิดบวก 10 จุด"}
+        p3_distinct = {"match_post_id": "M3", "post_id": "P3", "content": "บ่นระบบส่งพัสดุล่าช้ามาก"}
+
+        # Model returns the same GOOD_SR/GOOD_IR for all 3 HTTP requests:
+        # P1 passes, P2 (identical content repost) passes, P3 (distinct content reusing P1's reason) is rejected.
+        same_json = json.dumps(valid_item(), ensure_ascii=False)
+        fake_resp = lambda: SimpleNamespace(status_code=200, text="", json=lambda: {"response": same_json})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner.fail_log_path = os.path.join(tmpdir, "failures.jsonl")
+            with patch.object(rest, "fetch_pending_claimed", side_effect=[[p1, p2_dup_content, p3_distinct], []]), \
+                 patch.object(rest, "write_results", return_value=2) as write_mock, \
+                 patch.object(ollama.session, "post", side_effect=[fake_resp(), fake_resp(), fake_resp()]), \
+                 patch.object(ollama, "log_vram_status_once"), \
+                 redirect_stdout(io.StringIO()):
+                rc = runner.run("2026-11-01", "2026-11-16")
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(runner.total_posts_done, 2)
+        self.assertEqual(runner.total_failed_posts, 1)
+        sent_ids = [item["match_post_id"] for item in write_mock.call_args.args[0]]
+        self.assertEqual(sent_ids, ["M1", "M2"])
 
 
 if __name__ == "__main__":

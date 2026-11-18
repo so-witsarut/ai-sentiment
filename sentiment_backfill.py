@@ -94,16 +94,19 @@ given and none may be assumed.
   award, result or news is information. complaint = reports a problem or
   dissatisfaction. enquiry = asks a question or asks for help.
 - sentiment_reason and intent_reason: ONE short Thai sentence EACH, even for an English post,
-  that cites concrete details of THIS input post (at least 15 Thai characters each).
+  that cites a concrete detail of THIS post and names its subject as the post names it
+  (at least 15 Thai characters each). Reasons will be shown to end users.
   Write natural Thai only; keep English brand/person/award names in English (NEVER Chinese).
-  Never copy example sentences and never write "แบรนด์ลูกค้า" or "แบรนด์ของเรา".
+  Write each reason before its label, and make the label follow from it.
+  sentiment_reason and intent_reason MUST be two distinct sentences (never reuse the same
+  sentence for both, never copy example sentences, and never write "แบรนด์ลูกค้า"/"แบรนด์ของเรา").
 - multi_target: true if the post names two or more brands/products in different tones
   (praises one, criticises another), else false.
 - incident: true if the post reports or alleges something harmful to a person or organisation:
   an accident, injury or death, a crime, arrest, lawsuit or investigation, corruption or fraud,
   a scandal, a food/product safety or health problem, a serious product or service failure,
   a call to boycott. True even when worded neutrally as news, and independent of sentiment.
-  A plain complaint about everyday slow service, an ad, or fiction is false.
+  A plain complaint about everyday service, an ad, or fiction is false.
 
 Return ONLY one valid JSON object with exact keys in this order:
 {"sentiment_reason":"<1 short Thai sentence >=15 chars>","sentiment":"<positive|neutral|negative>","positive":<0-100>,"neutral":<0-100>,"negative":<0-100>,"intent_reason":"<1 short Thai sentence >=15 chars>","intent":"<information|complaint|enquiry|recommendation>","multi_target":false,"incident":false}"""
@@ -192,10 +195,18 @@ def parse_json_object(raw_text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def validate_verdict(x: Dict[str, Any], model: str) -> Verdict:
+def validate_verdict(
+    x: Dict[str, Any],
+    model: str,
+    *,
+    content: str = "",
+    forbidden_reasons: Optional[Set[str]] = None,
+) -> Verdict:
     """Validate and normalize one model item using sentiment_worker.py rules."""
     if not isinstance(x, dict):
         raise ValueError("response is not a JSON object")
+    if any(isinstance(x[k], bool) for k in SENTIMENT_VALUES):
+        raise ValueError("scores must be integers, not booleans")
     vals = {k: int(x[k]) for k in SENTIMENT_VALUES}
     total = sum(vals.values())
     if any(v < 0 for v in vals.values()) or not (90 <= total <= 110):
@@ -214,12 +225,21 @@ def validate_verdict(x: Dict[str, Any], model: str) -> Verdict:
         raise ValueError(f"invalid intent: {intent!r}")
     if not isinstance(x["incident"], bool) or not isinstance(x["multi_target"], bool):
         raise ValueError("incident and multi_target must be booleans")
+    reason = _clean_reason(x["sentiment_reason"])
+    intent_reason = _clean_reason(x["intent_reason"])
+    if reason == intent_reason:
+        raise ValueError("sentiment_reason and intent_reason must be different")
+    content_norm = content.strip()
+    if content_norm and (reason == content_norm or intent_reason == content_norm):
+        raise ValueError("reason copies post content verbatim")
+    if forbidden_reasons and (reason in forbidden_reasons or intent_reason in forbidden_reasons):
+        raise ValueError("reason reused from another post in batch")
     return Verdict(
         sentiment=sentiment,
-        reason=_clean_reason(x["sentiment_reason"]),
+        reason=reason,
         scores={"model": model, "multi_target": x["multi_target"], **vals},
         intent=intent,
-        intent_reason=_clean_reason(x["intent_reason"]),
+        intent_reason=intent_reason,
         incident=x["incident"],
     )
 
@@ -398,7 +418,12 @@ class OllamaWorkerClient:
         ]
         return [specs[idx % len(specs)] for idx in range(self.retries)]
 
-    def analyse_post(self, content: str, model_override: Optional[str] = None) -> Tuple[Optional[Verdict], str]:
+    def analyse_post(
+        self,
+        content: str,
+        model_override: Optional[str] = None,
+        forbidden_reasons: Optional[Set[str]] = None,
+    ) -> Tuple[Optional[Verdict], str]:
         target_model = model_override or self.model
         last_error = "unknown_error"
         specs = self._attempt_specs(target_model, content)
@@ -421,7 +446,12 @@ class OllamaWorkerClient:
                     print(f"  ⚠️ [Ollama {target_model} {mode} {attempt_idx}/{len(specs)}] {last_error}", flush=True)
                     continue
 
-                verdict = validate_verdict(parsed, target_model)
+                verdict = validate_verdict(
+                    parsed,
+                    target_model,
+                    content=content,
+                    forbidden_reasons=forbidden_reasons,
+                )
                 return verdict, ""
             except ValueError as exc:
                 last_error = f"{mode}: validation_error ({exc})"
@@ -705,6 +735,7 @@ class SentimentBackfillRunner:
             chunk = posts[start:start + self.batch_size]
             batch_started = time.perf_counter()
             pending_writes: List[Dict[str, Any]] = []
+            reasons_by_content: Dict[str, Set[str]] = {}
             print(f"\n🔄 [Backfill] Batch {start + 1}-{start + len(chunk)}/{len(posts)} posts "
                   f"(model={self.ollama.model})", flush=True)
 
@@ -713,8 +744,18 @@ class SentimentBackfillRunner:
                     if self._stop_requested:
                         break
                     pid = post["post_id"]
+                    content_key = " ".join(post["content"].split())
+                    forbidden = {
+                        r
+                        for c_key, r_set in reasons_by_content.items()
+                        if c_key != content_key
+                        for r in r_set
+                    }
                     t0 = time.perf_counter()
-                    verdict, err = self.ollama.analyse_post(post["content"])
+                    verdict, err = self.ollama.analyse_post(
+                        post["content"],
+                        forbidden_reasons=forbidden or None,
+                    )
 
                     if (
                         self.escalate_model
@@ -722,7 +763,10 @@ class SentimentBackfillRunner:
                         and (verdict is None or is_unsure(verdict))
                     ):
                         esc_verdict, esc_err = self.ollama.analyse_post(
-                            post["content"], model_override=self.escalate_model)
+                            post["content"],
+                            model_override=self.escalate_model,
+                            forbidden_reasons=forbidden or None,
+                        )
                         if esc_verdict is not None:
                             verdict = esc_verdict
                             self.total_escalated += 1
@@ -752,6 +796,9 @@ class SentimentBackfillRunner:
 
                     self.consecutive_failures = 0
                     self.total_posts_done += 1
+                    reasons_by_content.setdefault(content_key, set()).update(
+                        (verdict.reason, verdict.intent_reason)
+                    )
                     pending_writes.extend(build_items_fn(pid, verdict))
 
                     icon = "🟢" if verdict.sentiment == "positive" else ("🔴" if verdict.sentiment == "negative" else "⚪")
