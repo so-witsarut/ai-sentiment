@@ -425,6 +425,116 @@ class SentimentBackfillTests(unittest.TestCase):
         sent_ids = [item["match_post_id"] for item in write_mock.call_args.args[0]]
         self.assertEqual(sent_ids, ["M1", "M2"])
 
+    def test_parse_think_flag_auto_disables_for_gemma4(self):
+        self.assertIs(backfill.parse_think_flag("auto", "gemma4:e4b"), False)
+        self.assertIs(backfill.parse_think_flag("", "gemma4:e4b"), False)
+        self.assertIs(backfill.parse_think_flag("true", "gemma4:e4b"), True)
+
+    def test_parse_args_defaults_to_gemma4_escalate_qwen3_batch50(self):
+        with patch.dict(os.environ, {}, clear=False):
+            for k in ("OLLAMA_BACKFILL_MODEL", "OLLAMA_ESCALATE_MODEL", "OLLAMA_BACKFILL_BATCH_SIZE"):
+                os.environ.pop(k, None)
+            args = backfill.parse_args(["--from-date", "2026-10-25", "--to-date", "2026-10-25"])
+            self.assertEqual(args.model, "gemma4:e4b")
+            self.assertEqual(args.escalate_model, "qwen3:8b")
+            self.assertEqual(args.batch_size, 50)
+            self.assertTrue(args.escalate_information)
+
+            disabled = backfill.parse_args([
+                "--from-date", "2026-10-25",
+                "--to-date", "2026-10-25",
+                "--escalate-model", "none",
+                "--no-escalate-information",
+            ])
+            self.assertEqual(disabled.escalate_model, "")
+            self.assertFalse(disabled.escalate_information)
+
+    def test_two_pass_batch_escalation_runs_all_primary_before_escalate_model(self):
+        rest = backfill.BlueEyeRestClient(base_url="https://api.example/api/v1", token="tok")
+        ollama = backfill.OllamaWorkerClient(model="gemma4:e4b", retries=1)
+        runner = backfill.SentimentBackfillRunner(
+            rest=rest,
+            ollama=ollama,
+            batch_size=50,
+            save_db=True,
+            escalate_model="qwen3:8b",
+            escalate_information=True,
+        )
+
+        rows = [
+            {"match_post_id": "M1", "post_id": "P1_AD", "content": "โปรโมทขายสินค้าลดราคาพิเศษวันนี้"},
+            {"match_post_id": "M2", "post_id": "P2_INFO", "content": "รายงานข่าวตลาดหุ้นไทยปิดตลาดวันนี้"},
+            {"match_post_id": "M3", "post_id": "P3_LOW", "content": "รีวิวร้านอาหารกลางซอยบรรยากาศดีมาก"},
+            {"match_post_id": "M4", "post_id": "P4_ERR", "content": "ข้อความที่รอบแรกตอบผิดรูปแบบ"},
+        ]
+
+        v_ad = backfill.validate_verdict(
+            valid_item(positive=10, neutral=80, negative=10, sentiment="neutral", intent="recommendation"),
+            "gemma4:e4b",
+        )
+        v_info_p1 = backfill.validate_verdict(
+            valid_item(positive=70, neutral=20, negative=10, sentiment="positive", intent="information"),
+            "gemma4:e4b",
+        )
+        v_low_p1 = backfill.validate_verdict(
+            valid_item(positive=55, neutral=35, negative=10, sentiment="positive", intent="recommendation"),
+            "gemma4:e4b",
+        )
+        v_info_p2 = backfill.validate_verdict(
+            valid_item(positive=10, neutral=85, negative=5, sentiment="neutral", intent="information"),
+            "qwen3:8b",
+        )
+        v_low_p2 = backfill.validate_verdict(
+            valid_item(positive=80, neutral=15, negative=5, sentiment="positive", intent="recommendation"),
+            "qwen3:8b",
+        )
+        v_err_p2 = backfill.validate_verdict(
+            valid_item(positive=5, neutral=15, negative=80, sentiment="negative", intent="complaint"),
+            "qwen3:8b",
+        )
+
+        call_log = []
+        pass1_map = {
+            rows[0]["content"]: (v_ad, ""),
+            rows[1]["content"]: (v_info_p1, ""),
+            rows[2]["content"]: (v_low_p1, ""),
+            rows[3]["content"]: (None, "generate+json#1: unparseable_json ('')"),
+        }
+        pass2_map = {
+            rows[1]["content"]: (v_info_p2, ""),
+            rows[2]["content"]: (v_low_p2, ""),
+            rows[3]["content"]: (v_err_p2, ""),
+        }
+
+        def fake_analyse(content, model_override=None, forbidden_reasons=None):
+            used_model = model_override or ollama.model
+            call_log.append((used_model, content))
+            if model_override is None:
+                return pass1_map[content]
+            return pass2_map[content]
+
+        with patch.object(rest, "fetch_pending_claimed", side_effect=[rows, []]), \
+             patch.object(rest, "write_results", return_value=4) as write_mock, \
+             patch.object(ollama, "analyse_post", side_effect=fake_analyse), \
+             redirect_stdout(io.StringIO()):
+            rc = runner.run("2026-10-25", "2026-10-25")
+
+        self.assertEqual(rc, 0)
+        # Pass 1 runs all 4 posts on gemma4:e4b first; Pass 2 runs the 3 escalated posts on qwen3:8b at end of batch.
+        self.assertEqual(
+            [m for m, _ in call_log],
+            ["gemma4:e4b", "gemma4:e4b", "gemma4:e4b", "gemma4:e4b", "qwen3:8b", "qwen3:8b", "qwen3:8b"],
+        )
+        self.assertEqual(runner.total_posts_done, 4)
+        self.assertEqual(runner.total_escalated, 3)
+        self.assertEqual(runner.total_failed_posts, 0)
+        by_id = {item["match_post_id"]: item for item in write_mock.call_args.args[0]}
+        self.assertEqual(by_id["M1"]["sentiment_scores"]["model"], "gemma4:e4b")
+        self.assertEqual(by_id["M2"]["sentiment_scores"]["model"], "qwen3:8b")
+        self.assertEqual(by_id["M2"]["sentiment"], "neutral")
+        self.assertEqual(by_id["M3"]["sentiment_scores"]["model"], "qwen3:8b")
+        self.assertEqual(by_id["M4"]["sentiment_scores"]["model"], "qwen3:8b")
+
 
 if __name__ == "__main__":
     unittest.main()

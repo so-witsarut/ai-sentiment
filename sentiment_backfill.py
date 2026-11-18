@@ -51,7 +51,9 @@ MIN_REASON = 15
 UNSURE_BELOW = 60
 
 DEFAULT_BASE_URL = "https://api.blueeye.io/api/v1"
-DEFAULT_MODEL = "qwen3:8b"
+DEFAULT_MODEL = "gemma4:e4b"
+DEFAULT_ESCALATE_MODEL = "qwen3:8b"
+DEFAULT_BATCH_SIZE = 50
 DEFAULT_TIMEOUT = 120
 DEFAULT_NUM_CTX = 4096
 DEFAULT_KEEP_ALIVE = "30m"
@@ -150,7 +152,7 @@ def parse_think_flag(value: str, model_name: str) -> Optional[bool]:
     if raw in ("false", "0", "no"):
         return False
     model_low = str(model_name or "").lower()
-    if raw in ("", "auto") and any(k in model_low for k in ("deepseek-r1", "qwen3")):
+    if raw in ("", "auto") and any(k in model_low for k in ("deepseek-r1", "qwen3", "gemma4")):
         return False
     return None
 
@@ -248,6 +250,24 @@ def validate_verdict(
 def is_unsure(verdict: Verdict) -> bool:
     scores = verdict.scores or {}
     return bool(scores.get("multi_target")) or max(int(scores[k]) for k in SENTIMENT_VALUES) < UNSURE_BELOW
+
+
+def should_escalate(
+    verdict: Optional[Verdict],
+    *,
+    escalate_information: bool = True,
+) -> Tuple[bool, str]:
+    """Return (True, reason) when a Pass-1 result should be queued for the Pass-2 model."""
+    if verdict is None:
+        return True, "error"
+    scores = verdict.scores or {}
+    if bool(scores.get("multi_target")):
+        return True, "multi_target"
+    if max(int(scores[k]) for k in SENTIMENT_VALUES) < UNSURE_BELOW:
+        return True, f"score<{UNSURE_BELOW}"
+    if escalate_information and verdict.intent == "information":
+        return True, "intent=information"
+    return False, ""
 
 
 def _is_provider_failure(err: str) -> bool:
@@ -649,7 +669,7 @@ class SentimentBackfillRunner:
         rest: BlueEyeRestClient,
         ollama: OllamaWorkerClient,
         *,
-        batch_size: int = 10,
+        batch_size: int = DEFAULT_BATCH_SIZE,
         fetch_limit: int = 80,
         lease_seconds: int = 600,
         save_db: bool = False,
@@ -657,6 +677,7 @@ class SentimentBackfillRunner:
         project_id: Optional[str] = None,
         organization_id: Optional[str] = None,
         escalate_model: str = "",
+        escalate_information: bool = True,
         max_chars: int = MAX_CHARS,
         max_consecutive_failures: int = 5,
         fail_log_path: str = DEFAULT_FAIL_LOG,
@@ -673,7 +694,9 @@ class SentimentBackfillRunner:
         self.missing = missing
         self.project_id = project_id
         self.organization_id = organization_id
-        self.escalate_model = escalate_model.strip()
+        esc_clean = str(escalate_model or "").strip()
+        self.escalate_model = "" if esc_clean.lower() in ("none", "off", "false") else esc_clean
+        self.escalate_information = bool(escalate_information)
         self.max_chars = max(200, int(max_chars))
         self.max_consecutive_failures = max(1, int(max_consecutive_failures))
         self.fail_log_path = fail_log_path
@@ -731,6 +754,8 @@ class SentimentBackfillRunner:
         if not posts:
             return
 
+        can_escalate = bool(self.escalate_model and self.escalate_model != self.ollama.model)
+
         for start in range(0, len(posts), self.batch_size):
             if self._stop_requested:
                 break
@@ -738,8 +763,72 @@ class SentimentBackfillRunner:
             batch_started = time.perf_counter()
             pending_writes: List[Dict[str, Any]] = []
             reasons_by_content: Dict[str, Set[str]] = {}
-            print(f"\n🔄 [Backfill] Batch {start + 1}-{start + len(chunk)}/{len(posts)} posts "
-                  f"(model={self.ollama.model})", flush=True)
+            escalate_queue: List[Tuple[int, Dict[str, str], str, Optional[Verdict], str, float, str]] = []
+            esc_cursor = 0
+
+            def _forbidden_for(content_key: str) -> Optional[Set[str]]:
+                forbidden = {
+                    r
+                    for c_key, r_set in reasons_by_content.items()
+                    if c_key != content_key
+                    for r in r_set
+                }
+                return forbidden or None
+
+            def _finalize_post(
+                idx: int,
+                pid: str,
+                content_key: str,
+                verdict: Optional[Verdict],
+                err: str,
+                dt: float,
+            ) -> None:
+                if verdict is None:
+                    self.total_failed_posts += 1
+                    self.failed_post_ids.add(pid)
+                    self._record_failure(pid, match_ids_fn(pid), err)
+                    print(
+                        f"  ⏭️ [{idx:02d}] post={pid[:18]:<18} | SKIPPED (ไม่บันทึก rule:provider_failure) | {err}",
+                        flush=True,
+                    )
+                    return
+
+                self.total_posts_done += 1
+                reasons_by_content.setdefault(content_key, set()).update(
+                    (verdict.reason, verdict.intent_reason)
+                )
+                pending_writes.extend(build_items_fn(pid, verdict))
+
+                icon = "🟢" if verdict.sentiment == "positive" else ("🔴" if verdict.sentiment == "negative" else "⚪")
+                row_label = f"{row_count_fn(pid)} row" if self.missing != "incomplete" else "post"
+                print(
+                    f"  [{idx:02d}] {icon} post={pid[:18]:<18} ({row_label}) | "
+                    f"{verdict.sentiment.upper():<8} | intent={verdict.intent} | incident={verdict.incident} | "
+                    f"{dt:.2f}s | Model={verdict.scores['model']}",
+                    flush=True,
+                )
+                print(
+                    f"       📊 POS {verdict.scores['positive']}% | NEU {verdict.scores['neutral']}% | "
+                    f"NEG {verdict.scores['negative']}% | multi={verdict.scores['multi_target']}",
+                    flush=True,
+                )
+                print(f"       💬 Sentiment: {verdict.reason}", flush=True)
+                print(f"       🎯 Intent   : {verdict.intent_reason}", flush=True)
+
+            def _finalize_remaining_pass1(start_pos: int) -> None:
+                for q_idx, q_post, q_key, p1_verdict, p1_err, p1_dt, _ in escalate_queue[start_pos:]:
+                    if p1_verdict is not None:
+                        _finalize_post(q_idx, q_post["post_id"], q_key, p1_verdict, "", p1_dt)
+                    else:
+                        _finalize_post(q_idx, q_post["post_id"], q_key, None, p1_err, p1_dt)
+
+            print(
+                f"\n🔄 [Backfill] Batch {start + 1}-{start + len(chunk)}/{len(posts)} posts "
+                f"(model={self.ollama.model}"
+                + (f", escalate={self.escalate_model}" if can_escalate else "")
+                + ")",
+                flush=True,
+            )
 
             try:
                 for idx, post in enumerate(chunk, start=1):
@@ -747,41 +836,41 @@ class SentimentBackfillRunner:
                         break
                     pid = post["post_id"]
                     content_key = " ".join(post["content"].split())
-                    forbidden = {
-                        r
-                        for c_key, r_set in reasons_by_content.items()
-                        if c_key != content_key
-                        for r in r_set
-                    }
                     t0 = time.perf_counter()
                     verdict, err = self.ollama.analyse_post(
                         post["content"],
-                        forbidden_reasons=forbidden or None,
+                        forbidden_reasons=_forbidden_for(content_key),
                     )
-
-                    if (
-                        self.escalate_model
-                        and self.escalate_model != self.ollama.model
-                        and (verdict is None or is_unsure(verdict))
-                    ):
-                        esc_verdict, esc_err = self.ollama.analyse_post(
-                            post["content"],
-                            model_override=self.escalate_model,
-                            forbidden_reasons=forbidden or None,
-                        )
-                        if esc_verdict is not None:
-                            verdict = esc_verdict
-                            self.total_escalated += 1
-                        elif verdict is None:
-                            err = f"{err}; escalate {self.escalate_model}: {esc_err}"
-
                     dt = time.perf_counter() - t0
+
+                    if can_escalate:
+                        need_esc, esc_reason = should_escalate(
+                            verdict,
+                            escalate_information=self.escalate_information,
+                        )
+                        if need_esc:
+                            if verdict is None and _is_provider_failure(err):
+                                self.consecutive_failures += 1
+                                if self.consecutive_failures >= self.max_consecutive_failures:
+                                    _finalize_post(idx, pid, content_key, None, err, dt)
+                                    _finalize_remaining_pass1(0)
+                                    self.total_rows_written += self._flush_items(pending_writes)
+                                    pending_writes = []
+                                    raise OllamaUnavailableError(
+                                        f"หยุดทำงานชั่วคราว: Ollama ล้มเหลวติดต่อกัน {self.consecutive_failures} โพสต์ "
+                                        "(บันทึกโพสต์ที่สำเร็จก่อนหน้าแล้ว ส่วนที่พลาดยังคงรอวิเคราะห์อยู่)"
+                                    )
+                            else:
+                                self.consecutive_failures = 0
+                            escalate_queue.append((idx, post, content_key, verdict, err, dt, esc_reason))
+                            print(
+                                f"  ⏳ [{idx:02d}] post={pid[:18]:<18} -> คิวส่งต่อ {self.escalate_model} ท้าย Batch ({esc_reason})",
+                                flush=True,
+                            )
+                            continue
+
                     if verdict is None:
-                        self.total_failed_posts += 1
-                        self.failed_post_ids.add(pid)
-                        self._record_failure(pid, match_ids_fn(pid), err)
-                        print(f"  ⏭️ [{idx:02d}] post={pid[:18]:<18} | SKIPPED (ไม่บันทึก rule:provider_failure) | {err}",
-                              flush=True)
+                        _finalize_post(idx, pid, content_key, None, err, dt)
                         if _is_provider_failure(err):
                             self.consecutive_failures += 1
                             if self.consecutive_failures >= self.max_consecutive_failures:
@@ -797,30 +886,63 @@ class SentimentBackfillRunner:
                         continue
 
                     self.consecutive_failures = 0
-                    self.total_posts_done += 1
-                    reasons_by_content.setdefault(content_key, set()).update(
-                        (verdict.reason, verdict.intent_reason)
-                    )
-                    pending_writes.extend(build_items_fn(pid, verdict))
+                    _finalize_post(idx, pid, content_key, verdict, "", dt)
 
-                    icon = "🟢" if verdict.sentiment == "positive" else ("🔴" if verdict.sentiment == "negative" else "⚪")
-                    row_label = f"{row_count_fn(pid)} row" if self.missing != "incomplete" else "post"
-                    print(
-                        f"  [{idx:02d}] {icon} post={pid[:18]:<18} ({row_label}) | "
-                        f"{verdict.sentiment.upper():<8} | intent={verdict.intent} | incident={verdict.incident} | "
-                        f"{dt:.2f}s | Model={verdict.scores['model']}",
-                        flush=True,
-                    )
-                    print(
-                        f"       📊 POS {verdict.scores['positive']}% | NEU {verdict.scores['neutral']}% | "
-                        f"NEG {verdict.scores['negative']}% | multi={verdict.scores['multi_target']}",
-                        flush=True,
-                    )
-                    print(f"       💬 Sentiment: {verdict.reason}", flush=True)
-                    print(f"       🎯 Intent   : {verdict.intent_reason}", flush=True)
+                if escalate_queue:
+                    if not self._stop_requested:
+                        print(
+                            f"  🔁 [Escalate Pass 2] ส่งต่อ {len(escalate_queue)}/{len(chunk)} โพสต์ให้ "
+                            f"{self.escalate_model} วิเคราะห์ซ้ำรวดเดียว...",
+                            flush=True,
+                        )
+                    while esc_cursor < len(escalate_queue):
+                        if self._stop_requested:
+                            _finalize_remaining_pass1(esc_cursor)
+                            break
+                        idx, post, content_key, pass1_verdict, pass1_err, pass1_dt, _esc_reason = escalate_queue[esc_cursor]
+                        pid = post["post_id"]
+                        t1 = time.perf_counter()
+                        esc_verdict, esc_err = self.ollama.analyse_post(
+                            post["content"],
+                            model_override=self.escalate_model,
+                            forbidden_reasons=_forbidden_for(content_key),
+                        )
+                        total_dt = pass1_dt + (time.perf_counter() - t1)
+
+                        if esc_verdict is not None:
+                            self.total_escalated += 1
+                            self.consecutive_failures = 0
+                            _finalize_post(idx, pid, content_key, esc_verdict, "", total_dt)
+                            esc_cursor += 1
+                            continue
+
+                        combined_err = (
+                            f"{pass1_err}; escalate {self.escalate_model}: {esc_err}"
+                            if pass1_verdict is None
+                            else ""
+                        )
+                        _finalize_post(idx, pid, content_key, pass1_verdict, combined_err, total_dt)
+                        esc_cursor += 1
+
+                        if _is_provider_failure(esc_err):
+                            self.consecutive_failures += 1
+                            if self.consecutive_failures >= self.max_consecutive_failures:
+                                _finalize_remaining_pass1(esc_cursor)
+                                self.total_rows_written += self._flush_items(pending_writes)
+                                pending_writes = []
+                                raise OllamaUnavailableError(
+                                    f"หยุดทำงานชั่วคราว: Ollama ล้มเหลวติดต่อกัน {self.consecutive_failures} โพสต์ "
+                                    "(บันทึกโพสต์ที่สำเร็จก่อนหน้าแล้ว ส่วนที่พลาดยังคงรอวิเคราะห์อยู่)"
+                                )
+                        else:
+                            self.consecutive_failures = 0
             except KeyboardInterrupt:
                 print("\n🛑 หยุดตามคำสั่ง (Ctrl+C) — กำลังบันทึกผลที่วิเคราะห์สำเร็จแล้วใน Batch นี้...", flush=True)
                 self._stop_requested = True
+                if escalate_queue and esc_cursor < len(escalate_queue):
+                    for q_idx, q_post, q_key, p1_verdict, _p1_err, p1_dt, _ in escalate_queue[esc_cursor:]:
+                        if p1_verdict is not None:
+                            _finalize_post(q_idx, q_post["post_id"], q_key, p1_verdict, "", p1_dt)
                 self.total_rows_written += self._flush_items(pending_writes)
                 pending_writes = []
 
@@ -1010,7 +1132,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--missing", choices=("sentiment", "intent", "incomplete"), default="sentiment",
                         help="Queue to backfill: sentiment (default), intent, or incomplete (/incomplete -> /replace)")
     parser.add_argument("--model", default=os.environ.get("OLLAMA_BACKFILL_MODEL", "").strip() or DEFAULT_MODEL)
-    parser.add_argument("--escalate-model", default="", help="Optional second Ollama model when score < 60 or multi_target")
+    parser.add_argument(
+        "--escalate-model",
+        default=os.environ.get("OLLAMA_ESCALATE_MODEL", DEFAULT_ESCALATE_MODEL).strip(),
+        help="Pass-2 Ollama model at end of batch for score<60, multi_target, error, or intent=information (default: qwen3:8b; use 'none' to disable)",
+    )
+    parser.add_argument(
+        "--no-escalate-information",
+        dest="escalate_information",
+        action="store_false",
+        default=True,
+        help="Only escalate score<60, multi_target, or error (do not escalate intent=information)",
+    )
     parser.add_argument("--host", default=os.environ.get("OLLAMA_HOST", "").strip() or "http://localhost:11434")
     parser.add_argument("--timeout", type=int, default=_env_int("OLLAMA_DEEP_TIMEOUT", DEFAULT_TIMEOUT))
     parser.add_argument("--num-ctx", type=int, default=_env_int("OLLAMA_NUM_CTX", DEFAULT_NUM_CTX))
@@ -1020,8 +1153,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--think", default=os.environ.get("OLLAMA_THINK", "").strip() or "false",
                         help="Thinking toggle: false, true, or auto (default: false)")
     parser.add_argument("--retries", type=int, default=3, help="Attempts per post before skipping (default: 3)")
-    parser.add_argument("--batch-size", type=int, default=_env_int("OLLAMA_BACKFILL_BATCH_SIZE", 10),
-                        help="Posts analyzed per write flush (default: 10)")
+    parser.add_argument("--batch-size", type=int, default=_env_int("OLLAMA_BACKFILL_BATCH_SIZE", DEFAULT_BATCH_SIZE),
+                        help="Posts analyzed per write flush (default: 50)")
     parser.add_argument("--fetch-limit", type=int, default=80,
                         help="Rows fetched per poll (1-200 for /pending, 1-500 for /incomplete; default: 80)")
     parser.add_argument("--lease-seconds", type=int, default=600,
@@ -1037,6 +1170,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                             help="Read-only dry-run without writing to DB")
 
     args = parser.parse_args(argv)
+    if str(args.escalate_model or "").strip().lower() in ("none", "off", "false"):
+        args.escalate_model = ""
+    else:
+        args.escalate_model = str(args.escalate_model or "").strip()
 
     if args.project_id and args.organization_id:
         parser.error("Use either --project-id OR --organization-id, not both")
@@ -1092,11 +1229,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("=" * 75, flush=True)
     scope_extra = (f", project={args.project_id}" if args.project_id else
                    (f", org={args.organization_id}" if args.organization_id else ""))
+    esc = args.escalate_model.strip()
+    esc_info = (f", escalate={esc} (info={'on' if args.escalate_information else 'off'})"
+                if esc and esc != args.model else "")
     print(f"📅 ช่วงวันที่    : {args.date_from} ถึง {args.date_to} (missing={args.missing}{scope_extra})", flush=True)
-    print(f"🧠 โมเดล        : {args.model} @ {args.host} (think={think_flag}, num_ctx={args.num_ctx})", flush=True)
+    print(f"🧠 โมเดล        : {args.model} @ {args.host} (think={think_flag}, num_ctx={args.num_ctx}, batch_size={args.batch_size}{esc_info})", flush=True)
     print(f"💾 โหมดบันทึก   : {_mode_label(args.missing, args.save_db)}", flush=True)
 
-    esc = args.escalate_model.strip()
     needed = [args.model] + ([esc] if esc and esc != args.model else [])
     ok, msg = ollama.check_health(require_models=needed)
     if not ok:
@@ -1115,6 +1254,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         project_id=args.project_id,
         organization_id=args.organization_id,
         escalate_model=args.escalate_model,
+        escalate_information=args.escalate_information,
         max_chars=args.max_chars,
         max_consecutive_failures=args.max_consecutive_failures,
         fail_log_path=args.fail_log,
