@@ -15,7 +15,7 @@ if "%~1"=="" goto interactive
 exit /b %errorlevel%
 
 :interactive
-echo === Sentiment Backfill (Ollama deepseek-r1:8b, RTX 5060 Ti 8GB) ===
+echo === Sentiment Backfill (Ollama qwen3:8b, RTX 5060 Ti 8GB) ===
 set /p FROM_DATE=From date (YYYY-MM-DD): 
 set /p TO_DATE=To date   (YYYY-MM-DD): 
 set /p SAVE_MODE=Save results to DB? [y/N]: 

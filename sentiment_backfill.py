@@ -51,14 +51,14 @@ MIN_REASON = 15
 UNSURE_BELOW = 60
 
 DEFAULT_BASE_URL = "https://api.blueeye.io/api/v1"
-DEFAULT_MODEL = "deepseek-r1:8b"
+DEFAULT_MODEL = "qwen3:8b"
 DEFAULT_TIMEOUT = 120
 DEFAULT_NUM_CTX = 4096
 DEFAULT_KEEP_ALIVE = "30m"
 DEFAULT_FAIL_LOG = os.path.join(os.path.dirname(__file__), "reports", "sentiment_backfill_failures.jsonl")
 
-# Mirrors app/crud/sentiment_worker.py PROMPT (Author's Own Voice + Thai concrete reasons + incident)
-# adapted for single-post Ollama inference (sentiment before scores so 8B commits label first).
+# Verbatim app/crud/sentiment_worker.py PROMPT, adapted only on the final output-format line
+# for single-post Ollama JSON inference.
 PROMPT = """\
 Classify each post's sentiment and intent, and whether it reports an incident.
 
@@ -86,30 +86,30 @@ given and none may be assumed.
   "ยอดนักสู้ตัวจริง เด็ดขาด ไม่เกรงกลัวใคร" -> positive (the author's admiration)
   "รอคิวสองชั่วโมง พนักงานไม่สนใจเลย แย่มาก" -> negative (the author's complaint)
   "ร้านนี้อร่อยมาก ประทับใจ จะกลับมาอีกแน่นอน" -> positive (the author's praise)
-- positive, neutral, negative: three integers that MUST sum to 100 (e.g. 15/80/5,
-  NEVER 90/100/0). CRITICAL: the score for your chosen `sentiment` MUST be strictly
-  larger than the other two (if sentiment="neutral", `neutral` > `positive` and `neutral` > `negative`).
+- positive/neutral/negative: integer percentages summing to 100; the chosen
+  sentiment strictly the largest.
 - intent: information|complaint|enquiry|recommendation. The author's purpose.
   recommendation = urges the reader to buy/try/join/support/attend. Announcing an
   award, result or news is information. complaint = reports a problem or
   dissatisfaction. enquiry = asks a question or asks for help.
-- sentiment_reason and intent_reason: ONE short Thai sentence EACH, even for an English post,
-  that cites a concrete detail of THIS post and names its subject as the post names it
-  (at least 15 Thai characters each). Reasons will be shown to end users.
-  Write natural Thai only; keep English brand/person/award names in English (NEVER Chinese).
-  Write each reason before its label, and make the label follow from it.
-  sentiment_reason and intent_reason MUST be two distinct sentences (never reuse the same
-  sentence for both, never copy example sentences, and never write "แบรนด์ลูกค้า"/"แบรนด์ของเรา").
-- multi_target: true if the post names two or more brands/products in different tones
-  (praises one, criticises another), else false.
-- incident: true if the post reports or alleges something harmful to a person or organisation:
-  an accident, injury or death, a crime, arrest, lawsuit or investigation, corruption or fraud,
-  a scandal, a food/product safety or health problem, a serious product or service failure,
-  a call to boycott. True even when worded neutrally as news, and independent of sentiment.
-  A plain complaint about everyday service, an ad, or fiction is false.
+- Each reason: ONE short Thai sentence, also for an English post, that cites a
+  concrete detail of THIS post and names its subject as the post names it. Never
+  "แบรนด์ลูกค้า"/"แบรนด์ของเรา". Never reuse a sentence across posts. Reasons will
+  be shown to end users.
+- Write each reason before its label, and make the label follow from it.
+- multi_target: true if the post names two or more brands/products in different
+  tones (praises one, criticises another), else false.
+- incident: true if the post reports or alleges something harmful to a person or
+  organisation: an accident, injury or death, a crime, arrest, lawsuit or
+  investigation, corruption or fraud, a scandal, a food/product safety or health
+  problem, a serious product or service failure, a call to boycott. True even when
+  worded neutrally as news, and independent of sentiment. A plain complaint about
+  everyday service, an ad, or fiction is false.
 
-Return ONLY one valid JSON object with exact keys in this order:
-{"sentiment_reason":"<1 short Thai sentence >=15 chars>","sentiment":"<positive|neutral|negative>","positive":<0-100>,"neutral":<0-100>,"negative":<0-100>,"intent_reason":"<1 short Thai sentence >=15 chars>","intent":"<information|complaint|enquiry|recommendation>","multi_target":false,"incident":false}"""
+Return ONLY one valid JSON object (no markdown) with exact keys:
+sentiment_reason, sentiment, positive, neutral, negative, intent_reason, intent, multi_target, incident.
+Example shape:
+{"sentiment_reason":"ผู้เขียนรายงานตัวเลขผลประกอบการตามข่าวโดยไม่แสดงอารมณ์","sentiment":"neutral","positive":10,"neutral":85,"negative":5,"intent_reason":"เผยแพร่ข้อมูลข่าวสารทางธุรกิจให้ผู้อ่านทราบ","intent":"information","multi_target":false,"incident":false}"""
 
 
 class OllamaUnavailableError(RuntimeError):
@@ -149,7 +149,8 @@ def parse_think_flag(value: str, model_name: str) -> Optional[bool]:
         return True
     if raw in ("false", "0", "no"):
         return False
-    if raw in ("", "auto") and "deepseek-r1" in str(model_name or "").lower():
+    model_low = str(model_name or "").lower()
+    if raw in ("", "auto") and any(k in model_low for k in ("deepseek-r1", "qwen3")):
         return False
     return None
 
@@ -395,7 +396,6 @@ class OllamaWorkerClient:
                 "system": PROMPT,
                 "prompt": user_text,
                 "stream": False,
-                "format": "json",
                 "options": {
                     "temperature": temperature,
                     "seed": seed,
@@ -403,6 +403,8 @@ class OllamaWorkerClient:
                     "num_predict": self.num_predict,
                 },
             }
+            if think_val is not True:
+                body["format"] = "json"
             if think_val is not None:
                 body["think"] = think_val
             if self.keep_alive:

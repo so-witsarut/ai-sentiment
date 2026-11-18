@@ -209,7 +209,7 @@ TPM นับเฉพาะ input ตาม [เอกสาร Gemini](https:/
 | Windows PowerShell | `.\run.bat` | ใช้ `.venv` และ `.env` ในโฟลเดอร์โปรเจกต์ |
 | Windows PowerShell | `.\run.bat --from-date 2026-09-28 --to-date 2026-09-29` | วิเคราะห์ช่วงวันที่นี้หนึ่งรอบผ่าน `run.bat` |
 | Windows PowerShell | `.\.venv\Scripts\python.exe ai_sentiment.py --from-date 2026-09-28 --to-date 2026-09-29` | วิเคราะห์ช่วงวันที่นี้หนึ่งรอบแล้วจบ |
-| Windows PowerShell | `.\run_sentiment_backfill.bat --from-date 2026-11-01 --to-date 2026-11-16 --save-db` | สคริปต์รันย้อนหลังเฉพาะ Ollama (`deepseek-r1:8b`) ตามกติกา `sentiment_worker.py` โดยไม่บันทึก `rule:provider_failure` |
+| Windows PowerShell | `.\run_sentiment_backfill.bat --from-date 2026-11-01 --to-date 2026-11-16 --save-db` | สคริปต์รันย้อนหลังเฉพาะ Ollama (`qwen3:8b`) ตามกติกา `sentiment_worker.py` โดยไม่บันทึก `rule:provider_failure` |
 | Linux/macOS | `.venv/bin/python ai_sentiment.py` | ใช้ virtual environment ของโปรเจกต์ |
 | Linux/macOS | `.venv/bin/python ai_sentiment.py --from-date 2026-09-28 --to-date 2026-09-29` | วิเคราะห์ช่วงวันที่นี้หนึ่งรอบแล้วจบ |
 
@@ -219,7 +219,7 @@ TPM นับเฉพาะ input ตาม [เอกสาร Gemini](https:/
 
 ## สคริปต์รันย้อนหลังเฉพาะ Ollama ตามกติกาหลัก (`sentiment_backfill.py`)
 
-สำหรับรันวิเคราะห์ย้อนหลังบนเครื่องที่มีการ์ดจอแยก (เช่น RTX 5060 Ti 8GB) ด้วย `deepseek-r1:8b` โดยเฉพาะ โดยอิงกติกา **Author's Own Voice** และโครงสร้างผลลัพธ์เดียวกับ `sentiment_worker.py` (`sentiment`, `sentiment_reason`, `sentiment_scores` พร้อม `multi_target`, `intent`, `intent_reason`, `incident`):
+สำหรับรันวิเคราะห์ย้อนหลังบนเครื่องที่มีการ์ดจอแยก (เช่น RTX 5060 Ti 8GB) ด้วย `qwen3:8b` โดยเฉพาะ โดยอิงกติกา **Author's Own Voice** และโครงสร้างผลลัพธ์เดียวกับ `sentiment_worker.py` (`sentiment`, `sentiment_reason`, `sentiment_scores` พร้อม `multi_target`, `intent`, `intent_reason`, `incident`):
 
 - ใช้เฉพาะ Ollama เท่านั้น (ไม่อ่าน `ENABLE_OPENROUTER`, `ENABLE_GEMINI`, `VALIDATION_MODELS`)
 - **โหมดบันทึกจริง (`--save-db`)** ดึงคิวผ่าน `/internal/sentiment/pending?claim=true` (หรือใช้ `--missing incomplete` เพื่อดึงแถวที่บันทึกแล้วแต่ข้อมูลไม่ครบ/ติด `rule:` จาก `/internal/sentiment/incomplete` แล้วส่งทับผ่าน `/internal/sentiment/replace`) ส่วน `--dry-run` อ่านแบบ read-only โดยไม่เขียน DB
