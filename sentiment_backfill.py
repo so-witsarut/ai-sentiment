@@ -58,7 +58,7 @@ DEFAULT_KEEP_ALIVE = "30m"
 DEFAULT_FAIL_LOG = os.path.join(os.path.dirname(__file__), "reports", "sentiment_backfill_failures.jsonl")
 
 # Mirrors app/crud/sentiment_worker.py PROMPT (Author's Own Voice + Thai concrete reasons + incident)
-# adapted for single-post Ollama inference with scores placed before sentiment for argmax consistency.
+# adapted for single-post Ollama inference (sentiment before scores so 8B commits label first).
 PROMPT = """\
 Classify each post's sentiment and intent, and whether it reports an incident.
 
@@ -86,17 +86,17 @@ given and none may be assumed.
   "ยอดนักสู้ตัวจริง เด็ดขาด ไม่เกรงกลัวใคร" -> positive (the author's admiration)
   "รอคิวสองชั่วโมง พนักงานไม่สนใจเลย แย่มาก" -> negative (the author's complaint)
   "ร้านนี้อร่อยมาก ประทับใจ จะกลับมาอีกแน่นอน" -> positive (the author's praise)
-- positive, neutral, negative: integer percentages summing to 100.
-  CRITICAL: `sentiment` MUST match the strictly LARGEST score (for example: if neutral=80,
-  negative=20, positive=0, then `sentiment` MUST be "neutral").
+- positive, neutral, negative: three integers that MUST sum to 100 (e.g. 15/80/5,
+  NEVER 90/100/0). CRITICAL: the score for your chosen `sentiment` MUST be strictly
+  larger than the other two (if sentiment="neutral", `neutral` > `positive` and `neutral` > `negative`).
 - intent: information|complaint|enquiry|recommendation. The author's purpose.
   recommendation = urges the reader to buy/try/join/support/attend. Announcing an
   award, result or news is information. complaint = reports a problem or
   dissatisfaction. enquiry = asks a question or asks for help.
 - sentiment_reason and intent_reason: ONE short Thai sentence EACH, even for an English post,
   that cites concrete details of THIS input post (at least 15 Thai characters each).
-  Write natural Thai only (no Chinese characters). Never copy example sentences and never
-  write "แบรนด์ลูกค้า" or "แบรนด์ของเรา".
+  Write natural Thai only; keep English brand/person/award names in English (NEVER Chinese).
+  Never copy example sentences and never write "แบรนด์ลูกค้า" or "แบรนด์ของเรา".
 - multi_target: true if the post names two or more brands/products in different tones
   (praises one, criticises another), else false.
 - incident: true if the post reports or alleges something harmful to a person or organisation:
@@ -105,8 +105,8 @@ given and none may be assumed.
   a call to boycott. True even when worded neutrally as news, and independent of sentiment.
   A plain complaint about everyday slow service, an ad, or fiction is false.
 
-Return ONLY one valid JSON object with exact keys:
-{"sentiment_reason":"<1 short Thai sentence >=15 chars>","positive":0,"neutral":100,"negative":0,"sentiment":"neutral","intent_reason":"<1 short Thai sentence >=15 chars>","intent":"information","multi_target":false,"incident":false}"""
+Return ONLY one valid JSON object with exact keys in this order:
+{"sentiment_reason":"<1 short Thai sentence >=15 chars>","sentiment":"<positive|neutral|negative>","positive":<0-100>,"neutral":<0-100>,"negative":<0-100>,"intent_reason":"<1 short Thai sentence >=15 chars>","intent":"<information|complaint|enquiry|recommendation>","multi_target":false,"incident":false}"""
 
 
 class OllamaUnavailableError(RuntimeError):
@@ -158,7 +158,8 @@ def _clean_reason(value: Any) -> str:
         raise ValueError(f"reason too short or missing Thai text: {r!r}")
     thai_chars = len(re.findall(r"[ก-๙]", r))
     cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", r))
-    if thai_chars < 10 or cjk_chars >= 4:
+    # Reject Chinese-only or CJK-heavy reasons, while tolerating an isolated untranslated term inside substantial Thai.
+    if thai_chars < 10 or (cjk_chars >= 4 and cjk_chars * 4 > thai_chars):
         raise ValueError(f"reason not mostly Thai: {r!r}")
     if "แบรนด์ลูกค้า" in r or "แบรนด์ของเรา" in r:
         raise ValueError(f"reason uses forbidden generic label: {r!r}")
@@ -226,6 +227,21 @@ def validate_verdict(x: Dict[str, Any], model: str) -> Verdict:
 def is_unsure(verdict: Verdict) -> bool:
     scores = verdict.scores or {}
     return bool(scores.get("multi_target")) or max(int(scores[k]) for k in SENTIMENT_VALUES) < UNSURE_BELOW
+
+
+def _is_provider_failure(err: str) -> bool:
+    """Return True only for Ollama transport/timeout/HTTP 5xx failures, not model output errors."""
+    for segment in str(err or "").split(";"):
+        s = segment.strip()
+        if s.startswith("escalate "):
+            _, _, s = s.partition(": ")
+            s = s.strip()
+        mode_head, sep, rest = s.partition(": ")
+        if sep and re.fullmatch(r"[A-Za-z0-9_+#-]+", mode_head):
+            s = rest.strip()
+        if re.match(r"^(?:timeout\b|connection_error\b|HTTP\s+5\d\d\b)", s, re.IGNORECASE):
+            return True
+    return False
 
 
 def _verdict_payload_fields(verdict: Verdict) -> Dict[str, Any]:
@@ -700,7 +716,11 @@ class SentimentBackfillRunner:
                     t0 = time.perf_counter()
                     verdict, err = self.ollama.analyse_post(post["content"])
 
-                    if self.escalate_model and (verdict is None or is_unsure(verdict)):
+                    if (
+                        self.escalate_model
+                        and self.escalate_model != self.ollama.model
+                        and (verdict is None or is_unsure(verdict))
+                    ):
                         esc_verdict, esc_err = self.ollama.analyse_post(
                             post["content"], model_override=self.escalate_model)
                         if esc_verdict is not None:
@@ -712,18 +732,22 @@ class SentimentBackfillRunner:
                     dt = time.perf_counter() - t0
                     if verdict is None:
                         self.total_failed_posts += 1
-                        self.consecutive_failures += 1
                         self.failed_post_ids.add(pid)
                         self._record_failure(pid, match_ids_fn(pid), err)
                         print(f"  ⏭️ [{idx:02d}] post={pid[:18]:<18} | SKIPPED (ไม่บันทึก rule:provider_failure) | {err}",
                               flush=True)
-                        if self.consecutive_failures >= self.max_consecutive_failures:
-                            self.total_rows_written += self._flush_items(pending_writes)
-                            pending_writes = []
-                            raise OllamaUnavailableError(
-                                f"หยุดทำงานชั่วคราว: Ollama ล้มเหลวติดต่อกัน {self.consecutive_failures} โพสต์ "
-                                "(บันทึกโพสต์ที่สำเร็จก่อนหน้าแล้ว ส่วนที่พลาดยังคงรอวิเคราะห์อยู่)"
-                            )
+                        if _is_provider_failure(err):
+                            self.consecutive_failures += 1
+                            if self.consecutive_failures >= self.max_consecutive_failures:
+                                self.total_rows_written += self._flush_items(pending_writes)
+                                pending_writes = []
+                                raise OllamaUnavailableError(
+                                    f"หยุดทำงานชั่วคราว: Ollama ล้มเหลวติดต่อกัน {self.consecutive_failures} โพสต์ "
+                                    "(บันทึกโพสต์ที่สำเร็จก่อนหน้าแล้ว ส่วนที่พลาดยังคงรอวิเคราะห์อยู่)"
+                                )
+                        else:
+                            # Ollama responded HTTP 200; model output validation/JSON errors must not trip the circuit breaker.
+                            self.consecutive_failures = 0
                         continue
 
                     self.consecutive_failures = 0
@@ -1023,7 +1047,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"🧠 โมเดล        : {args.model} @ {args.host} (think={think_flag}, num_ctx={args.num_ctx})", flush=True)
     print(f"💾 โหมดบันทึก   : {_mode_label(args.missing, args.save_db)}", flush=True)
 
-    needed = [args.model] + ([args.escalate_model] if args.escalate_model.strip() else [])
+    esc = args.escalate_model.strip()
+    needed = [args.model] + ([esc] if esc and esc != args.model else [])
     ok, msg = ollama.check_health(require_models=needed)
     if not ok:
         print(f"❌ {msg}", flush=True)

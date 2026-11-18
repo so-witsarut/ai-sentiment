@@ -61,12 +61,13 @@ class SentimentBackfillTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 backfill.validate_verdict(bad, "deepseek-r1:8b")
 
-        # Single stray character in an otherwise valid Thai reason is tolerated like sentiment_worker.py
-        tolerated = backfill.validate_verdict(
-            valid_item(sentiment_reason="บทกวีนี้เน้นสอนใจและคำคม ไม่มีการวิพ论หรือแสดงความรู้สึกต่อแบรนด์"),
-            "deepseek-r1:8b",
-        )
-        self.assertEqual(tolerated.sentiment, "neutral")
+        # Isolated stray CJK chars or one borrowed term inside a substantial Thai reason is tolerated
+        for ok_reason in (
+            "บทกวีนี้เน้นสอนใจและคำคม ไม่มีการวิพ论หรือแสดงความรู้สึกต่อแบรนด์",
+            "ขอบคุณและแสดงความยินดีต่อการเลือก Jacinta Linden สำหรับรางวัล終身成就獎",
+        ):
+            tolerated = backfill.validate_verdict(valid_item(sentiment_reason=ok_reason), "deepseek-r1:8b")
+            self.assertEqual(tolerated.sentiment, "neutral")
 
     def test_client_retries_generate_json_with_varied_seeds(self):
         client = backfill.OllamaWorkerClient(model="deepseek-r1:8b", retries=3, think=False)
@@ -301,6 +302,90 @@ class SentimentBackfillTests(unittest.TestCase):
             with self.subTest(bad_argv=bad_argv), self.assertRaises(SystemExit), \
                  redirect_stdout(io.StringIO()):
                 backfill.parse_args(bad_argv)
+
+    def test_circuit_breaker_skips_validation_errors_and_trips_only_on_provider_failures(self):
+        rest = backfill.BlueEyeRestClient(base_url="https://api.example/api/v1", token="tok")
+        ollama = backfill.OllamaWorkerClient(model="deepseek-r1:8b", retries=1)
+        ok_verdict = backfill.validate_verdict(valid_item(), "deepseek-r1:8b")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fail_log = os.path.join(tmpdir, "failures.jsonl")
+            # 3 validation/JSON errors exceed max_consecutive_failures=2, yet must NOT abort; post 4 succeeds
+            runner = backfill.SentimentBackfillRunner(
+                rest=rest, ollama=ollama, save_db=True, max_consecutive_failures=2, fail_log_path=fail_log
+            )
+            rows = [
+                {"match_post_id": "M1", "post_id": "P1", "content": "post 1"},
+                {"match_post_id": "M2", "post_id": "P2", "content": "post 2"},
+                {"match_post_id": "M3", "post_id": "P3", "content": "post 3"},
+                {"match_post_id": "M4", "post_id": "P4", "content": "post 4"},
+            ]
+            outcomes = [
+                (None, "generate+json#3: validation_error (sentiment 'neutral' is not strictly largest)"),
+                (None, "generate+json#3: unparseable_json ('{bad')"),
+                (None, "generate+json#3: schema_error (KeyError: 'intent')"),
+                (ok_verdict, ""),
+            ]
+            with patch.object(rest, "fetch_pending_claimed", side_effect=[rows, []]), \
+                 patch.object(rest, "write_results", return_value=1) as write_mock, \
+                 patch.object(ollama, "analyse_post", side_effect=outcomes), \
+                 redirect_stdout(io.StringIO()):
+                rc = runner.run("2026-11-01", "2026-11-16")
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(runner.total_failed_posts, 3)
+            self.assertEqual(runner.total_posts_done, 1)
+            self.assertEqual(runner.total_rows_written, 1)
+            self.assertEqual(write_mock.call_args.args[0][0]["match_post_id"], "M4")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fail_log = os.path.join(tmpdir, "failures2.jsonl")
+            # Transport/timeout/HTTP 5xx errors DO trip the circuit breaker at max_consecutive_failures=2
+            runner = backfill.SentimentBackfillRunner(
+                rest=rest, ollama=ollama, save_db=True, max_consecutive_failures=2, fail_log_path=fail_log
+            )
+            rows = [
+                {"match_post_id": "M1", "post_id": "P1", "content": "post 1"},
+                {"match_post_id": "M2", "post_id": "P2", "content": "post 2"},
+                {"match_post_id": "M3", "post_id": "P3", "content": "post 3"},
+                {"match_post_id": "M4", "post_id": "P4", "content": "post 4"},
+            ]
+            outcomes = [
+                (ok_verdict, ""),
+                (None, "generate+json#3: timeout after 120s (ReadTimeout)"),
+                (None, "generate+json#3: HTTP 500 (server error)"),
+            ]
+            with patch.object(rest, "fetch_pending_claimed", return_value=rows), \
+                 patch.object(rest, "write_results", return_value=1) as write_mock, \
+                 patch.object(ollama, "analyse_post", side_effect=outcomes) as analyse_mock, \
+                 redirect_stdout(io.StringIO()):
+                rc = runner.run("2026-11-01", "2026-11-16")
+
+            self.assertEqual(rc, 2)
+            self.assertEqual(analyse_mock.call_count, 3)  # P4 was never reached
+            self.assertEqual(runner.total_posts_done, 1)
+            self.assertEqual(runner.total_rows_written, 1)
+            self.assertEqual(runner.total_failed_posts, 2)
+            self.assertEqual(write_mock.call_args.args[0][0]["match_post_id"], "M1")
+
+    def test_escalate_skipped_when_same_as_primary_model(self):
+        rest = backfill.BlueEyeRestClient(base_url="https://api.example/api/v1", token="tok")
+        ollama = backfill.OllamaWorkerClient(model="deepseek-r1:8b")
+        runner = backfill.SentimentBackfillRunner(
+            rest=rest, ollama=ollama, save_db=False, escalate_model="deepseek-r1:8b", limit=1
+        )
+        unsure = backfill.validate_verdict(
+            valid_item(positive=45, neutral=50, negative=5, sentiment="neutral"), "deepseek-r1:8b"
+        )
+        with patch.object(rest, "fetch_posts_page",
+                          return_value=(1, [{"match_post_id": "M1", "post_id": "P1", "content": "ข้อความทดสอบ"}])), \
+             patch.object(ollama, "analyse_post", return_value=(unsure, "")) as analyse_mock, \
+             redirect_stdout(io.StringIO()):
+            rc = runner.run("2026-11-01", "2026-11-16")
+
+        self.assertEqual(rc, 0)
+        analyse_mock.assert_called_once()
+        self.assertEqual(runner.total_escalated, 0)
 
 
 if __name__ == "__main__":
