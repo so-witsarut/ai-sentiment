@@ -228,6 +228,17 @@ def is_unsure(verdict: Verdict) -> bool:
     return bool(scores.get("multi_target")) or max(int(scores[k]) for k in SENTIMENT_VALUES) < UNSURE_BELOW
 
 
+def _verdict_payload_fields(verdict: Verdict) -> Dict[str, Any]:
+    return {
+        "sentiment": verdict.sentiment,
+        "sentiment_reason": verdict.reason,
+        "sentiment_scores": verdict.scores,
+        "intent": verdict.intent,
+        "intent_reason": verdict.intent_reason,
+        "incident": verdict.incident,
+    }
+
+
 def format_result_item(match_post_id: str, verdict: Verdict, intent_only: bool = False) -> Dict[str, Any]:
     """Build one BatchVerdictItem matching app/api/routes/sentiment.py."""
     if intent_only:
@@ -236,15 +247,12 @@ def format_result_item(match_post_id: str, verdict: Verdict, intent_only: bool =
             "intent": verdict.intent,
             "intent_reason": verdict.intent_reason,
         }
-    return {
-        "match_post_id": match_post_id,
-        "sentiment": verdict.sentiment,
-        "sentiment_reason": verdict.reason,
-        "sentiment_scores": verdict.scores,
-        "intent": verdict.intent,
-        "intent_reason": verdict.intent_reason,
-        "incident": verdict.incident,
-    }
+    return {"match_post_id": match_post_id, **_verdict_payload_fields(verdict)}
+
+
+def format_replace_item(post_id: str, verdict: Verdict) -> Dict[str, Any]:
+    """Build one ReplaceVerdictItem for POST /internal/sentiment/replace."""
+    return {"post_id": post_id, **_verdict_payload_fields(verdict)}
 
 
 class OllamaWorkerClient:
@@ -493,10 +501,54 @@ class BlueEyeRestClient:
         self.last_fetch_error = True
         return 0, []
 
-    def write_results(self, results: List[Dict[str, Any]]) -> int:
+    def fetch_incomplete_page(
+        self,
+        *,
+        date_from: str,
+        date_to: str,
+        cursor: Optional[str] = None,
+        limit: int = 100,
+        project_id: Optional[str] = None,
+        organization_id: Optional[str] = None,
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        url = f"{self.base_url}/internal/sentiment/incomplete"
+        params: Dict[str, Any] = {
+            "date_from": date_from,
+            "date_to": date_to,
+            "limit": max(1, min(500, int(limit))),
+        }
+        if cursor:
+            params["cursor"] = cursor
+        if project_id:
+            params["project_id"] = project_id
+        elif organization_id:
+            params["organization_id"] = organization_id
+        for attempt in range(1, 4):
+            try:
+                r = self.session.get(url, params=params, headers=self.headers, timeout=60)
+                if r.status_code == 200:
+                    body = r.json()
+                    return list(body.get("items") or []), body.get("next_cursor")
+                print(f"[REST API] /incomplete HTTP {r.status_code} (attempt {attempt}/3): {r.text[:150]}", flush=True)
+                if r.status_code == 422:
+                    break
+            except requests.RequestException as exc:
+                print(f"[REST API] /incomplete error (attempt {attempt}/3): {exc}", flush=True)
+            if attempt < 3:
+                time.sleep(2)
+        self.last_fetch_error = True
+        return [], None
+
+    def _post_results_batch(
+        self,
+        endpoint: str,
+        label: str,
+        results: List[Dict[str, Any]],
+        on_success: Any,
+    ) -> int:
         if not results:
             return 0
-        url = f"{self.base_url}/internal/sentiment/results"
+        url = f"{self.base_url}{endpoint}"
         total_written = 0
         for start in range(0, len(results), 500):
             chunk = results[start:start + 500]
@@ -504,21 +556,41 @@ class BlueEyeRestClient:
                 try:
                     r = self.session.post(url, headers=self.headers, json={"results": chunk}, timeout=60)
                     if r.status_code in (200, 201):
-                        body = r.json()
-                        updated = int(body.get("updated", len(chunk)))
-                        not_found = body.get("not_found") or []
-                        print(f"  ✅ [REST API] บันทึก {len(chunk)} แถว → updated={updated}"
-                              + (f" (not_found={len(not_found)})" if not_found else ""), flush=True)
-                        total_written += updated
+                        total_written += int(on_success(chunk, r.json()))
                         break
-                    print(f"  ❌ [REST API] /results HTTP {r.status_code} (attempt {attempt}/3): {r.text[:250]}", flush=True)
+                    print(f"  ❌ [REST API] {label} HTTP {r.status_code} (attempt {attempt}/3): {r.text[:250]}", flush=True)
                     if r.status_code == 422:
                         break  # Schema rejection is deterministic; do not retry identical body
                 except requests.RequestException as exc:
-                    print(f"  ❌ [REST API] /results error (attempt {attempt}/3): {exc}", flush=True)
+                    print(f"  ❌ [REST API] {label} error (attempt {attempt}/3): {exc}", flush=True)
                 if attempt < 3:
                     time.sleep(2)
         return total_written
+
+    def write_results(self, results: List[Dict[str, Any]]) -> int:
+        def _on_ok(chunk: List[Dict[str, Any]], body: Dict[str, Any]) -> int:
+            updated = int(body.get("updated", len(chunk)))
+            not_found = body.get("not_found") or []
+            print(f"  ✅ [REST API] บันทึก {len(chunk)} แถว → updated={updated}"
+                  + (f" (not_found={len(not_found)})" if not_found else ""), flush=True)
+            return updated
+
+        return self._post_results_batch("/internal/sentiment/results", "/results", results, _on_ok)
+
+    def replace_results(self, results: List[Dict[str, Any]]) -> int:
+        def _on_ok(chunk: List[Dict[str, Any]], body: Dict[str, Any]) -> int:
+            posts_cnt = int(body.get("posts", len(chunk)))
+            written = int(body.get("written_rows", posts_cnt))
+            print(f"  ✅ [REST API] อัปเดตทับ {posts_cnt} โพสต์ → written_rows={written}", flush=True)
+            return written
+
+        return self._post_results_batch("/internal/sentiment/replace", "/replace", results, _on_ok)
+
+
+def _mode_label(missing: str, save_db: bool) -> str:
+    if missing == "incomplete":
+        return "LIVE (/incomplete -> /replace)" if save_db else "DRY-RUN (/incomplete -> ไม่เขียน DB)"
+    return "LIVE (claim=true -> /results)" if save_db else "DRY-RUN (/posts -> ไม่เขียน DB)"
 
 
 class SentimentBackfillRunner:
@@ -535,20 +607,24 @@ class SentimentBackfillRunner:
         save_db: bool = False,
         missing: str = "sentiment",
         project_id: Optional[str] = None,
+        organization_id: Optional[str] = None,
         escalate_model: str = "",
         max_chars: int = MAX_CHARS,
         max_consecutive_failures: int = 5,
         fail_log_path: str = DEFAULT_FAIL_LOG,
         limit: Optional[int] = None,
     ):
+        if project_id and organization_id:
+            raise ValueError("Specify either project_id or organization_id, not both")
         self.rest = rest
         self.ollama = ollama
         self.batch_size = max(1, int(batch_size))
-        self.fetch_limit = max(1, min(200, int(fetch_limit)))
+        self.fetch_limit = max(1, min(500, int(fetch_limit)))
         self.lease_seconds = max(30, min(3600, int(lease_seconds)))
         self.save_db = save_db
         self.missing = missing
         self.project_id = project_id
+        self.organization_id = organization_id
         self.escalate_model = escalate_model.strip()
         self.max_chars = max(200, int(max_chars))
         self.max_consecutive_failures = max(1, int(max_consecutive_failures))
@@ -585,33 +661,25 @@ class SentimentBackfillRunner:
         if not items:
             return 0
         if self.save_db:
+            if self.missing == "incomplete":
+                return self.rest.replace_results(items)
             return self.rest.write_results(items)
-        print(f"  🔒 [DRY-RUN: ปิดการบันทึก] จำลองส่ง {len(items)} แถว (ไม่เขียนลง DB):", flush=True)
+        endpoint_hint = "/replace" if self.missing == "incomplete" else "/results"
+        print(f"  🔒 [DRY-RUN: ปิดการบันทึก] จำลองส่ง {len(items)} แถวไป {endpoint_hint} (ไม่เขียนลง DB):", flush=True)
         for item in items:
             s = item.get("sentiment") or "(keep)"
-            print(f"      📝 id={item['match_post_id']} sentiment={s} intent={item['intent']} "
+            key_str = f"id={item['match_post_id']}" if "match_post_id" in item else f"post_id={item['post_id']}"
+            print(f"      📝 {key_str} sentiment={s} intent={item['intent']} "
                   f"incident={item.get('incident')} scores={item.get('sentiment_scores')}", flush=True)
         return len(items)
 
-    def _process_rows(self, rows: List[Dict[str, Any]]) -> None:
-        # Deduplicate by post_id just like sentiment_worker.py._process, skipping empty/already-failed posts
-        ids_by_post: Dict[str, List[Tuple[str, bool]]] = {}
-        posts: List[Dict[str, str]] = []
-        for r in rows:
-            pid = str(r.get("post_id") or "")
-            mid = str(r.get("match_post_id") or "")
-            if not pid or not mid or pid in self.failed_post_ids:
-                continue
-            content = (r.get("content") or "").strip()[:self.max_chars]
-            if not content:
-                continue
-            if pid not in ids_by_post:
-                if self.limit is not None and (self.total_posts_done + self.total_failed_posts + len(posts)) >= self.limit:
-                    break
-                posts.append({"post_id": pid, "content": content})
-            intent_only = (self.missing == "intent" and r.get("sentiment") is not None)
-            ids_by_post.setdefault(pid, []).append((mid, intent_only))
-
+    def _analyse_post_batch(
+        self,
+        posts: List[Dict[str, str]],
+        row_count_fn: Any,
+        match_ids_fn: Any,
+        build_items_fn: Any,
+    ) -> None:
         if not posts:
             return
 
@@ -646,8 +714,7 @@ class SentimentBackfillRunner:
                         self.total_failed_posts += 1
                         self.consecutive_failures += 1
                         self.failed_post_ids.add(pid)
-                        mids = [m for m, _ in ids_by_post[pid]]
-                        self._record_failure(pid, mids, err)
+                        self._record_failure(pid, match_ids_fn(pid), err)
                         print(f"  ⏭️ [{idx:02d}] post={pid[:18]:<18} | SKIPPED (ไม่บันทึก rule:provider_failure) | {err}",
                               flush=True)
                         if self.consecutive_failures >= self.max_consecutive_failures:
@@ -661,12 +728,12 @@ class SentimentBackfillRunner:
 
                     self.consecutive_failures = 0
                     self.total_posts_done += 1
-                    for mid, intent_only in ids_by_post[pid]:
-                        pending_writes.append(format_result_item(mid, verdict, intent_only=intent_only))
+                    pending_writes.extend(build_items_fn(pid, verdict))
 
                     icon = "🟢" if verdict.sentiment == "positive" else ("🔴" if verdict.sentiment == "negative" else "⚪")
+                    row_label = f"{row_count_fn(pid)} row" if self.missing != "incomplete" else "post"
                     print(
-                        f"  [{idx:02d}] {icon} post={pid[:18]:<18} ({len(ids_by_post[pid])} row) | "
+                        f"  [{idx:02d}] {icon} post={pid[:18]:<18} ({row_label}) | "
                         f"{verdict.sentiment.upper():<8} | intent={verdict.intent} | incident={verdict.incident} | "
                         f"{dt:.2f}s | Model={verdict.scores['model']}",
                         flush=True,
@@ -696,6 +763,53 @@ class SentimentBackfillRunner:
             if self.limit is not None and (self.total_posts_done + self.total_failed_posts) >= self.limit:
                 raise _LimitReached()
 
+    def _process_rows(self, rows: List[Dict[str, Any]]) -> None:
+        # Deduplicate by post_id just like sentiment_worker.py._process, skipping empty/already-failed posts
+        ids_by_post: Dict[str, List[Tuple[str, bool]]] = {}
+        posts: List[Dict[str, str]] = []
+        for r in rows:
+            pid = str(r.get("post_id") or "")
+            mid = str(r.get("match_post_id") or "")
+            if not pid or not mid or pid in self.failed_post_ids:
+                continue
+            content = (r.get("content") or "").strip()[:self.max_chars]
+            if not content:
+                continue
+            if pid not in ids_by_post:
+                if self.limit is not None and (self.total_posts_done + self.total_failed_posts + len(posts)) >= self.limit:
+                    break
+                posts.append({"post_id": pid, "content": content})
+            intent_only = (self.missing == "intent" and r.get("sentiment") is not None)
+            ids_by_post.setdefault(pid, []).append((mid, intent_only))
+
+        self._analyse_post_batch(
+            posts,
+            row_count_fn=lambda pid: len(ids_by_post[pid]),
+            match_ids_fn=lambda pid: [m for m, _ in ids_by_post[pid]],
+            build_items_fn=lambda pid, v: [format_result_item(m, v, intent_only=io) for m, io in ids_by_post[pid]],
+        )
+
+    def _process_incomplete_items(self, items: List[Dict[str, Any]], seen_posts: Set[str]) -> None:
+        posts: List[Dict[str, str]] = []
+        for r in items:
+            pid = str(r.get("post_id") or "")
+            if not pid or pid in seen_posts or pid in self.failed_post_ids:
+                continue
+            content = (r.get("content") or "").strip()[:self.max_chars]
+            if not content:
+                continue
+            if self.limit is not None and (self.total_posts_done + self.total_failed_posts + len(posts)) >= self.limit:
+                break
+            seen_posts.add(pid)
+            posts.append({"post_id": pid, "content": content})
+
+        self._analyse_post_batch(
+            posts,
+            row_count_fn=lambda _pid: 1,
+            match_ids_fn=lambda _pid: [],
+            build_items_fn=lambda pid, v: [format_replace_item(pid, v)],
+        )
+
     def run(self, date_from: str, date_to: str) -> int:
         date_from = validate_date_str(date_from)
         date_to = validate_date_str(date_to)
@@ -705,7 +819,30 @@ class SentimentBackfillRunner:
         started = time.perf_counter()
         aborted_reason = ""
         try:
-            if self.save_db:
+            if self.missing == "incomplete":
+                cursor: Optional[str] = None
+                seen_posts: Set[str] = set()
+                while not self._stop_requested:
+                    req_limit = min(500, self.fetch_limit)
+                    if self.limit is not None:
+                        remaining = max(0, self.limit - (self.total_posts_done + self.total_failed_posts))
+                        if remaining == 0:
+                            break
+                        req_limit = min(500, max(remaining * 2, self.batch_size))
+                    items, next_cursor = self.rest.fetch_incomplete_page(
+                        date_from=date_from,
+                        date_to=date_to,
+                        cursor=cursor,
+                        limit=req_limit,
+                        project_id=self.project_id,
+                        organization_id=self.organization_id,
+                    )
+                    if items:
+                        self._process_incomplete_items(items, seen_posts)
+                    if not next_cursor:
+                        break
+                    cursor = next_cursor
+            elif self.save_db:
                 while not self._stop_requested:
                     req_limit = self.fetch_limit
                     if self.limit is not None:
@@ -768,7 +905,7 @@ class SentimentBackfillRunner:
         print(f"   • ช่วงวันที่         : {date_from} ถึง {date_to} (missing={self.missing})", flush=True)
         print(f"   • โมเดล             : {self.ollama.model} @ {self.ollama.host}"
               + (f" (escalate={self.escalate_model})" if self.escalate_model else ""), flush=True)
-        print(f"   • โหมดบันทึก        : {'LIVE (/pending?claim=true -> DB)' if self.save_db else 'DRY-RUN (/posts -> ไม่เขียน DB)'}", flush=True)
+        print(f"   • โหมดบันทึก        : {_mode_label(self.missing, self.save_db)}", flush=True)
         print(f"   • วิเคราะห์สำเร็จ     : {self.total_posts_done} โพสต์ ({rate:.1f} posts/min)", flush=True)
         print(f"   • บันทึก/จำลองแล้ว   : {self.total_rows_written} แถว", flush=True)
         if self.escalate_model:
@@ -795,8 +932,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--to-date", dest="date_to", metavar="YYYY-MM-DD", help="End date (BKK inclusive)")
     parser.add_argument("--days", type=int, help="Backfill last N days up to yesterday (if --from-date omitted)")
     parser.add_argument("--project-id", default=None, help="Optional single project_id filter")
-    parser.add_argument("--missing", choices=("sentiment", "intent"), default="sentiment",
-                        help="Queue to backfill (default: sentiment)")
+    parser.add_argument("--organization-id", default=None,
+                        help="Optional organization_id filter (only with --missing incomplete)")
+    parser.add_argument("--missing", choices=("sentiment", "intent", "incomplete"), default="sentiment",
+                        help="Queue to backfill: sentiment (default), intent, or incomplete (/incomplete -> /replace)")
     parser.add_argument("--model", default=os.environ.get("OLLAMA_BACKFILL_MODEL", "").strip() or DEFAULT_MODEL)
     parser.add_argument("--escalate-model", default="", help="Optional second Ollama model when score < 60 or multi_target")
     parser.add_argument("--host", default=os.environ.get("OLLAMA_HOST", "").strip() or "http://localhost:11434")
@@ -811,7 +950,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=_env_int("OLLAMA_BACKFILL_BATCH_SIZE", 10),
                         help="Posts analyzed per write flush (default: 10)")
     parser.add_argument("--fetch-limit", type=int, default=80,
-                        help="Rows claimed per /internal/sentiment/pending poll in live mode (1-200, default: 80)")
+                        help="Rows fetched per poll (1-200 for /pending, 1-500 for /incomplete; default: 80)")
     parser.add_argument("--lease-seconds", type=int, default=600,
                         help="Claim lease duration in live mode (30-3600, default: 600)")
     parser.add_argument("--max-consecutive-failures", type=int, default=5)
@@ -820,11 +959,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     save_group = parser.add_mutually_exclusive_group()
     save_group.add_argument("--save-db", dest="save_db", action="store_true", default=env_save,
-                            help="Write results via /internal/sentiment/results")
+                            help="Write results via /internal/sentiment/results (or /replace when --missing incomplete)")
     save_group.add_argument("--dry-run", dest="save_db", action="store_false",
                             help="Read-only dry-run without writing to DB")
 
     args = parser.parse_args(argv)
+
+    if args.project_id and args.organization_id:
+        parser.error("Use either --project-id OR --organization-id, not both")
+    if args.organization_id and args.missing != "incomplete":
+        parser.error("--organization-id is only supported with --missing incomplete")
 
     if args.days is not None:
         if args.date_from or args.date_to:
@@ -873,10 +1017,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print("🤖 SENTIMENT BACKFILL WORKER (sentiment_worker.py rules + Ollama Only)", flush=True)
     print("=" * 75, flush=True)
-    print(f"📅 ช่วงวันที่    : {args.date_from} ถึง {args.date_to} (missing={args.missing}"
-          + (f", project={args.project_id}" if args.project_id else "") + ")", flush=True)
+    scope_extra = (f", project={args.project_id}" if args.project_id else
+                   (f", org={args.organization_id}" if args.organization_id else ""))
+    print(f"📅 ช่วงวันที่    : {args.date_from} ถึง {args.date_to} (missing={args.missing}{scope_extra})", flush=True)
     print(f"🧠 โมเดล        : {args.model} @ {args.host} (think={think_flag}, num_ctx={args.num_ctx})", flush=True)
-    print(f"💾 โหมดบันทึก   : {'LIVE (claim=true -> /results)' if args.save_db else 'DRY-RUN (/posts -> ไม่เขียน DB)'}", flush=True)
+    print(f"💾 โหมดบันทึก   : {_mode_label(args.missing, args.save_db)}", flush=True)
 
     needed = [args.model] + ([args.escalate_model] if args.escalate_model.strip() else [])
     ok, msg = ollama.check_health(require_models=needed)
@@ -894,6 +1039,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         save_db=args.save_db,
         missing=args.missing,
         project_id=args.project_id,
+        organization_id=args.organization_id,
         escalate_model=args.escalate_model,
         max_chars=args.max_chars,
         max_consecutive_failures=args.max_consecutive_failures,

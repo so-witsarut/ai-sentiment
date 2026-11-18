@@ -222,16 +222,19 @@ TPM นับเฉพาะ input ตาม [เอกสาร Gemini](https:/
 สำหรับรันวิเคราะห์ย้อนหลังบนเครื่องที่มีการ์ดจอแยก (เช่น RTX 5060 Ti 8GB) ด้วย `deepseek-r1:8b` โดยเฉพาะ โดยอิงกติกา **Author's Own Voice** และโครงสร้างผลลัพธ์เดียวกับ `sentiment_worker.py` (`sentiment`, `sentiment_reason`, `sentiment_scores` พร้อม `multi_target`, `intent`, `intent_reason`, `incident`):
 
 - ใช้เฉพาะ Ollama เท่านั้น (ไม่อ่าน `ENABLE_OPENROUTER`, `ENABLE_GEMINI`, `VALIDATION_MODELS`)
-- **โหมดบันทึกจริง (`--save-db`)** ดึงคิวผ่าน `/internal/sentiment/pending?claim=true` เพื่อจอง lease แยกจาก `sentiment_worker.py` และ dedupe ตาม `post_id` ภายในชุด ส่วน `--dry-run` อ่านจาก `/internal/sentiment/posts` แบบ read-only
-- **ไม่มีการสร้างหรือบันทึก `rule:provider_failure`**: หาก Ollama ค้าง, timeout หรือตอบไม่ผ่าน validation หลังลองซ้ำ 3 รูปแบบ (`generate+json` → `generate+freeform` → `chat+json`) จะข้ามโพสต์นั้นไว้ในสถานะรอวิเคราะห์เดิม และบันทึก ID/สาเหตุลง `reports/sentiment_backfill_failures.jsonl`
+- **โหมดบันทึกจริง (`--save-db`)** ดึงคิวผ่าน `/internal/sentiment/pending?claim=true` (หรือใช้ `--missing incomplete` เพื่อดึงแถวที่บันทึกแล้วแต่ข้อมูลไม่ครบ/ติด `rule:` จาก `/internal/sentiment/incomplete` แล้วส่งทับผ่าน `/internal/sentiment/replace`) ส่วน `--dry-run` อ่านแบบ read-only โดยไม่เขียน DB
+- **ไม่มีการสร้างหรือบันทึก `rule:provider_failure`**: หาก Ollama ค้าง, timeout หรือตอบไม่ผ่าน validation หลังลองซ้ำ 3 รอบ (`/api/generate` + `format="json"` โดยสลับ temperature/seed) จะข้ามโพสต์นั้นไว้ในสถานะเดิม และบันทึก ID/สาเหตุลง `reports/sentiment_backfill_failures.jsonl`
 - มี Circuit Breaker หยุดทำงานอัตโนมัติ (ค่าเริ่มต้น 5 โพสต์ติดกัน) และบันทึก batch ที่สำเร็จก่อนหน้าเสมอ
 
 ```powershell
 # ทดสอบ Dry-run ย้อนหลัง 7 วัน (จำกัดดู 5 โพสต์แรก)
 .\.venv\Scripts\python.exe sentiment_backfill.py --days 7 --dry-run --limit 5
 
-# รันจริงและบันทึกผลตามช่วงวันที่
+# รันจริงและบันทึกผลตามช่วงวันที่ (เฉพาะคิวใหม่ sentiment_status=0)
 .\.venv\Scripts\python.exe sentiment_backfill.py --from-date 2026-11-01 --to-date 2026-11-16 --save-db
+
+# รันซ่อม/เขียนทับรายการที่ status=1 แล้วแต่ข้อมูลยังไม่ครบหรือเป็น rule: (/incomplete -> /replace)
+.\.venv\Scripts\python.exe sentiment_backfill.py --from-date 2026-11-01 --to-date 2026-11-16 --missing incomplete --save-db
 
 # หรือใช้ตัวช่วยบน Windows (ส่งพารามิเตอร์หรือดับเบิลคลิกเพื่อกรอกวันที่)
 .\run_sentiment_backfill.bat --from-date 2026-11-01 --to-date 2026-11-16 --save-db

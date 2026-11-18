@@ -199,6 +199,109 @@ class SentimentBackfillTests(unittest.TestCase):
         self.assertEqual(runner.total_posts_done, 1)
         self.assertEqual(runner.total_escalated, 0)
 
+    def test_incomplete_mode_walks_cursors_and_posts_replace_payload(self):
+        rest = backfill.BlueEyeRestClient(base_url="https://api.example/api/v1", token="tok")
+        ollama = backfill.OllamaWorkerClient(model="deepseek-r1:8b", retries=1)
+        runner = backfill.SentimentBackfillRunner(
+            rest=rest,
+            ollama=ollama,
+            save_db=True,
+            missing="incomplete",
+            organization_id="org-1",
+        )
+        verdict = backfill.validate_verdict(
+            valid_item(
+                positive=5, neutral=15, negative=80, sentiment="negative",
+                intent="complaint", incident=False,
+            ),
+            "deepseek-r1:8b",
+        )
+        pages = [
+            ([], "c1"),  # empty page with non-null cursor must keep going
+            (
+                [
+                    {"post_id": "1234567890_987654", "content": "สินค้าเสียหลังใช้ 2 วัน"},
+                    {"post_id": "1234567890_987654", "content": "สินค้าเสียหลังใช้ 2 วัน"},  # dup across projects
+                ],
+                None,
+            ),
+        ]
+
+        with patch.object(rest, "fetch_incomplete_page", side_effect=pages) as inc_mock, \
+             patch.object(rest, "replace_results", return_value=3) as replace_mock, \
+             patch.object(rest, "write_results") as write_mock, \
+             patch.object(ollama, "analyse_post", return_value=(verdict, "")) as analyse_mock, \
+             redirect_stdout(io.StringIO()):
+            rc = runner.run("2026-11-01", "2026-11-16")
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(inc_mock.call_count, 2)
+        self.assertEqual(inc_mock.call_args_list[0].kwargs["cursor"], None)
+        self.assertEqual(inc_mock.call_args_list[1].kwargs["cursor"], "c1")
+        self.assertEqual(inc_mock.call_args_list[0].kwargs["organization_id"], "org-1")
+        self.assertEqual(analyse_mock.call_count, 1)
+        write_mock.assert_not_called()
+        replace_mock.assert_called_once()
+
+        payload = replace_mock.call_args.args[0]
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["post_id"], "1234567890_987654")
+        self.assertNotIn("match_post_id", payload[0])
+        self.assertEqual(payload[0]["sentiment"], "negative")
+        self.assertEqual(payload[0]["intent"], "complaint")
+        self.assertIs(payload[0]["incident"], False)
+        self.assertEqual(payload[0]["sentiment_scores"], {
+            "model": "deepseek-r1:8b",
+            "multi_target": False,
+            "positive": 5,
+            "neutral": 15,
+            "negative": 80,
+        })
+        self.assertEqual(runner.total_posts_done, 1)
+        self.assertEqual(runner.total_rows_written, 3)
+
+    def test_incomplete_dry_run_reads_incomplete_without_posting_replace(self):
+        rest = backfill.BlueEyeRestClient(base_url="https://api.example/api/v1", token="tok")
+        ollama = backfill.OllamaWorkerClient(model="deepseek-r1:8b")
+        runner = backfill.SentimentBackfillRunner(
+            rest=rest, ollama=ollama, save_db=False, missing="incomplete", limit=1
+        )
+        verdict = backfill.validate_verdict(valid_item(), "deepseek-r1:8b")
+
+        with patch.object(rest, "fetch_incomplete_page",
+                          return_value=([{"post_id": "P_INC_1", "content": "ทดสอบข้อความ"}], "c2")) as inc_mock, \
+             patch.object(rest, "fetch_posts_page") as posts_mock, \
+             patch.object(rest, "replace_results") as replace_mock, \
+             patch.object(ollama, "analyse_post", return_value=(verdict, "")), \
+             redirect_stdout(io.StringIO()):
+            rc = runner.run("2026-11-01", "2026-11-16")
+
+        self.assertEqual(rc, 0)
+        inc_mock.assert_called_once()
+        posts_mock.assert_not_called()
+        replace_mock.assert_not_called()
+        self.assertEqual(runner.total_posts_done, 1)
+
+    def test_parse_args_incomplete_and_organization_validation(self):
+        args = backfill.parse_args([
+            "--from-date", "2026-11-01",
+            "--to-date", "2026-11-16",
+            "--missing", "incomplete",
+            "--organization-id", "org-123",
+        ])
+        self.assertEqual(args.missing, "incomplete")
+        self.assertEqual(args.organization_id, "org-123")
+
+        for bad_argv in (
+            ["--from-date", "2026-11-01", "--to-date", "2026-11-16", "--missing", "incomplete",
+             "--project-id", "p1", "--organization-id", "o1"],
+            ["--from-date", "2026-11-01", "--to-date", "2026-11-16", "--missing", "sentiment",
+             "--organization-id", "o1"],
+        ):
+            with self.subTest(bad_argv=bad_argv), self.assertRaises(SystemExit), \
+                 redirect_stdout(io.StringIO()):
+                backfill.parse_args(bad_argv)
+
 
 if __name__ == "__main__":
     unittest.main()
