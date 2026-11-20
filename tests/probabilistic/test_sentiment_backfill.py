@@ -535,6 +535,37 @@ class SentimentBackfillTests(unittest.TestCase):
         self.assertEqual(by_id["M3"]["sentiment_scores"]["model"], "qwen3:8b")
         self.assertEqual(by_id["M4"]["sentiment_scores"]["model"], "qwen3:8b")
 
+    def test_missing_all_runs_sentiment_then_incomplete_in_one_run(self):
+        rest = backfill.BlueEyeRestClient(base_url="https://api.example/api/v1", token="tok")
+        ollama = backfill.OllamaWorkerClient(model="gemma4:e4b", retries=1)
+        runner = backfill.SentimentBackfillRunner(rest=rest, ollama=ollama, save_db=True, missing="all")
+
+        v_new = backfill.validate_verdict(valid_item(sentiment="neutral", intent="recommendation"), "gemma4:e4b")
+        v_inc = backfill.validate_verdict(
+            valid_item(positive=5, neutral=15, negative=80, sentiment="negative", intent="complaint"),
+            "gemma4:e4b",
+        )
+        pending_rows = [{"match_post_id": "M_NEW", "post_id": "P_NEW", "content": "โปรโมชันสินค้าใหม่วันนี้"}]
+        inc_rows = [{"post_id": "P_INC", "content": "บริการช้ามากไม่ประทับใจ"}]
+
+        with patch.object(rest, "fetch_pending_claimed", side_effect=[pending_rows, []]) as pending_mock, \
+             patch.object(rest, "fetch_incomplete_page", return_value=(inc_rows, None)) as inc_mock, \
+             patch.object(rest, "write_results", return_value=1) as write_mock, \
+             patch.object(rest, "replace_results", return_value=2) as replace_mock, \
+             patch.object(ollama, "analyse_post", side_effect=[(v_new, ""), (v_inc, "")]), \
+             redirect_stdout(io.StringIO()):
+            rc = runner.run("2026-10-25", "2026-10-25")
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(pending_mock.call_args_list[0].kwargs["missing"], "sentiment")
+        inc_mock.assert_called_once()
+        write_mock.assert_called_once()
+        replace_mock.assert_called_once()
+        self.assertEqual(write_mock.call_args.args[0][0]["match_post_id"], "M_NEW")
+        self.assertEqual(replace_mock.call_args.args[0][0]["post_id"], "P_INC")
+        self.assertEqual(runner.total_posts_done, 2)
+        self.assertEqual(runner.total_rows_written, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

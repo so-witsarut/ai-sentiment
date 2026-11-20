@@ -658,6 +658,8 @@ class BlueEyeRestClient:
 def _mode_label(missing: str, save_db: bool) -> str:
     if missing == "incomplete":
         return "LIVE (/incomplete -> /replace)" if save_db else "DRY-RUN (/incomplete -> ไม่เขียน DB)"
+    if missing == "all":
+        return "LIVE (/pending->/results + /incomplete->/replace)" if save_db else "DRY-RUN (/posts + /incomplete -> ไม่เขียน DB)"
     return "LIVE (claim=true -> /results)" if save_db else "DRY-RUN (/posts -> ไม่เขียน DB)"
 
 
@@ -728,14 +730,14 @@ class SentimentBackfillRunner:
         except OSError as exc:
             print(f"  ⚠️ Cannot write failure log {self.fail_log_path}: {exc}", flush=True)
 
-    def _flush_items(self, items: List[Dict[str, Any]]) -> int:
+    def _flush_items(self, items: List[Dict[str, Any]], *, replace: bool = False) -> int:
         if not items:
             return 0
         if self.save_db:
-            if self.missing == "incomplete":
+            if replace:
                 return self.rest.replace_results(items)
             return self.rest.write_results(items)
-        endpoint_hint = "/replace" if self.missing == "incomplete" else "/results"
+        endpoint_hint = "/replace" if replace else "/results"
         print(f"  🔒 [DRY-RUN: ปิดการบันทึก] จำลองส่ง {len(items)} แถวไป {endpoint_hint} (ไม่เขียนลง DB):", flush=True)
         for item in items:
             s = item.get("sentiment") or "(keep)"
@@ -750,6 +752,8 @@ class SentimentBackfillRunner:
         row_count_fn: Any,
         match_ids_fn: Any,
         build_items_fn: Any,
+        *,
+        use_replace: bool = False,
     ) -> None:
         if not posts:
             return
@@ -800,7 +804,7 @@ class SentimentBackfillRunner:
                 pending_writes.extend(build_items_fn(pid, verdict))
 
                 icon = "🟢" if verdict.sentiment == "positive" else ("🔴" if verdict.sentiment == "negative" else "⚪")
-                row_label = f"{row_count_fn(pid)} row" if self.missing != "incomplete" else "post"
+                row_label = "post" if use_replace else f"{row_count_fn(pid)} row"
                 print(
                     f"  [{idx:02d}] {icon} post={pid[:18]:<18} ({row_label}) | "
                     f"{verdict.sentiment.upper():<8} | intent={verdict.intent} | incident={verdict.incident} | "
@@ -854,7 +858,7 @@ class SentimentBackfillRunner:
                                 if self.consecutive_failures >= self.max_consecutive_failures:
                                     _finalize_post(idx, pid, content_key, None, err, dt)
                                     _finalize_remaining_pass1(0)
-                                    self.total_rows_written += self._flush_items(pending_writes)
+                                    self.total_rows_written += self._flush_items(pending_writes, replace=use_replace)
                                     pending_writes = []
                                     raise OllamaUnavailableError(
                                         f"หยุดทำงานชั่วคราว: Ollama ล้มเหลวติดต่อกัน {self.consecutive_failures} โพสต์ "
@@ -874,7 +878,7 @@ class SentimentBackfillRunner:
                         if _is_provider_failure(err):
                             self.consecutive_failures += 1
                             if self.consecutive_failures >= self.max_consecutive_failures:
-                                self.total_rows_written += self._flush_items(pending_writes)
+                                self.total_rows_written += self._flush_items(pending_writes, replace=use_replace)
                                 pending_writes = []
                                 raise OllamaUnavailableError(
                                     f"หยุดทำงานชั่วคราว: Ollama ล้มเหลวติดต่อกัน {self.consecutive_failures} โพสต์ "
@@ -928,7 +932,7 @@ class SentimentBackfillRunner:
                             self.consecutive_failures += 1
                             if self.consecutive_failures >= self.max_consecutive_failures:
                                 _finalize_remaining_pass1(esc_cursor)
-                                self.total_rows_written += self._flush_items(pending_writes)
+                                self.total_rows_written += self._flush_items(pending_writes, replace=use_replace)
                                 pending_writes = []
                                 raise OllamaUnavailableError(
                                     f"หยุดทำงานชั่วคราว: Ollama ล้มเหลวติดต่อกัน {self.consecutive_failures} โพสต์ "
@@ -943,11 +947,11 @@ class SentimentBackfillRunner:
                     for q_idx, q_post, q_key, p1_verdict, _p1_err, p1_dt, _ in escalate_queue[esc_cursor:]:
                         if p1_verdict is not None:
                             _finalize_post(q_idx, q_post["post_id"], q_key, p1_verdict, "", p1_dt)
-                self.total_rows_written += self._flush_items(pending_writes)
+                self.total_rows_written += self._flush_items(pending_writes, replace=use_replace)
                 pending_writes = []
 
             if pending_writes:
-                self.total_rows_written += self._flush_items(pending_writes)
+                self.total_rows_written += self._flush_items(pending_writes, replace=use_replace)
 
             elapsed = time.perf_counter() - batch_started
             rate = len(chunk) / (elapsed / 60.0) if elapsed > 0 else 0.0
@@ -1003,7 +1007,85 @@ class SentimentBackfillRunner:
             row_count_fn=lambda _pid: 1,
             match_ids_fn=lambda _pid: [],
             build_items_fn=lambda pid, v: [format_replace_item(pid, v)],
+            use_replace=True,
         )
+
+    def _run_pending_or_posts(self, date_from: str, date_to: str, queue_missing: str) -> None:
+        if self.save_db:
+            while not self._stop_requested:
+                req_limit = self.fetch_limit
+                if self.limit is not None:
+                    remaining = max(0, self.limit - (self.total_posts_done + self.total_failed_posts))
+                    if remaining == 0:
+                        break
+                    req_limit = min(req_limit, max(remaining * 2, self.batch_size))
+                rows = self.rest.fetch_pending_claimed(
+                    limit=req_limit,
+                    date_from=date_from,
+                    date_to=date_to,
+                    missing=queue_missing,
+                    lease_seconds=self.lease_seconds,
+                    project_id=self.project_id,
+                )
+                if not rows:
+                    break
+                fresh = [r for r in rows if str(r.get("post_id") or "") not in self.failed_post_ids and (r.get("content") or "").strip()]
+                if not fresh:
+                    break
+                self._process_rows(rows)
+            return
+
+        page = 1
+        seen_ids: Set[str] = set()
+        while not self._stop_requested:
+            total_rows, rows = self.rest.fetch_posts_page(
+                date_from=date_from,
+                date_to=date_to,
+                page=page,
+                page_size=500,
+                project_id=self.project_id,
+            )
+            if page == 1:
+                print(f"[REST API] พบรายการรอวิเคราะห์ทั้งหมด {total_rows} แถวในช่วง {date_from}..{date_to}", flush=True)
+            if not rows:
+                break
+            filtered = []
+            for r in rows:
+                mid = str(r.get("match_post_id") or "")
+                if not mid or mid in seen_ids:
+                    continue
+                seen_ids.add(mid)
+                if queue_missing == "intent" and r.get("intent") is not None:
+                    continue
+                filtered.append(r)
+            self._process_rows(filtered)
+            if page * 500 >= total_rows:
+                break
+            page += 1
+
+    def _run_incomplete(self, date_from: str, date_to: str) -> None:
+        cursor: Optional[str] = None
+        seen_posts: Set[str] = set()
+        while not self._stop_requested:
+            req_limit = min(500, self.fetch_limit)
+            if self.limit is not None:
+                remaining = max(0, self.limit - (self.total_posts_done + self.total_failed_posts))
+                if remaining == 0:
+                    break
+                req_limit = min(500, max(remaining * 2, self.batch_size))
+            items, next_cursor = self.rest.fetch_incomplete_page(
+                date_from=date_from,
+                date_to=date_to,
+                cursor=cursor,
+                limit=req_limit,
+                project_id=self.project_id,
+                organization_id=self.organization_id,
+            )
+            if items:
+                self._process_incomplete_items(items, seen_posts)
+            if not next_cursor:
+                break
+            cursor = next_cursor
 
     def run(self, date_from: str, date_to: str) -> int:
         date_from = validate_date_str(date_from)
@@ -1015,78 +1097,15 @@ class SentimentBackfillRunner:
         aborted_reason = ""
         try:
             if self.missing == "incomplete":
-                cursor: Optional[str] = None
-                seen_posts: Set[str] = set()
-                while not self._stop_requested:
-                    req_limit = min(500, self.fetch_limit)
-                    if self.limit is not None:
-                        remaining = max(0, self.limit - (self.total_posts_done + self.total_failed_posts))
-                        if remaining == 0:
-                            break
-                        req_limit = min(500, max(remaining * 2, self.batch_size))
-                    items, next_cursor = self.rest.fetch_incomplete_page(
-                        date_from=date_from,
-                        date_to=date_to,
-                        cursor=cursor,
-                        limit=req_limit,
-                        project_id=self.project_id,
-                        organization_id=self.organization_id,
-                    )
-                    if items:
-                        self._process_incomplete_items(items, seen_posts)
-                    if not next_cursor:
-                        break
-                    cursor = next_cursor
-            elif self.save_db:
-                while not self._stop_requested:
-                    req_limit = self.fetch_limit
-                    if self.limit is not None:
-                        remaining = max(0, self.limit - (self.total_posts_done + self.total_failed_posts))
-                        if remaining == 0:
-                            break
-                        req_limit = min(req_limit, max(remaining * 2, self.batch_size))
-                    rows = self.rest.fetch_pending_claimed(
-                        limit=req_limit,
-                        date_from=date_from,
-                        date_to=date_to,
-                        missing=self.missing,
-                        lease_seconds=self.lease_seconds,
-                        project_id=self.project_id,
-                    )
-                    if not rows:
-                        break
-                    fresh = [r for r in rows if str(r.get("post_id") or "") not in self.failed_post_ids and (r.get("content") or "").strip()]
-                    if not fresh:
-                        break
-                    self._process_rows(rows)
+                self._run_incomplete(date_from, date_to)
+            elif self.missing == "all":
+                print("\n📌 [Phase 1/2] วิเคราะห์คิวใหม่ที่ยังไม่เคยวิเคราะห์ (missing=sentiment)...", flush=True)
+                self._run_pending_or_posts(date_from, date_to, "sentiment")
+                if not self._stop_requested:
+                    print("\n📌 [Phase 2/2] ซ่อม/เขียนทับรายการที่ข้อมูลไม่ครบหรือติด rule: (missing=incomplete)...", flush=True)
+                    self._run_incomplete(date_from, date_to)
             else:
-                page = 1
-                seen_ids: Set[str] = set()
-                while not self._stop_requested:
-                    total_rows, rows = self.rest.fetch_posts_page(
-                        date_from=date_from,
-                        date_to=date_to,
-                        page=page,
-                        page_size=500,
-                        project_id=self.project_id,
-                    )
-                    if page == 1:
-                        print(f"[REST API] พบรายการรอวิเคราะห์ทั้งหมด {total_rows} แถวในช่วง {date_from}..{date_to}", flush=True)
-                    if not rows:
-                        break
-                    filtered = []
-                    for r in rows:
-                        mid = str(r.get("match_post_id") or "")
-                        if not mid or mid in seen_ids:
-                            continue
-                        seen_ids.add(mid)
-                        if self.missing == "intent" and r.get("intent") is not None:
-                            continue
-                        filtered.append(r)
-                    self._process_rows(filtered)
-                    if page * 500 >= total_rows:
-                        break
-                    page += 1
+                self._run_pending_or_posts(date_from, date_to, self.missing)
         except _LimitReached:
             pass
         except OllamaUnavailableError as exc:
@@ -1129,8 +1148,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--project-id", default=None, help="Optional single project_id filter")
     parser.add_argument("--organization-id", default=None,
                         help="Optional organization_id filter (only with --missing incomplete)")
-    parser.add_argument("--missing", choices=("sentiment", "intent", "incomplete"), default="sentiment",
-                        help="Queue to backfill: sentiment (default), intent, or incomplete (/incomplete -> /replace)")
+    parser.add_argument("--missing", choices=("sentiment", "intent", "incomplete", "all"), default="sentiment",
+                        help="Queue to backfill: sentiment (default), intent, incomplete (/incomplete -> /replace), or all (sentiment + incomplete)")
     parser.add_argument("--model", default=os.environ.get("OLLAMA_BACKFILL_MODEL", "").strip() or DEFAULT_MODEL)
     parser.add_argument(
         "--escalate-model",
